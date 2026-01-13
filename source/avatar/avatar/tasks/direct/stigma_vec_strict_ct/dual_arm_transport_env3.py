@@ -266,7 +266,7 @@ class DualrobotEnv(DirectRLEnv):
 
         is_violated = (pos_violation > 1e-4) | (rot_violation > 1e-4)
 
-        ct_offset_val = 3.0
+        ct_offset_val = 5.0 #3 -> 5
         r_step = torch.where(is_violated, -ct_offset_val, 0.0)
 
         w_slope = 2.0

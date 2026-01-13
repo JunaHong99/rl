@@ -48,6 +48,11 @@ docker run --name junhwa --entrypoint bash -it --gpus all \
   -v ~/docker/isaac-sim/data:/root/.local/share/ov/data:rw \
   -v ~/docker/isaac-sim/documents:/root/Documents:rw \
   nvcr.io/nvidia/isaac-lab:2.3.0
+  
+<학습 실행 전> 
+export CUDA_VISIBLE_DEVICES=1 -> 사용할 gpu 번호 지정하기.
+python3 -c "import torch; print(f'인식된 GPU 개수: {torch.cuda.device_count()}'); print(f'현재 사용 GPU 이름: {torch.cuda.get_device_name(0)}')"  -> 잘 지정됐나 확인하기
+
 
 <Gemini cli 관련>
 * 최근 세션 목록 확인:
