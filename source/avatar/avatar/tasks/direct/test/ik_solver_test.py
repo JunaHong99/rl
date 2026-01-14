@@ -8,9 +8,8 @@ class FrankaIKSolver:
     def __init__(self):
         # 1. Franka Panda 로봇 모델 로드 (URDF 직접 로드)
         # 사용자 환경의 URDF 경로
-        current_dir = os.path.dirname(os.path.abspath(__file__))   
-        urdf_path = os.path.join(current_dir, "../../../asset/robot_urdf/franka_description/franka_panda.urdf")  
-
+        urdf_path = "/home/hjh/research/2nd/IsaacLab/scripts/avatar/source/avatar/avatar/asset/robot_urdf/franka_description/panda.urdf"
+        
         if not os.path.exists(urdf_path):
             raise FileNotFoundError(f"URDF 파일을 찾을 수 없습니다: {urdf_path}")
 
