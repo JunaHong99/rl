@@ -17,9 +17,9 @@ class ActorNetwork(nn.Module):
         self.num_gnn_steps = num_gnn_steps
 
         # 1. Embedding Layers (Raw Feature -> Latent)
-        self.node_embedder = core.MLP(node_dim, 512, num_layers=3)
-        self.edge_embedder = core.MLP(edge_dim, 256, num_layers=3)
-        self.global_embedder = core.MLP(global_dim, 512, num_layers=3)
+        self.node_embedder = core.MLP(node_dim, 512, num_layers=3)#5
+        self.edge_embedder = core.MLP(edge_dim, 256, num_layers=3)#5
+        self.global_embedder = core.MLP(global_dim, 512, num_layers=3)#5
 
         # 2. GNN Block
         self.gnn = core.RoboBalletGNNBlock(node_dim=512, edge_dim=256, global_dim=512, hidden_dim=256)

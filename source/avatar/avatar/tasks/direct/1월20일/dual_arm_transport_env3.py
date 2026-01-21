@@ -18,7 +18,7 @@ from isaaclab.scene import InteractiveScene
 import isaaclab.utils.math as math_utils
 
 from dual_arm_transport_cfg import DualrobotCfg
-from vectorized_pose_sampler import VectorizedPoseSampler
+from vectorized_pose_sampler import VectorizedPoseSampler        
 
 class DualrobotEnv(DirectRLEnv):
     """
@@ -31,8 +31,9 @@ class DualrobotEnv(DirectRLEnv):
         # 원본 Cfg를 부모 클래스에 전달
         super().__init__(cfg, render_mode, **kwargs)
 
-        self.pose_sampler = VectorizedPoseSampler(device=self.device)
-        
+        self.pose_sampler = VectorizedPoseSampler(device=self.device)  
+        self.external_samples = None # 외부 샘플 저장용 (테스트용)
+
         # (관절 인덱스 등은 나중에 필요시 여기에 추가)
         self.robot_1_joint_ids = self.robot_1.actuators["all_joints"].joint_indices
         self.robot_2_joint_ids = self.robot_2.actuators["all_joints"].joint_indices
@@ -276,7 +277,7 @@ class DualrobotEnv(DirectRLEnv):
 
         is_violated = (pos_violation > 1e-4) | (rot_violation > 1e-4)
 
-        ct_offset_val = 2.0  #-> 5로 두니까 학습 안되네
+        ct_offset_val = 3.0 
         r_step = torch.where(is_violated, -ct_offset_val, 0.0)
 
         w_slope = 2.0
@@ -299,7 +300,7 @@ class DualrobotEnv(DirectRLEnv):
         # ---------------------------------------------------------
         # [수정] 성공 조건 강화 (Orientation Check 추가)
         # 1. 거리 조건: 5cm 이내 (0.05m)
-        dist_success = (dist_1 < 0.1) & (dist_2 < 0.1)
+        dist_success = (dist_1 < 0.05) & (dist_2 < 0.05)
         
         # 2. 각도 조건: 15도 이내 (약 0.2618 rad)
         angle_err_1 = self._calc_rot_error(ee1_quat, goal1_quat)
@@ -309,7 +310,7 @@ class DualrobotEnv(DirectRLEnv):
         rot_success = (angle_err_1 < angle_threshold) & (angle_err_2 < angle_threshold)
         
         # 최종 도달 판정 (Reached)
-        is_reached = dist_success #& rot_success
+        is_reached = dist_success & rot_success
         
         # 최종 성공 판정 (Reached AND Safe)
         is_truly_success = is_reached & (~self.violation_occurred)
@@ -361,7 +362,7 @@ class DualrobotEnv(DirectRLEnv):
         
         # [수정] 성공 조건 강화 (Reward 함수와 동일하게 적용)
         # 1. 거리 조건 (0.05m)
-        dist_success = (dist_1 < 0.1) & (dist_2 < 0.1)
+        dist_success = (dist_1 < 0.05) & (dist_2 < 0.05)
         
         # 2. 각도 조건 (15도)
         angle_err_1 = self._calc_rot_error(ee1_quat, goal1_quat)
@@ -370,7 +371,7 @@ class DualrobotEnv(DirectRLEnv):
         
         rot_success = (angle_err_1 < angle_threshold) & (angle_err_2 < angle_threshold)
         
-        is_reached = dist_success #& rot_success
+        is_reached = dist_success & rot_success
         
         is_success = is_reached & (~self.violation_occurred)
         
@@ -394,10 +395,15 @@ class DualrobotEnv(DirectRLEnv):
         num_resets = len(env_ids)
 
         # ---------------------------------------------------------
-        # 1. Sampling Loop (Vectorized)
-        # ---------------------------------------------------------
-        # 샘플러로부터 Base, Joint, Goal EE Pose를 배치 단위로 받아옵니다.
-        samples = self.pose_sampler.sample_episodes(num_resets)
+        # 1. Sampling Loop (GPU)
+        if self.external_samples is not None:
+             # [Fixed] 외부 주입 샘플 사용 시 해당 env_ids에 맞는 데이터만 슬라이싱
+             samples = {}
+             for k, v in self.external_samples.items():
+                 samples[k] = v[env_ids]
+        else:
+             # 기존 방식: 샘플러로부터 Base, Joint, Goal EE Pose를 모두 받아옵니다.
+             samples = self.pose_sampler.sample_episodes(num_resets)
         
         base_pose_1 = samples["base_pose_1"]
         base_pose_2 = samples["base_pose_2"]
@@ -429,7 +435,7 @@ class DualrobotEnv(DirectRLEnv):
         self.robot_2.write_root_pose_to_sim(r2_world_pose, env_ids)
         self.robot_2.write_root_velocity_to_sim(zeros_vel, env_ids)
         self.robot_2.write_joint_state_to_sim(q_start_2, zeros_joint_vel, self.robot_2_joint_ids, env_ids)
-
+        
         # ---------------------------------------------------------
         # 4. Applying to Sim (Markers) - 여기가 시각화 핵심
         # ---------------------------------------------------------

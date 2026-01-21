@@ -4,6 +4,7 @@ import torch
 import numpy as np
 import os
 import argparse
+import time
 from datetime import datetime
 from collections import deque
 from torch_geometric.data import Batch
@@ -26,7 +27,7 @@ app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 # 나머지 모듈 임포트 (App 실행 후)
-from dual_arm_transport_env2 import DualrobotEnv, DualrobotCfg
+from dual_arm_transport_env3 import DualrobotEnv, DualrobotCfg
 from graph_converter import (
     convert_batch_state_to_graph,
     NODE_FEATURE_DIM, EDGE_FEATURE_DIM, GLOBAL_FEATURE_DIM
@@ -76,7 +77,7 @@ def main():
     }
     
     # 학습률 등 하이퍼파라미터 설정
-    agent = TD3(gnn_params=gnn_params, max_action=1.0, lr=3e-4) #3e-4, 파인튜닝시 1e-4
+    agent = TD3(gnn_params=gnn_params, max_action=1.0, lr=3e-4)
     
     # --- C. 학습 루프 시작 ---
     obs_dict, _ = env.reset()
@@ -88,7 +89,7 @@ def main():
     # 메모리 사용량 주의: (1M * Nodes * Dim * 4bytes) -> 1M * 4 * 14 * 4 ~= 224MB (매우 작음)
     # GPU 메모리가 넉넉하다면 device="cuda" 권장
     buffer = VectorizedGraphReplayBuffer(
-        capacity=1000000, 
+        capacity=40000000, 
         num_envs=args_cli.num_envs,
         node_dim=NODE_FEATURE_DIM,
         edge_dim=EDGE_FEATURE_DIM,
@@ -120,6 +121,9 @@ def main():
 
     print(f"🔄 Start Interaction Loop ({args_cli.max_iterations} steps)...")
     print(f"📂 Logs will be saved to: {log_dir}")
+
+    t_start = time.time()
+    log_interval = 100  # 로그를 찍는 간격 (아래 % 100과 맞춰주세요)
 
     for step in range(start_step, args_cli.max_iterations):
         
@@ -195,21 +199,16 @@ def main():
         # -------------------------------------------------
         # 4. Train Agent
         # -------------------------------------------------
-        # 버퍼가 어느 정도 차면 학습 시작 (배치 사이즈 256 권장)
         # [수정] 4096 환경 등 대규모 병렬 처리 시 데이터가 빨리 차므로 워밍업을 줄이고, 업데이트 횟수를 늘림
-        if len(buffer) > 100000:
-            # 데이터 유입량(num_envs)에 비례하여 업데이트 횟수 조절
-            # 예: 4096 envs -> 약 32회 업데이트
-            # 예: 1 env -> 1회 업데이트
-            gradient_steps = max(1, args_cli.num_envs // 128) #1024/128 -> 8
+        if len(buffer) > 200000: 
+            BATCH_SIZE = 512       
+            TARGET_SIR = 2.0          
+
+            gradient_steps = int((args_cli.num_envs * TARGET_SIR) / BATCH_SIZE)
             
             for _ in range(gradient_steps): #버퍼에서 256개의 데이터를 뽑아 업데이트, 이걸 그라디언트 스텝만큼 반복.
-                agent.train(buffer, batch_size=256)
+                agent.train(buffer, batch_size=BATCH_SIZE)
                 
-            # (옵션) 학습 진행 상황 디버깅
-            # if step % 100 == 0:
-            #     print(f"DEBUG: Performed {gradient_steps} gradient updates.")
-
         # -------------------------------------------------
         # 5. Logging (TensorBoard)
         # -------------------------------------------------
@@ -223,15 +222,34 @@ def main():
                 success_buffer.extend(success_vals)
 
         # 주기적 기록 (매 100 스텝)
-        if step % 100 == 0:
+        if step % log_interval == 0:
+            # [추가 2] FPS 계산 로직 ================================
+            t_end = time.time()
+            dt = t_end - t_start
+            
+            if dt > 0:
+                # (환경 수 x 지난 스텝 수) / 걸린 시간
+                current_fps = (args_cli.num_envs * log_interval) / dt
+            else:
+                current_fps = 0.0
+            
+            # 다음 측정을 위해 시간 초기화
+            t_start = time.time()
+            # =======================================================
             mean_reward = torch.mean(rewards).item()
 
             # (2) 리워드 성분별 기록 (수정됨)
             # extras에 키가 존재하는지 확인 후 기록
             if "log/total_reward" in extras:
-                writer.add_scalar("Reward/Distance", extras["log/r_dist"].item(), step)
                 writer.add_scalar("Reward/Constraint", extras["log/r_constraint"].item(), step)
                 writer.add_scalar("Reward/Action", extras["log/r_action"].item(), step)
+
+            # [CHANGED] Log potential reward instead of absolute distance reward
+            if "log/r_potential" in extras:
+                writer.add_scalar("Reward/Potential", extras["log/r_potential"].item(), step)
+            elif "log/r_dist" in extras: # Fallback if using old env
+                writer.add_scalar("Reward/Distance", extras["log/r_dist"].item(), step)
+
 
             # (3) 디버깅용 에러 기록
             if "log/err_pos" in extras:
@@ -240,9 +258,12 @@ def main():
             
             # [NEW] 추가된 성능 지표 로깅
             if "log/max_err_pos" in extras:
+                # Note: This logs the MEAN of the "Episode Max Errors" across envs.
+                # Ideally, to detect if ANY violation occurred, we check if this value > threshold.
                 writer.add_scalar("Error/Max_Position", extras["log/max_err_pos"].item(), step)
                 writer.add_scalar("Error/Max_Rotation", extras["log/max_err_rot"].item(), step)
             if "log/violation_ratio" in extras:
+                # This is the Ratio of envs currently violating. 0.0 means PERFECT safety.
                 writer.add_scalar("Rollout/ViolationRatio", extras["log/violation_ratio"].item(), step)
 
             # (4) 성공률 기록

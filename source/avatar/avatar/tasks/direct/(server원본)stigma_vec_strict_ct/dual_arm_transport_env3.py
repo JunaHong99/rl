@@ -18,7 +18,7 @@ from isaaclab.scene import InteractiveScene
 import isaaclab.utils.math as math_utils
 
 from dual_arm_transport_cfg import DualrobotCfg
-from vectorized_pose_sampler import VectorizedPoseSampler
+from vectorized_pose_sampler import VectorizedPoseSampler        
 
 class DualrobotEnv(DirectRLEnv):
     """
@@ -31,8 +31,8 @@ class DualrobotEnv(DirectRLEnv):
         # 원본 Cfg를 부모 클래스에 전달
         super().__init__(cfg, render_mode, **kwargs)
 
-        self.pose_sampler = VectorizedPoseSampler(device=self.device)
-        
+        self.pose_sampler = VectorizedPoseSampler(device=self.device)  
+
         # (관절 인덱스 등은 나중에 필요시 여기에 추가)
         self.robot_1_joint_ids = self.robot_1.actuators["all_joints"].joint_indices
         self.robot_2_joint_ids = self.robot_2.actuators["all_joints"].joint_indices
@@ -276,7 +276,7 @@ class DualrobotEnv(DirectRLEnv):
 
         is_violated = (pos_violation > 1e-4) | (rot_violation > 1e-4)
 
-        ct_offset_val = 2.0  #-> 5로 두니까 학습 안되네
+        ct_offset_val = 3.0 
         r_step = torch.where(is_violated, -ct_offset_val, 0.0)
 
         w_slope = 2.0
@@ -309,7 +309,7 @@ class DualrobotEnv(DirectRLEnv):
         rot_success = (angle_err_1 < angle_threshold) & (angle_err_2 < angle_threshold)
         
         # 최종 도달 판정 (Reached)
-        is_reached = dist_success #& rot_success
+        is_reached = dist_success #&rot_success
         
         # 최종 성공 판정 (Reached AND Safe)
         is_truly_success = is_reached & (~self.violation_occurred)
@@ -394,9 +394,9 @@ class DualrobotEnv(DirectRLEnv):
         num_resets = len(env_ids)
 
         # ---------------------------------------------------------
-        # 1. Sampling Loop (Vectorized)
+        # 1. Sampling Loop (GPU)
         # ---------------------------------------------------------
-        # 샘플러로부터 Base, Joint, Goal EE Pose를 배치 단위로 받아옵니다.
+        # # 샘플러로부터 Base, Joint, Goal EE Pose를 모두 받아옵니다.
         samples = self.pose_sampler.sample_episodes(num_resets)
         
         base_pose_1 = samples["base_pose_1"]
@@ -429,7 +429,7 @@ class DualrobotEnv(DirectRLEnv):
         self.robot_2.write_root_pose_to_sim(r2_world_pose, env_ids)
         self.robot_2.write_root_velocity_to_sim(zeros_vel, env_ids)
         self.robot_2.write_joint_state_to_sim(q_start_2, zeros_joint_vel, self.robot_2_joint_ids, env_ids)
-
+        
         # ---------------------------------------------------------
         # 4. Applying to Sim (Markers) - 여기가 시각화 핵심
         # ---------------------------------------------------------

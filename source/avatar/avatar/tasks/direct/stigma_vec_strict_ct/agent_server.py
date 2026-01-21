@@ -17,9 +17,9 @@ class ActorNetwork(nn.Module):
         self.num_gnn_steps = num_gnn_steps
 
         # 1. Embedding Layers (Raw Feature -> Latent)
-        self.node_embedder = core.MLP(node_dim, 512, num_layers=3)
-        self.edge_embedder = core.MLP(edge_dim, 256, num_layers=3)
-        self.global_embedder = core.MLP(global_dim, 512, num_layers=3)
+        self.node_embedder = core.MLP(node_dim, 512, num_layers=3) #5
+        self.edge_embedder = core.MLP(edge_dim, 256, num_layers=3) #5
+        self.global_embedder = core.MLP(global_dim, 512, num_layers=3) #5
 
         # 2. GNN Block
         self.gnn = core.RoboBalletGNNBlock(node_dim=512, edge_dim=256, global_dim=512, hidden_dim=256)
@@ -177,7 +177,7 @@ class TD3(object):
             next_action_flat = next_robot_actions.reshape(batch_size, -1)
 
             # Add Noise
-            noise = (torch.randn_like(next_action_flat) * 0.2).clamp(-0.5, 0.5)
+            noise = (torch.randn_like(next_action_flat) * 0.2).clamp(-0.5, 0.5) #0.02 -> 0.0005
             next_action = (next_action_flat + noise).clamp(-self.max_action, self.max_action)
 
             # Target Q (이제 next_action은 [Batch, 14]이므로 Shape Mismatch 없음)

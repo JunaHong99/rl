@@ -180,8 +180,9 @@ class DualArmPoseSampler:
             g_ee1_pos, g_ee1_quat = None, None
             g_ee2_pos, g_ee2_quat = None, None
             
-            # [수정 1] 탐색 횟수를 10 -> 50 정도로 늘려줍니다 (조건이 까다로워졌으므로)
-            for _ in range(50):
+            # [수정 1] 탐색 횟수를 10 -> 50, 100 정도로 늘려줍니다 (조건이 까다로워졌으므로)
+            # 거리 제한 때매 걸리는건 주로 골 위치기 때문에 아래꺼만 늘리면 됨 
+            for _ in range(100):
                 center_x = (r1_x + r2_x) / 2.0
                 center_y = (r1_y + r2_y) / 2.0
                 
@@ -194,7 +195,7 @@ class DualArmPoseSampler:
                 # [NEW] 최소 거리 조건 체크 (50cm 이상)
                 # 시작 위치(start_obj_pos)와 현재 샘플링된 목표 위치(pos) 사이 거리 계산
                 dist = np.linalg.norm(pos - start_obj_pos)
-                
+
                 if dist < 0.1:
                     continue  # 거리가 너무 가까우면 다시 뽑기
 

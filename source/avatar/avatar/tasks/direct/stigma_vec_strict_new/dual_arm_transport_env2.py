@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 #----------------------얘넨 항상 최상단------------------------
 from isaaclab.app import AppLauncher
@@ -18,12 +19,11 @@ from isaaclab.scene import InteractiveScene
 import isaaclab.utils.math as math_utils
 
 from dual_arm_transport_cfg import DualrobotCfg
-from vectorized_pose_sampler import VectorizedPoseSampler
+from pose_sampler import DualArmPoseSampler
 
 class DualrobotEnv(DirectRLEnv):
     """
     Dofbot 2대를 스폰하는 환경 클래스입니다.
-    Potential-based Reward (PBR) 적용 버전.
     """
     cfg: DualrobotCfg # Cfg 클래스 타입 힌트
 
@@ -31,7 +31,7 @@ class DualrobotEnv(DirectRLEnv):
         # 원본 Cfg를 부모 클래스에 전달
         super().__init__(cfg, render_mode, **kwargs)
 
-        self.pose_sampler = VectorizedPoseSampler(device=self.device)
+        self.pose_sampler = DualArmPoseSampler()
         
         # (관절 인덱스 등은 나중에 필요시 여기에 추가)
         self.robot_1_joint_ids = self.robot_1.actuators["all_joints"].joint_indices
@@ -56,11 +56,6 @@ class DualrobotEnv(DirectRLEnv):
         # [NEW] 에피소드 내 최대 오차 추적용 버퍼
         self.episode_max_pos_error = torch.zeros(self.num_envs, device=self.device)
         self.episode_max_rot_error = torch.zeros(self.num_envs, device=self.device)
-
-        # [NEW] Potential Reward를 위한 이전 거리 저장용 버퍼
-        # 초기값은 무한대나 매우 큰 값으로 설정하여 첫 스텝에서 비정상적인 보상을 방지
-        self.prev_dist = torch.full((self.num_envs,), float('inf'), device=self.device)
-
 
     def _setup_scene(self):
         """씬에 모든 에셋을 로드하고 등록합니다."""
@@ -190,19 +185,7 @@ class DualrobotEnv(DirectRLEnv):
 
         return {"policy": raw_state_dict}
 
-    def _calc_rot_error(self, current_quat, target_quat):
-        """
-        Calculate rotation error (angle difference) between two quaternions.
-        Returns angle in radians.
-        """
-        current_inv = math_utils.quat_conjugate(current_quat)
-        q_diff = math_utils.quat_mul(current_inv, target_quat)
-        q_diff_v = q_diff[:, 1:4]
-        q_diff_w = q_diff[:, 0]
-        # Angle = 2 * atan2(norm(v), abs(w))
-        rot_error = 2.0 * torch.atan2(torch.norm(q_diff_v, dim=-1), torch.abs(q_diff_w))
-        return rot_error
-
+    #offset 추가 버전
     def _get_rewards(self) -> torch.Tensor:
         # ---------------------------------------------------------
         # 1. Threshold Definitions
@@ -210,7 +193,7 @@ class DualrobotEnv(DirectRLEnv):
         curr_thresh = 0.3
         
         # ---------------------------------------------------------
-        # 2. 데이터 수집 & 오차 계산
+        # 2. 데이터 수집 & 오차 계산 (기존 코드 유지)
         # ---------------------------------------------------------
         ee1_pos = self.robot_1.data.body_state_w[:, self.ee_body_idx_1, 0:3]
         ee2_pos = self.robot_2.data.body_state_w[:, self.ee_body_idx_2, 0:3]
@@ -219,19 +202,15 @@ class DualrobotEnv(DirectRLEnv):
         
         goal1_pos = self.goal_marker_ee1.data.root_state_w[:, 0:3]
         goal2_pos = self.goal_marker_ee2.data.root_state_w[:, 0:3]
-        
-        # [NEW] Goal Quaternions for Angle Check
-        goal1_quat = self.goal_marker_ee1.data.root_state_w[:, 3:7]
-        goal2_quat = self.goal_marker_ee2.data.root_state_w[:, 3:7]
-
         target_rel_pos = self.target_ee_rel_poses[:, 0:3]
         target_rel_rot = self.target_ee_rel_poses[:, 3:7]
 
-        # (A) Constraint Error Calculation
+        # (A) Position Error
         ee1_inv_quat = math_utils.quat_conjugate(ee1_quat)
         curr_rel_pos_local = math_utils.quat_apply(ee1_inv_quat, ee2_pos - ee1_pos)
         pos_error = torch.norm(curr_rel_pos_local - target_rel_pos, dim=-1)
 
+        # (B) Rotation Error
         curr_rel_rot = math_utils.quat_mul(ee1_inv_quat, ee2_quat)
         target_rel_rot_inv = math_utils.quat_conjugate(target_rel_rot)
         q_diff = math_utils.quat_mul(curr_rel_rot, target_rel_rot_inv)
@@ -240,99 +219,88 @@ class DualrobotEnv(DirectRLEnv):
         rot_error = 2.0 * torch.atan2(torch.norm(q_diff_v, dim=-1), torch.abs(q_diff_w))
 
         # ---------------------------------------------------------
-        # 3. [NEW] Potential-based Reward (Difference Reward)
+        # 3. 리워드 계산 (Offset + Linear 적용)
         # ---------------------------------------------------------
-        # 현재 거리 계산
+        
+        # (1) Task Reward (Distance)
         dist_1 = torch.norm(ee1_pos - goal1_pos, dim=-1)
         dist_2 = torch.norm(ee2_pos - goal2_pos, dim=-1)
-        current_dist = dist_1 + dist_2
-        
-        # 첫 스텝이거나 리셋 직후라면(prev가 무한대), progress는 0으로 처리
-        is_first_step = torch.isinf(self.prev_dist)
-        self.prev_dist = torch.where(is_first_step, current_dist, self.prev_dist)
+        r_dist = -(dist_1 + dist_2)
 
-        # Progress: (과거 거리 - 현재 거리) * 100.0
-        progress = (self.prev_dist - current_dist)* 100.0
-        
-        r_potential = progress 
-
-        # 상태 업데이트
-        self.prev_dist = current_dist.clone()
-
-        # ---------------------------------------------------------
-        # 4. [NEW] Time Penalty (Existence Penalty)
-        # ---------------------------------------------------------
-        r_time = -0.1
-
-        # ---------------------------------------------------------
-        # 5. Constraint Reward (기존 로직 유지)
-        # ---------------------------------------------------------
+        # (2) Constraint Reward: [Offset + Slope]
+        # 위반량(Deadzone) 계산: 0.3 이내면 0, 넘으면 양수
         pos_violation = torch.clamp(pos_error - curr_thresh, min=0.0)
         rot_violation = torch.clamp(rot_error - curr_thresh, min=0.0)
         is_currently_violated = (pos_violation > 1e-4) | (rot_violation > 1e-4)
         
         self.extras["log/is_currently_violated"] = is_currently_violated
+        
+        # "한 번이라도 위반하면 True로 영구 고정" (OR 연산 누적)
         self.violation_occurred = self.violation_occurred | is_currently_violated
 
+        # 위반 여부 확인 (아주 작은 오차 1e-4 이상이면 위반으로 간주)
         is_violated = (pos_violation > 1e-4) | (rot_violation > 1e-4)
 
-        ct_offset_val = 2.0  #-> 5로 두니까 학습 안되네
+        # A. Offset (Step Penalty): "위반하면 일단 -5점 먹고 시작해라"
+        # 경계를 명확히 구분해주는 역할 (Step Function의 효과)
+        ct_offset_val = 3.0 #1 -> 3 (1월 11일)
         r_step = torch.where(is_violated, -ct_offset_val, 0.0)
 
+        # B. Slope (Linear Penalty): "그래도 줄이면 봐준다"
+        # 2차(Square) 대신 1차(Linear)를 사용하여 경계 근처에서도 확실한 기울기 제공
         w_slope = 2.0
         r_slope = -1.0 * w_slope * (pos_violation + rot_violation)
 
+        # 최종 제약 보상 합산
         r_constraint = r_step + r_slope
 
+        # [NEW] 최대 오차 갱신
         self.episode_max_pos_error = torch.max(self.episode_max_pos_error, pos_error)
         self.episode_max_rot_error = torch.max(self.episode_max_rot_error, rot_error)
 
-        # ---------------------------------------------------------
-        # 6. Action Penalty
-        # ---------------------------------------------------------
+        # (3) Action & Time Penalty
         action_norm = torch.norm(self.actions, p=2, dim=-1)
-        w_action = 0.05 #0.5 아님.
+        w_action = 0.1 
         r_action = -1.0 * w_action * action_norm
 
         # ---------------------------------------------------------
-        # 7. Total Reward & Success Bonus
+        # 4. 가중 합산 & 성공 보너스
         # ---------------------------------------------------------
-        # [수정] 성공 조건 강화 (Orientation Check 추가)
-        # 1. 거리 조건: 5cm 이내 (0.05m)
-        dist_success = (dist_1 < 0.1) & (dist_2 < 0.1)
-        
-        # 2. 각도 조건: 15도 이내 (약 0.2618 rad)
-        angle_err_1 = self._calc_rot_error(ee1_quat, goal1_quat)
-        angle_err_2 = self._calc_rot_error(ee2_quat, goal2_quat)
-        angle_threshold = 15.0 * (math.pi / 180.0) # 0.2618 rad
-        
-        rot_success = (angle_err_1 < angle_threshold) & (angle_err_2 < angle_threshold)
-        
-        # 최종 도달 판정 (Reached)
-        is_reached = dist_success #& rot_success
-        
-        # 최종 성공 판정 (Reached AND Safe)
+        w_d = 3.0 # 5-> 3 (1월9일)
+        r_dist_slope = -1.0 * w_d * (dist_1 + dist_2)
+
+        # 성공 판정
+        is_reached = (dist_1 < 0.1) & (dist_2 < 0.1)
+
+        dist_offset_val = 0.5
+        r_dist_offset = torch.where(is_reached, 0.0, -dist_offset_val)
+        r_dist = r_dist_slope + r_dist_offset
+
+        # "진정한 성공": 현재 도달함 AND 과거에도 깨끗함 AND 현재도 안전함
         is_truly_success = is_reached & (~self.violation_occurred)
 
-        r_success = torch.where(is_truly_success, 200.0, 0.0) 
+        reward_weighted = r_constraint + r_dist + r_action
 
-        total_reward = r_potential + r_time + r_constraint + r_action + r_success
+        r_success = torch.where(is_truly_success, 20.0, 0.0)
+
+        total_reward = reward_weighted + r_success
 
         # ---------------------------------------------------------
-        # 8. Logging
+        # 5. Logging (로그에 r_step 비중 확인용 추가)
         # ---------------------------------------------------------
         self.extras["log/curr_threshold"] = torch.tensor(curr_thresh, device=self.device)
         self.extras["log/r_action"] = torch.mean(r_action)
-        self.extras["log/r_potential"] = torch.mean(r_potential) 
+        self.extras["log/r_dist"] = torch.mean(r_dist)
         self.extras["log/r_constraint"] = torch.mean(r_constraint)
         self.extras["log/r_success"] = torch.mean(r_success)
         self.extras["log/total_reward"] = torch.mean(total_reward)
         self.extras["log/err_pos"] = torch.mean(pos_error) 
         self.extras["log/err_rot"] = torch.mean(rot_error) 
         
-        # [수정] MEAN 대신 MAX를 사용하여 "단 한 대의 위반도 없는지" 감시함
-        self.extras["log/max_err_pos"] = torch.max(self.episode_max_pos_error)
-        self.extras["log/max_err_rot"] = torch.max(self.episode_max_rot_error)
+        # [NEW] 추가 성능 지표 로깅
+        # - Max Error: 에피소드 중 최악의 순간을 기록 (안정성 지표)
+        self.extras["log/max_err_pos"] = torch.mean(self.episode_max_pos_error)
+        self.extras["log/max_err_rot"] = torch.mean(self.episode_max_rot_error)
         # - Violation Ratio: 현재 스텝에서 위반한 환경의 비율 (0.0 ~ 1.0)
         self.extras["log/violation_ratio"] = torch.mean(is_violated.float())
 
@@ -341,17 +309,13 @@ class DualrobotEnv(DirectRLEnv):
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         # ---------------------------------------------------------
-        # 2. 데이터 수집
+        # 2. 데이터 수집 & 오차 계산
         # ---------------------------------------------------------
         ee1_pos = self.robot_1.data.body_state_w[:, self.ee_body_idx_1, 0:3]
         ee2_pos = self.robot_2.data.body_state_w[:, self.ee_body_idx_2, 0:3]
-        ee1_quat = self.robot_1.data.body_state_w[:, self.ee_body_idx_1, 3:7]
-        ee2_quat = self.robot_2.data.body_state_w[:, self.ee_body_idx_2, 3:7]
         
         goal1_pos = self.goal_marker_ee1.data.root_state_w[:, 0:3]
         goal2_pos = self.goal_marker_ee2.data.root_state_w[:, 0:3]
-        goal1_quat = self.goal_marker_ee1.data.root_state_w[:, 3:7]
-        goal2_quat = self.goal_marker_ee2.data.root_state_w[:, 3:7]
 
         # ---------------------------------------------------------
         # 3. Done Conditions
@@ -359,27 +323,21 @@ class DualrobotEnv(DirectRLEnv):
         dist_1 = torch.norm(ee1_pos - goal1_pos, dim=-1)
         dist_2 = torch.norm(ee2_pos - goal2_pos, dim=-1)
         
-        # [수정] 성공 조건 강화 (Reward 함수와 동일하게 적용)
-        # 1. 거리 조건 (0.05m)
-        dist_success = (dist_1 < 0.1) & (dist_2 < 0.1)
+        # [조건 1] 단순히 거리가 가까워졌는지 (도달 여부)
+        is_reached = (dist_1 < 0.1) & (dist_2 < 0.1)
         
-        # 2. 각도 조건 (15도)
-        angle_err_1 = self._calc_rot_error(ee1_quat, goal1_quat)
-        angle_err_2 = self._calc_rot_error(ee2_quat, goal2_quat)
-        angle_threshold = 15.0 * (math.pi / 180.0)
-        
-        rot_success = (angle_err_1 < angle_threshold) & (angle_err_2 < angle_threshold)
-        
-        is_reached = dist_success #& rot_success
-        
+        # [조건 2] 진정한 성공 여부 (도달함 AND 위반 기록 없음)
+        # 이 값은 로그 기록 및 학습 성공률 판단에 사용됩니다.
         is_success = is_reached & (~self.violation_occurred)
         
         time_out = self.episode_length_buf >= self.max_episode_length - 1
 
-        terminated = is_success 
+        terminated = is_success #is_reached
 
-        # 로그
+        # 로그에는 "깨끗한 성공"만 1.0으로 기록됨
         self.extras["log/success"] = is_success.float()
+
+        # [NEW] 도달 여부와 위반 여부를 extras에 추가 (test.py에서 확인용)
         self.extras["log/is_reached"] = is_reached.float()
         self.extras["log/violation"] = self.violation_occurred.float()
         
@@ -394,17 +352,41 @@ class DualrobotEnv(DirectRLEnv):
         num_resets = len(env_ids)
 
         # ---------------------------------------------------------
-        # 1. Sampling Loop (Vectorized)
+        # 1. Sampling Loop (CPU)
         # ---------------------------------------------------------
-        # 샘플러로부터 Base, Joint, Goal EE Pose를 배치 단위로 받아옵니다.
-        samples = self.pose_sampler.sample_episodes(num_resets)
+        # 샘플러로부터 Base, Joint, Goal EE Pose를 모두 받아옵니다.
+        base_pose_1_list = []
+        base_pose_2_list = []
+        q_start_1_list = []
+        q_start_2_list = []
+        # (참고: goal_obj_pose는 보상 계산용으로 받아두지만, 시각화는 EE로 합니다)
+        goal_ee1_pose_list = []
+        goal_ee2_pose_list = []
+
+        for _ in range(num_resets):
+            sample = self.pose_sampler.sample_valid_episode()
+            
+            base_pose_1_list.append(sample["base_pose_1"])
+            base_pose_2_list.append(sample["base_pose_2"])
+            q_start_1_list.append(sample["q_start_1"])
+            q_start_2_list.append(sample["q_start_2"])
+            goal_ee1_pose_list.append(sample["goal_ee1_pose"])
+            goal_ee2_pose_list.append(sample["goal_ee2_pose"])
+
+        # ---------------------------------------------------------
+        # 2. Tensor Conversion
+        # ---------------------------------------------------------
+        # Robot Base Poses [N, 7]
+        base_pose_1 = torch.tensor(np.array(base_pose_1_list), dtype=torch.float32, device=self.device)
+        base_pose_2 = torch.tensor(np.array(base_pose_2_list), dtype=torch.float32, device=self.device)
         
-        base_pose_1 = samples["base_pose_1"]
-        base_pose_2 = samples["base_pose_2"]
-        q_start_1 = samples["q_start_1"]
-        q_start_2 = samples["q_start_2"]
-        goal_ee1_pose = samples["goal_ee1_pose"]
-        goal_ee2_pose = samples["goal_ee2_pose"]
+        # Joint Angles [N, 7]
+        q_start_1 = torch.tensor(np.array(q_start_1_list), dtype=torch.float32, device=self.device)
+        q_start_2 = torch.tensor(np.array(q_start_2_list), dtype=torch.float32, device=self.device)
+        
+        # Goal EE Poses [N, 7]
+        goal_ee1_pose = torch.tensor(np.array(goal_ee1_pose_list), dtype=torch.float32, device=self.device)
+        goal_ee2_pose = torch.tensor(np.array(goal_ee2_pose_list), dtype=torch.float32, device=self.device)
 
         # ---------------------------------------------------------
         # 3. Applying to Sim (Robot)
@@ -420,7 +402,7 @@ class DualrobotEnv(DirectRLEnv):
         
         self.robot_1.write_root_pose_to_sim(r1_world_pose, env_ids)
         self.robot_1.write_root_velocity_to_sim(zeros_vel, env_ids)
-        self.robot_1.write_joint_state_to_sim(q_start_1, zeros_joint_vel, self.robot_1_joint_ids, env_ids)
+        self.robot_1.write_joint_state_to_sim(q_start_1, zeros_joint_vel, None, env_ids)
 
         # B. Robot 2 (Base + Joint)
         r2_world_pose = base_pose_2.clone()
@@ -428,7 +410,7 @@ class DualrobotEnv(DirectRLEnv):
         
         self.robot_2.write_root_pose_to_sim(r2_world_pose, env_ids)
         self.robot_2.write_root_velocity_to_sim(zeros_vel, env_ids)
-        self.robot_2.write_joint_state_to_sim(q_start_2, zeros_joint_vel, self.robot_2_joint_ids, env_ids)
+        self.robot_2.write_joint_state_to_sim(q_start_2, zeros_joint_vel, None, env_ids)
 
         # ---------------------------------------------------------
         # 4. Applying to Sim (Markers) - 여기가 시각화 핵심
@@ -469,9 +451,6 @@ class DualrobotEnv(DirectRLEnv):
         # [NEW] 리셋 시 최대 오차 초기화
         self.episode_max_pos_error[env_ids] = 0.0
         self.episode_max_rot_error[env_ids] = 0.0
-
-        # [NEW] 리셋 시 이전 거리도 초기화 (무한대로)
-        self.prev_dist[env_ids] = float('inf')
 
 if __name__ == "__main__":
 

@@ -22,36 +22,28 @@ app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 # 나머지 임포트
-from dual_arm_transport_env2 import DualrobotEnv, DualrobotCfg
+from dual_arm_transport_env3 import DualrobotEnv, DualrobotCfg
 from graph_converter import convert_batch_state_to_graph, NODE_FEATURE_DIM, EDGE_FEATURE_DIM, GLOBAL_FEATURE_DIM
 from agent import TD3
-from pose_sampler import DualArmPoseSampler
+from vectorized_pose_sampler import VectorizedPoseSampler
 
 def generate_and_save_dataset(filepath, num_samples, device="cpu"):
     """
-    100개의 테스트용 초기 상태를 미리 생성하여 파일로 저장합니다.
+    테스트용 초기 상태를 정밀 VectorizedPoseSampler를 통해 생성하여 파일로 저장합니다.
     """
-    print(f"Generating new test dataset with {num_samples} samples...")
-    sampler = DualArmPoseSampler()
+    print(f"Generating new test dataset with {num_samples} samples using VectorizedPoseSampler (Verified)...")
+    sampler = VectorizedPoseSampler(device=device)
+    
+    samples = sampler.sample_episodes(num_samples)
     
     data = {
-        "base_pose_1": [], "base_pose_2": [],
-        "q_start_1": [], "q_start_2": [],
-        "goal_ee1": [], "goal_ee2": []
+        "base_pose_1": samples["base_pose_1"],
+        "base_pose_2": samples["base_pose_2"],
+        "q_start_1": samples["q_start_1"],
+        "q_start_2": samples["q_start_2"],
+        "goal_ee1": samples["goal_ee1_pose"],
+        "goal_ee2": samples["goal_ee2_pose"]
     }
-    
-    for _ in range(num_samples):
-        sample = sampler.sample_valid_episode()
-        data["base_pose_1"].append(sample["base_pose_1"])
-        data["base_pose_2"].append(sample["base_pose_2"])
-        data["q_start_1"].append(sample["q_start_1"])
-        data["q_start_2"].append(sample["q_start_2"])
-        data["goal_ee1"].append(sample["goal_ee1_pose"])
-        data["goal_ee2"].append(sample["goal_ee2_pose"])
-        
-    # List to Tensor
-    for key in data:
-        data[key] = torch.tensor(np.array(data[key]), dtype=torch.float32, device=device)
         
     torch.save(data, filepath)
     print(f"Saved dataset to {filepath}")
@@ -69,25 +61,35 @@ def force_apply_dataset(env, dataset, env_ids):
     goal_ee1 = dataset["goal_ee1"][env_ids].to(env.device)
     goal_ee2 = dataset["goal_ee2"][env_ids].to(env.device)
     
+    if q_start_2.shape[-1] == 9:
+        q_start_2 = q_start_2[:, :7]
+        
     zeros_vel = torch.zeros_like(base_pose_1[:, :6])
     zeros_joint_vel = torch.zeros_like(q_start_1)
     
     # 2. Sim에 쓰기 (env_origins 보정 필수)
     env_origins = env.scene.env_origins[env_ids]
     
-    # Robot 1
+    # [Fix] 만약 데이터셋의 q가 9차원(Gripper 포함)이라면 팔 관절(7개)만 슬라이싱
+    if q_start_1.shape[-1] == 9:
+        q_start_1 = q_start_1[:, :7].clone()
+    if q_start_2.shape[-1] == 9:
+        q_start_2 = q_start_2[:, :7].clone()
+        
+    zeros_vel = torch.zeros((len(env_ids), 6), device=env.device)
+    zeros_joint_vel = torch.zeros_like(q_start_1)
     r1_pose = base_pose_1.clone()
     r1_pose[:, :3] += env_origins
     env.robot_1.write_root_pose_to_sim(r1_pose, env_ids)
     env.robot_1.write_root_velocity_to_sim(zeros_vel, env_ids)
-    env.robot_1.write_joint_state_to_sim(q_start_1, zeros_joint_vel, None, env_ids)
+    env.robot_1.write_joint_state_to_sim(q_start_1, zeros_joint_vel, env.robot_1_joint_ids, env_ids)
     
     # Robot 2
     r2_pose = base_pose_2.clone()
     r2_pose[:, :3] += env_origins
     env.robot_2.write_root_pose_to_sim(r2_pose, env_ids)
     env.robot_2.write_root_velocity_to_sim(zeros_vel, env_ids)
-    env.robot_2.write_joint_state_to_sim(q_start_2, zeros_joint_vel, None, env_ids)
+    env.robot_2.write_joint_state_to_sim(q_start_2, zeros_joint_vel, env.robot_2_joint_ids, env_ids)
     
     # Markers
     m1_pose = goal_ee1.clone()
@@ -121,6 +123,12 @@ def force_apply_dataset(env, dataset, env_ids):
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
+    print(f"CWD: {os.getcwd()}")
+    print(f"Dataset File Arg: {args_cli.dataset_file}")
+    abs_path = os.path.abspath(args_cli.dataset_file)
+    print(f"Absolute Path: {abs_path}")
+    print(f"Exists? {os.path.exists(abs_path)}")
+
     # 1. Dataset 준비
     if os.path.exists(args_cli.dataset_file):
         print(f"Loading existing dataset: {args_cli.dataset_file}")
@@ -131,7 +139,35 @@ def main():
     # 2. 환경 설정
     env_cfg = DualrobotCfg()
     env_cfg.scene.num_envs = args_cli.num_envs
-    env = DualrobotEnv(cfg=env_cfg, render_mode=None) # 속도를 위해 렌더링 끔
+    env = DualrobotEnv(cfg=env_cfg, render_mode=None)
+
+    # [Optimization] 몽키 패칭: 초기 리셋 시 무거운 IK 연산을 방지
+    # 어차피 force_apply_dataset으로 덮어쓸 것이므로, 
+    # 환경이 내부적으로 호출하는 sample_episodes를 아주 빠른 버전으로 임시 교체합니다.
+    print("  [Info] Optimizing initial reset by bypassing heavy IK verification...")
+    
+    def fast_sample_episodes(num_envs):
+        # IK 검증이 전혀 없는 예전 방식의 코드를 최소화하여 실행
+        # (필요한 키만 맞춰서 리턴)
+        # N을 작게 잡아서 빠르게 통과
+        N = num_envs
+        device = env.device
+        res = {
+            "base_pose_1": torch.zeros(N, 7, device=device),
+            "base_pose_2": torch.zeros(N, 7, device=device),
+            "q_start_1": torch.zeros(N, 7, device=device),
+            "q_start_2": torch.zeros(N, 7, device=device),
+            "start_obj_pose": torch.zeros(N, 7, device=device),
+            "goal_obj_pose": torch.zeros(N, 7, device=device),
+            "goal_ee1_pose": torch.zeros(N, 7, device=device),
+            "goal_ee2_pose": torch.cat([torch.zeros(N, 3), torch.tensor([1,0,0,0]).repeat(N,1)], dim=1).to(device),
+            "obj_width": 0.8
+        }
+        return res
+
+    # 원래 샘플러 보관 후 더미로 교체
+    original_sampler_func = env.pose_sampler.sample_episodes
+    env.pose_sampler.sample_episodes = fast_sample_episodes
 
     # 3. 에이전트 로드
     gnn_params = {
@@ -165,19 +201,24 @@ def main():
     
     current_batch_graph = convert_batch_state_to_graph(obs_dict['policy'], args_cli.num_envs)
 
-    # 통계 변수
+    # 통계 변수 (Latches & Masks)
     total_rewards = torch.zeros(env.num_envs, device=device)
-    successes = torch.zeros(env.num_envs, device=device)
-    violations = torch.zeros(env.num_envs, device=device)
+    any_success = torch.zeros(env.num_envs, dtype=torch.bool, device=device)
+    any_violation = torch.zeros(env.num_envs, dtype=torch.bool, device=device)
+    active_mask = torch.ones(env.num_envs, dtype=torch.bool, device=device) # 첫 에피소드 진행 중이면 True
     
     # 에피소드 길이만큼 실행 (환경의 max_length 사용)
-    max_steps = 300 # 혹시 모르니 하드코딩 혹은 env.max_episode_length
+    max_steps = 100 # 혹시 모르니 하드코딩 혹은 env.max_episode_length
     
     agent.actor.eval()
     
-    with torch.no_grad():
-        for step in range(max_steps):
-            # Action
+    print(f"Running simulation for {max_steps} steps...")
+    
+    print(f"Running simulation for {max_steps} steps...")
+    
+    for step in range(max_steps):
+        # Action Inference (No Grad for Policy)
+        with torch.no_grad():
             full_actions = agent.actor(current_batch_graph)
             
             # Reshape & Slice (Train과 동일 로직)
@@ -186,34 +227,49 @@ def main():
             reshaped_actions = full_actions.view(args_cli.num_envs, num_nodes_per_env, -1)
             robot_actions = reshaped_actions[:, :2, :] 
             env_actions = robot_actions.reshape(args_cli.num_envs, -1)
-            
-            # Step
-            next_obs_dict, rewards, terminated, truncated, extras = env.step(env_actions)
-            
-            total_rewards += rewards
-            
-            # 마지막 스텝에서 성공/위반 여부 기록
-            # 주의: 중간에 끝나는 환경은 없다고 가정 (DirectRLEnv는 보통 타임아웃까지 돔)
-            # 만약 조기 종료가 있다면 masking 필요
-            
-            current_batch_graph = convert_batch_state_to_graph(next_obs_dict['policy'], args_cli.num_envs)
+        
+        # Step (Grad Enabled for Internal IK/Sim Ops)
+        next_obs_dict, rewards, terminated, truncated, extras = env.step(env_actions)
+        
+        if (step + 1) % 10 == 0:
+            print(f"Step {step+1}/{max_steps} completed.")
+        
+        dones = terminated | truncated
+        
+        # 1. Rewards Accumulation (활성 상태인 환경만)
+        total_rewards += rewards * active_mask.float()
+        
+        # 2. Success Latch
+        if "log/success" in extras:
+            # extras["log/success"]는 done 시점에만 1.0 (성공 시)
+            current_success = (extras["log/success"] > 0.5)
+            # 현재 활성 상태이고 성공했다면 기록
+            any_success = torch.logical_or(any_success, current_success & active_mask)
+
+        # 3. Violation Latch
+        if "log/violation" in extras:
+            # extras["log/violation"]은 위반 기록이 있으면 1.0
+            current_violation = (extras["log/violation"] > 0.5)
+            any_violation = torch.logical_or(any_violation, current_violation & active_mask)
+        
+        # 4. Mask Update (끝난 환경은 비활성화)
+        active_mask = active_mask & (~dones)
+        
+        # 모든 환경이 끝났으면 조기 종료
+        if not active_mask.any():
+            print(f"All episodes finished at step {step+1}.")
+            break
+        
+        current_batch_graph = convert_batch_state_to_graph(next_obs_dict['policy'], args_cli.num_envs)
 
     # 5. 결과 집계
-    # env.step 마지막 반환값인 extras에 최종 상태가 들어있음
-    # 혹은 env 내부 변수 직접 접근
-    
-    final_success = extras["log/success"] # 0 or 1
-    final_violation_occurred = env.violation_occurred # True or False
-    final_max_pos_err = env.episode_max_pos_error
-    final_max_rot_err = env.episode_max_rot_error
-    
     print("\n" + "="*50)
     print(f"Evaluation Results ({args_cli.num_envs} Episodes)")
     print("="*50)
-    print(f"Success Rate        : {torch.mean(final_success).item()*100:.2f}%")
-    print(f"Violation Rate      : {torch.mean(final_violation_occurred.float()).item()*100:.2f}%")
-    print(f"Avg Max Pos Error   : {torch.mean(final_max_pos_err).item():.4f} m")
-    print(f"Avg Max Rot Error   : {torch.mean(final_max_rot_err).item():.4f} rad")
+    print(f"Success Rate        : {torch.mean(any_success.float()).item()*100:.2f}%")
+    print(f"Violation Rate      : {torch.mean(any_violation.float()).item()*100:.2f}%")
+    # Max Error는 정확한 집계가 어려우므로(reset 문제) 생략하거나 extras 로깅 의존
+    # print(f"Avg Max Pos Error   : {torch.mean(final_max_pos_err).item():.4f} m") 
     print(f"Avg Total Reward    : {torch.mean(total_rewards).item():.4f}")
     print("="*50)
 

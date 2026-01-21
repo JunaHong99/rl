@@ -76,7 +76,7 @@ def main():
     }
     
     # 학습률 등 하이퍼파라미터 설정
-    agent = TD3(gnn_params=gnn_params, max_action=1.0, lr=3e-4)
+    agent = TD3(gnn_params=gnn_params, max_action=1.0, lr=3e-4) #3e-4, 파인튜닝시 1e-4
     
     # --- C. 학습 루프 시작 ---
     obs_dict, _ = env.reset()

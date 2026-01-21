@@ -2,19 +2,13 @@
 
 import pinocchio as pin
 import numpy as np
-import os
+from example_robot_data import load
 
 class FrankaIKSolver:
     def __init__(self):
-        # 1. Franka Panda 로봇 모델 로드 (URDF 직접 로드)
-        # 사용자 환경의 URDF 경로
-        current_dir = os.path.dirname(os.path.abspath(__file__))   
-        urdf_path = os.path.join(current_dir, "../../../asset/robot_urdf/franka_description/franka_panda.urdf")  
-
-        if not os.path.exists(urdf_path):
-            raise FileNotFoundError(f"URDF 파일을 찾을 수 없습니다: {urdf_path}")
-
-        self.model = pin.buildModelFromUrdf(urdf_path)
+        # 1. Franka Panda 로봇 모델 로드 (example-robot-data 사용)
+        self.robot = load("panda")
+        self.model = self.robot.model
         self.data = self.model.createData()
         
         # 2. End-Effector 프레임 ID 찾기

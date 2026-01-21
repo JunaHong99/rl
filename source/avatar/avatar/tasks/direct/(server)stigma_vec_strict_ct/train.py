@@ -58,7 +58,6 @@ def main():
     writer = SummaryWriter(log_dir)
     
     # 성공률 계산을 위한 이동 평균 버퍼 -> 에피소드가 끝날 때만 이 버퍼에 저장됨. 총 stats_buffer_size 개의 에피소드를 저장
-    # 환경 수가 많을 경우 100개는 너무 적어서 그래프가 요동치므로 넉넉하게 잡습니다.
     # 최소 2000개, 혹은 환경 수의 5배 중 큰 값으로 설정
     stats_buffer_size = max(2000, args_cli.num_envs * 5)
     success_buffer = deque(maxlen=stats_buffer_size)
@@ -88,7 +87,7 @@ def main():
     # 메모리 사용량 주의: (1M * Nodes * Dim * 4bytes) -> 1M * 4 * 14 * 4 ~= 224MB (매우 작음)
     # GPU 메모리가 넉넉하다면 device="cuda" 권장
     buffer = VectorizedGraphReplayBuffer(
-        capacity=1000000, 
+        capacity=40000000, 
         num_envs=args_cli.num_envs,
         node_dim=NODE_FEATURE_DIM,
         edge_dim=EDGE_FEATURE_DIM,
@@ -121,50 +120,55 @@ def main():
     print(f"🔄 Start Interaction Loop ({args_cli.max_iterations} steps)...")
     print(f"📂 Logs will be saved to: {log_dir}")
 
+    MAX_EPISODE_STEPS = 300
+    WARMUP_STEPS = MAX_EPISODE_STEPS *2
+
     for step in range(start_step, args_cli.max_iterations):
         
         # -------------------------------------------------
         # 1. Action Selection (GNN Inference)
         # -------------------------------------------------
         # [Vectorized] 이미 Batch 객체이므로 바로 사용 가능
-        
-        agent.actor.eval()
+        if step < WARMUP_STEPS:
+            # -0.5 ~ 0.5 사이의 균등 분포 랜덤 액션 (계산 비용 0)
+            env_actions_tensor = 1 * torch.rand(args_cli.num_envs, 14, device=device) - 0.5
+        else:   
+            agent.actor.eval()
+            with torch.no_grad():
+                # GNN 출력: [Total_Nodes, 7] 
+                full_actions = agent.actor(current_batch_graph)
+                
+                # [수정 제안: 동적 계산] -----------------------------------------
+                # 1. 전체 노드 수와 환경 수로 '그래프당 노드 수'를 역산합니다.
+                #    이렇게 하면 장애물이나 태스크가 늘어나서 노드 수가 4개가 아니게 되어도 코드가 작동합니다.
+                total_nodes = full_actions.shape[0]
+                num_envs = args_cli.num_envs
+                
+                # 산술 검증 (Total Nodes는 반드시 Num Envs의 배수여야 함)
+                assert total_nodes % num_envs == 0, f"Node mismatch: {total_nodes} nodes for {num_envs} envs"
+                
+                num_nodes_per_env = total_nodes // num_envs  # 예: 4, 5, 6... 등으로 자동 계산됨
 
-        with torch.no_grad():
-            # GNN 출력: [Total_Nodes, 7] 
-            full_actions = agent.actor(current_batch_graph)
-            
-            # [수정 제안: 동적 계산] -----------------------------------------
-            # 1. 전체 노드 수와 환경 수로 '그래프당 노드 수'를 역산합니다.
-            #    이렇게 하면 장애물이나 태스크가 늘어나서 노드 수가 4개가 아니게 되어도 코드가 작동합니다.
-            total_nodes = full_actions.shape[0]
-            num_envs = args_cli.num_envs
-            
-            # 산술 검증 (Total Nodes는 반드시 Num Envs의 배수여야 함)
-            assert total_nodes % num_envs == 0, f"Node mismatch: {total_nodes} nodes for {num_envs} envs"
-            
-            num_nodes_per_env = total_nodes // num_envs  # 예: 4, 5, 6... 등으로 자동 계산됨
+                # 2. [Num_Envs, Node_Per_Env, Action_Dim] 형태로 변환
+                reshaped_actions = full_actions.view(num_envs, num_nodes_per_env, -1)
+                
+                # 3. 로봇 노드만 슬라이싱
+                # (주의: DualArm 환경이므로 로봇은 항상 2대라고 가정하거나, 
+                #  env 설정에서 가져오는 변수(env.num_robots 등)를 사용하는 것이 좋습니다)
+                num_robots = 2 
+                
+                # graph_converter에서 로봇 노드를 0, 1번 인덱스에 넣었으므로 앞부분을 가져옵니다.
+                robot_actions = reshaped_actions[:, :num_robots, :] # [Num_Envs, 2, 7]
+                
+                # 4. 환경 입력용 플래튼 [Num_Envs, 14]
+                env_actions_tensor = robot_actions.reshape(num_envs, -1)
+                # -------------------------------------------------------------
+                
+                # Exploration Noise 추가
+                noise = torch.randn_like(env_actions_tensor) * 0.1
+                env_actions_tensor = (env_actions_tensor + noise).clamp(-1.0, 1.0)
 
-            # 2. [Num_Envs, Node_Per_Env, Action_Dim] 형태로 변환
-            reshaped_actions = full_actions.view(num_envs, num_nodes_per_env, -1)
-            
-            # 3. 로봇 노드만 슬라이싱
-            # (주의: DualArm 환경이므로 로봇은 항상 2대라고 가정하거나, 
-            #  env 설정에서 가져오는 변수(env.num_robots 등)를 사용하는 것이 좋습니다)
-            num_robots = 2 
-            
-            # graph_converter에서 로봇 노드를 0, 1번 인덱스에 넣었으므로 앞부분을 가져옵니다.
-            robot_actions = reshaped_actions[:, :num_robots, :] # [Num_Envs, 2, 7]
-            
-            # 4. 환경 입력용 플래튼 [Num_Envs, 14]
-            env_actions_tensor = robot_actions.reshape(num_envs, -1)
-            # -------------------------------------------------------------
-            
-            # Exploration Noise 추가
-            noise = torch.randn_like(env_actions_tensor) * 0.1
-            env_actions_tensor = (env_actions_tensor + noise).clamp(-1.0, 1.0)
-
-        agent.actor.train()
+            agent.actor.train()
 
         # -------------------------------------------------
         # 2. Environment Step
@@ -197,18 +201,10 @@ def main():
         # -------------------------------------------------
         # 버퍼가 어느 정도 차면 학습 시작 (배치 사이즈 256 권장)
         # [수정] 4096 환경 등 대규모 병렬 처리 시 데이터가 빨리 차므로 워밍업을 줄이고, 업데이트 횟수를 늘림
-        if len(buffer) > 100000:
-            # 데이터 유입량(num_envs)에 비례하여 업데이트 횟수 조절
-            # 예: 4096 envs -> 약 32회 업데이트
-            # 예: 1 env -> 1회 업데이트
-            gradient_steps = max(1, args_cli.num_envs // 128) #1024/128 -> 8
-            
+        if step >= WARMUP_STEPS:
+            gradient_steps = max(1, args_cli.num_envs // 128)
             for _ in range(gradient_steps): #버퍼에서 256개의 데이터를 뽑아 업데이트, 이걸 그라디언트 스텝만큼 반복.
                 agent.train(buffer, batch_size=256)
-                
-            # (옵션) 학습 진행 상황 디버깅
-            # if step % 100 == 0:
-            #     print(f"DEBUG: Performed {gradient_steps} gradient updates.")
 
         # -------------------------------------------------
         # 5. Logging (TensorBoard)

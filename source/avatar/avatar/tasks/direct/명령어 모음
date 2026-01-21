@@ -1,0 +1,66 @@
+tensorboard --logdir=logs
+
+새로운 학습
+python train.py --headless --num_envs 1024
+
+리쥼
+python train.py --headless --num_envs 1024 --resume_path "logs/roboballet_03/model_step_55000"
+
+테스트
+python test.py --model_path ./logs/roboballet_03_2/model_step_150000_actor
+
+python experiment.py --model_path "logs/roboballet_.../model_step_50000" --num_envs 100
+       (* 이때 test_dataset_100.pt 파일이 자동으로 생성)
+
+<학습 시 확인 사항>
+1. learning rate 3e-4확인
+2. scaling_factor 확인
+3. episode time 확인
+
+<서버에서 학습 돌리기>
+#필요시 --rm 옵션 제거
+docker run --name junhwa --entrypoint bash -it --gpus all \
+  --network=host --rm \
+  -e "ACCEPT_EULA=Y" \
+  -e "PRIVACY_CONSENT=Y" \
+  -v "/home/junhwa":/home/junhwa \
+  -v ~/docker/isaac-sim/cache/kit:/isaac-sim/kit/cache:rw \
+  -v ~/docker/isaac-sim/cache/ov:/root/.cache/ov:rw \
+  -v ~/docker/isaac-sim/cache/pip:/root/.cache/pip:rw \
+  -v ~/docker/isaac-sim/cache/glcache:/root/.cache/nvidia/GLCache:rw \
+  -v ~/docker/isaac-sim/cache/computecache:/root/.nv/ComputeCache:rw \
+  -v ~/docker/isaac-sim/logs:/root/.nvidia-omniverse/logs:rw \
+  -v ~/docker/isaac-sim/data:/root/.local/share/ov/data:rw \
+  -v ~/docker/isaac-sim/documents:/root/Documents:rw \
+  nvcr.io/nvidia/isaac-lab:2.3.0
+
+#--rm 옵션 없는거.
+docker run --name junhwa --entrypoint bash -it --gpus all \
+  --network=host \
+  -e "ACCEPT_EULA=Y" \
+  -e "PRIVACY_CONSENT=Y" \
+  -v "/home/junhwa":/home/junhwa \
+  -v ~/docker/isaac-sim/cache/kit:/isaac-sim/kit/cache:rw \
+  -v ~/docker/isaac-sim/cache/ov:/root/.cache/ov:rw \
+  -v ~/docker/isaac-sim/cache/pip:/root/.cache/pip:rw \
+  -v ~/docker/isaac-sim/cache/glcache:/root/.cache/nvidia/GLCache:rw \
+  -v ~/docker/isaac-sim/cache/computecache:/root/.nv/ComputeCache:rw \
+  -v ~/docker/isaac-sim/logs:/root/.nvidia-omniverse/logs:rw \
+  -v ~/docker/isaac-sim/data:/root/.local/share/ov/data:rw \
+  -v ~/docker/isaac-sim/documents:/root/Documents:rw \
+  nvcr.io/nvidia/isaac-lab:2.3.0
+  
+<학습 실행 전> 
+export CUDA_VISIBLE_DEVICES=1 -> 사용할 gpu 번호 지정하기.
+python3 -c "import torch; print(f'인식된 GPU 개수: {torch.cuda.device_count()}'); print(f'현재 사용 GPU 이름: {torch.cuda.get_device_name(0)}')"  -> 잘 지정됐나 확인하기
+
+
+<Gemini cli 관련>
+* 최근 세션 목록 확인:
+   gemini list  # 또는 gemini sessions
+* 특정 세션 재개:
+   gemini resume <SESSION_ID>
+* 마지막 세션 바로 이어하기:
+   gemini resume last
+
+
