@@ -24,6 +24,7 @@ parser.add_argument("--action_scale_rot", type=float, default=0.05)
 parser.add_argument("--obstacle_frac", type=float, default=1.0, help="평가 시 장애물 curriculum frac")
 parser.add_argument("--zero_nullspace", action="store_true", help="action[6:8](nullspace)를 0으로 강제 — 진단용")
 parser.add_argument("--no_filter", action="store_true", help="rod safety filter OFF (model_paths의 per-entry @가 우선).")
+parser.add_argument("--num_rounds", type=int, default=2, help="GNN message-passing rounds (GNN 체크포인트 평가 시).")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 app = AppLauncher(args); sim_app = app.app
@@ -48,14 +49,21 @@ def run_eval(model_path, no_filter):
     env.cfg.use_rod_safety_filter = (not no_filter)
     sd = torch.load(os.path.abspath(model_path), map_location=dev, weights_only=False)["model"]
     scale = [args.action_scale_pos]*3 + [args.action_scale_rot]*3 + [1.0]*(A-6)
-    in_dim = sd["actor.mean_head.0.weight"].shape[1]
-    use_full = (in_dim == mlp_policy._state_dim(True))
-    use_lean = (in_dim == mlp_policy._state_dim(False, True))
-    agent = mlp_policy.MLPSACAgent(action_dim=A, action_scale=scale, hidden_dim=256,
-                                   num_hidden_layers=2, use_full_state=use_full,
-                                   use_lean_obstacle=use_lean).to(dev)
+    # MLP(actor.mean_head.* 키 존재) vs GNN 자동 판별
+    if "actor.mean_head.0.weight" in sd:
+        in_dim = sd["actor.mean_head.0.weight"].shape[1]
+        use_full = (in_dim == mlp_policy._state_dim(True))
+        use_lean = (in_dim == mlp_policy._state_dim(False, True))
+        agent = mlp_policy.MLPSACAgent(action_dim=A, action_scale=scale, hidden_dim=256,
+                                       num_hidden_layers=2, use_full_state=use_full,
+                                       use_lean_obstacle=use_lean).to(dev)
+        mode = "full_state" if use_full else ("lean_obstacle" if use_lean else "rod+global")
+    else:
+        import gnn_policy
+        agent = gnn_policy.GNNSACAgent(action_dim=A, num_rounds=args.num_rounds,
+                                       action_scale=scale).to(dev)
+        mode = "GNN"
     agent.load_state_dict(sd); agent.eval()
-    mode = "full_state" if use_full else ("lean_obstacle" if use_lean else "rod+global")
     fmode = "OFF" if no_filter else "ON"
     print("=" * 70)
     print(f"✅ {os.path.basename(model_path)}  input={mode}(dim={in_dim})  filter={fmode}  frac={args.obstacle_frac}")
