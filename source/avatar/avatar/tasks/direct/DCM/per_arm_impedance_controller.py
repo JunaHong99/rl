@@ -251,17 +251,34 @@ class PerArmImpedanceController:
         # ★ 근접-게이트: 어떤 팔 링크도 장애물 d0 이내 없으면 nullspace 토크 0 (운반에 간섭 X).
         return torch.where(near_any.unsqueeze(-1), tau_null, torch.zeros_like(tau_null))
 
+    def _nullspace_rl_torque(self, robot, J, joint_ids, alpha):
+        """RL이 출력한 α(B,)로 팔꿈치 nullspace self-motion 구동 (control: RL이 여분 DoF 직접 제어).
+        τ_null = N·(α·gain·e − D_null·qd), e=ones. N=I−Jᵀ(JJᵀ+λI)⁻¹J로 EE(=rod) 안 흔들게 투영.
+        α∈[-1,1] → 팔꿈치 swing 방향·크기. 모델기반(_nullspace_obstacle_torque)과 달리 RL이 언제·얼마나 결정."""
+        B = J.shape[0]
+        JT = J.transpose(-1, -2)
+        eye6 = torch.eye(6, device=self.device).expand(B, 6, 6)
+        JJt_inv = torch.linalg.inv(torch.bmm(J, JT) + self._null_lambda * eye6)
+        eye7 = torch.eye(7, device=self.device).expand(B, 7, 7)
+        N = eye7 - torch.bmm(JT, torch.bmm(JJt_inv, J))               # (B,7,7)
+        qd = robot.data.joint_vel[:, joint_ids]
+        gain = getattr(self.env.cfg, "null_gain", 5.0)
+        e = torch.ones(B, 7, device=self.device)
+        tau_sec = alpha.unsqueeze(-1) * gain * e - self.D_null * qd    # α 구동 + 댐핑
+        return torch.bmm(N, tau_sec.unsqueeze(-1)).squeeze(-1)        # nullspace 투영
+
     # ──────────────────────────────────────────────────────────────────
     # Main: target → both arms' joint torques
     # ──────────────────────────────────────────────────────────────────
     def compute_torques(self, target_obj_pos, target_obj_quat, target_x_rel=None,
-                        K_arm1=None, K_arm2=None):
+                        K_arm1=None, K_arm2=None, null_alpha1=None, null_alpha2=None):
         """
         Args:
             target_obj_pos: (B, 3) rod target position (world)
             target_obj_quat: (B, 4) rod target quaternion (world)
             target_x_rel: ignored (interface 호환용)
             K_arm1, K_arm2: (B,) per-arm positional stiffness (Stage 1). None이면 고정 self.K_pos.
+            null_alpha1, null_alpha2: (B,) per-arm nullspace 명령 (8-DoF action). None이면 nullspace 미사용.
 
         Returns:
             tau_1, tau_2: (B, 7) joint torques
@@ -298,6 +315,11 @@ class PerArmImpedanceController:
             obs_active = self.env.obstacle_active
             tau_1 = tau_1 + self._nullspace_obstacle_torque(self.robot_1, J1, self.joint_ids_1, obs_pos_w, obs_active)
             tau_2 = tau_2 + self._nullspace_obstacle_torque(self.robot_2, J2, self.joint_ids_2, obs_pos_w, obs_active)
+
+        # 3a'. RL 구동 nullspace (control: 8-DoF action의 α로 팔꿈치 제어 → 팔-장애물 회피 학습).
+        if null_alpha1 is not None:
+            tau_1 = tau_1 + self._nullspace_rl_torque(self.robot_1, J1, self.joint_ids_1, null_alpha1)
+            tau_2 = tau_2 + self._nullspace_rl_torque(self.robot_2, J2, self.joint_ids_2, null_alpha2)
 
         # 3b. Gravity compensation (flag-gated). τ += sign·G(q).
         # EOM: M q̈ + C + G = τ → 정적 유지엔 τ=G 필요. sign은 API convention 따라 부호 테스트로 결정.

@@ -121,7 +121,10 @@ class DualrobotCfg(DirectRLEnvCfg):
     # Cluttered transport (2026-06-19): RL=6-DoF rod pose만. 팔-장애물 회피는 컨트롤러(모델기반
     #   nullspace potential, control A)가 담당 → RL은 깨끗한 운반+rod 라우팅에 집중.
     #   action[0:3] = rod positional delta (누적), action[3:6] = rod rotation delta (axis-angle)
-    action_space = 6
+    #   action[6:8] = 팔당 nullspace α∈[-1,1] (팔꿈치 swing → 팔-장애물 회피). 2026-06-24 arm 회피 단계.
+    #   (구 6-DoF 모델 평가 시엔 action_space=6으로 override 필요.)
+    action_space = 8
+    null_gain = 5.0   # nullspace α→토크 gain (τ_null = N·(α·gain·e − D_null·qd)). 튜닝 대상.
     observation_space = 0 # (자리 채우기, 나중에 _get_obs 수정 시 함께 변경)
     state_space = 0
 

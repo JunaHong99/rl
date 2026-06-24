@@ -289,10 +289,17 @@ class DualrobotEnv(DirectRLEnv):
         rot_aa = self.actions[:, 3:6]
         self.target_obj_pos = self.target_obj_pos + pos_disp
 
-        # 팔-장애물 회피는 컨트롤러(모델기반 nullspace, control A)가 담당 → RL은 rod(6-DoF)만.
         # K_arm 폐기(고정 K).
         self.K_arm1 = None
         self.K_arm2 = None
+        # nullspace α (8-DoF action): action[6:8] = 팔당 팔꿈치 swing 명령 ∈[-1,1].
+        # → 컨트롤러가 N·(α·gain·e)로 팔꿈치를 EE 안 흔들며 swing → 팔-장애물 회피 학습.
+        if self.actions.shape[1] >= 8:
+            self.null_alpha1 = self.actions[:, 6]
+            self.null_alpha2 = self.actions[:, 7]
+        else:
+            self.null_alpha1 = None
+            self.null_alpha2 = None
 
         # ★ target_obj_pos를 env-local ±1m 내로 clamp (graph feature 폭주 방지)
         env_origins = self.scene.env_origins
@@ -365,6 +372,7 @@ class DualrobotEnv(DirectRLEnv):
         tau_1, tau_2, info = self.controller.compute_torques(
             self.target_obj_pos, self.target_obj_quat, self.target_x_rel,
             K_arm1=getattr(self, "K_arm1", None), K_arm2=getattr(self, "K_arm2", None),
+            null_alpha1=getattr(self, "null_alpha1", None), null_alpha2=getattr(self, "null_alpha2", None),
         )
         self.robot_1.set_joint_effort_target(tau_1, joint_ids=self.robot_1_joint_ids)
         self.robot_2.set_joint_effort_target(tau_2, joint_ids=self.robot_2_joint_ids)
