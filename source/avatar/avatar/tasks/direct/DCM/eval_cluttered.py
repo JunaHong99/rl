@@ -62,7 +62,7 @@ def run_eval(model_path, no_filter):
         import gnn_policy
         agent = gnn_policy.GNNSACAgent(action_dim=A, num_rounds=args.num_rounds,
                                        action_scale=scale).to(dev)
-        mode = "GNN"
+        mode, in_dim = "GNN", "graph"
     agent.load_state_dict(sd); agent.eval()
     fmode = "OFF" if no_filter else "ON"
     print("=" * 70)
