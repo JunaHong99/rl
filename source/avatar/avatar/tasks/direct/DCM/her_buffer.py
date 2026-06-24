@@ -161,13 +161,16 @@ class HERReplayBuffer:
                  device: torch.device, k_future: int = 4, max_episode_len: int = 130,
                  strategy: str = "random_task",
                  goal_offset_pos_pool: torch.Tensor | None = None,
-                 goal_offset_quat_pool: torch.Tensor | None = None):
+                 goal_offset_quat_pool: torch.Tensor | None = None,
+                 progress_weight: float = 50.0):
         self.capacity = capacity
         self.num_envs = num_envs
         self.action_dim = action_dim
         self.device = device
         self.k_future = k_future
         self.max_episode_len = max_episode_len
+        # dense 진행 보상 가중치 — original·virtual 모두 동일 적용 (일관성). (prev_dist−cur_dist)*w.
+        self.progress_weight = progress_weight
         assert strategy in ("future", "random_task"), f"unknown HER strategy: {strategy}"
         self.strategy = strategy
         # (start→goal) offset pool — random_task strategy 전용
@@ -362,7 +365,7 @@ class HERReplayBuffer:
             prev_dist_o[1:] = cur_dist_o[:-1]
         prev_dist_o = torch.where(is_first_o, torch.full_like(prev_dist_o, float('inf')), prev_dist_o)
 
-        r_prog_o = (prev_dist_o - cur_dist_o) * 50.0
+        r_prog_o = (prev_dist_o - cur_dist_o) * self.progress_weight
         r_prog_o = torch.where(is_first_o, torch.zeros_like(r_prog_o), r_prog_o)
         reached_o = (pos_err_o < 0.10) & (rot_err_o < 0.30) & ~is_first_o
         reward_o = r_prog_o + torch.where(reached_o, torch.full_like(r_prog_o, 100.0), torch.zeros_like(r_prog_o))
@@ -432,7 +435,8 @@ class HERReplayBuffer:
             is_first_h = torch.zeros(M_her, dtype=torch.bool, device=d)
             r_h, reached_h, _ = recompute_reward(
                 n_rod_p_h, n_rod_q_h, vg_pos, vg_quat,
-                prev_dist_h, is_first_h
+                prev_dist_h, is_first_h,
+                progress_weight=self.progress_weight,   # virtual도 original과 동일 진행 보상 (이전엔 0)
             )
             # goal-무관 보상(충돌 등)은 virtual goal에도 동일하게 더함 (state 기반이므로 보존).
             r_h = r_h + self.ep_goal_indep[t_her, env_her]

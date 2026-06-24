@@ -72,6 +72,9 @@ parser.add_argument("--her_strategy", choices=["future", "random_task"], default
                          "random_task: vg = curriculum offset 풀에서 sampling (trajectory와 무관, exploit 없음).")
 parser.add_argument("--k_future", type=int, default=4,
                     help="HER: 각 transition당 virtual goal 개수 (strategy 무관).")
+parser.add_argument("--her_progress_weight", type=float, default=50.0,
+                    help="HER dense 진행 보상 가중치 (prev_dist−cur_dist)*w. original·virtual 모두 동일 적용. "
+                         "GNN 등 신호 약할 때 ↑. 0이면 sparse-only.")
 parser.add_argument("--resume_path", type=str, default=None)
 parser.add_argument("--init_weights_path", type=str, default=None,
                     help="네트워크 가중치만 로드(optimizer/buffer/step은 fresh, new log_dir). "
@@ -203,8 +206,10 @@ def main():
             strategy=args.her_strategy,
             goal_offset_pos_pool=offset_pos_pool,
             goal_offset_quat_pool=offset_quat_pool,
+            progress_weight=args.her_progress_weight,
         )
-        print(f"🎯 HER enabled: strategy={args.her_strategy}, k_future={args.k_future}, max_ep_len={max_ep_len}")
+        print(f"🎯 HER enabled: strategy={args.her_strategy}, k_future={args.k_future}, "
+              f"progress_weight={args.her_progress_weight}, max_ep_len={max_ep_len}")
 
     if args.resume_path:
         ckpt = torch.load(args.resume_path, map_location=device)
