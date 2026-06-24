@@ -171,6 +171,9 @@ class DualrobotCfg(DirectRLEnvCfg):
     # v1: 고정 반경 kinematic 구. 충돌은 해석적 clearance(rod 선분↔구)로 보상 처리(물리접촉 X).
     #   비활성 슬롯은 멀리(far_away) 보냄. 형태/크기 변이·가변노드는 일반화 단계에서.
     n_obstacles: int = 4              # N_OBS_MAX 슬롯 수 (그래프 obstacle 노드 수와 일치시킬 것)
+    # 일반화 실험용: 학습 시 활성 장애물 최대치 cap (기본 = n_obstacles, 즉 무제한).
+    #   train에 2로 주면 활성 ∈ {0,1,2} → eval(기본 4)에서 3-4는 unseen. GNN vs MLP 일반화 비교.
+    max_active_obstacles: int = 4
     obstacle_radius: float = 0.06     # 구 반경 [m] (고정, v1)
     obstacle_collision_margin: float = 0.05  # clearance < margin이면 graded 페널티 시작 [m] (안전 margin↑)
     obstacle_min_active: int = 1      # 에피소드당 활성 장애물 최소

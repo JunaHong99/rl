@@ -81,6 +81,9 @@ parser.add_argument("--init_weights_path", type=str, default=None,
                          "2-phase warm-start용 (convert_phaseA_to_phaseB.py 출력). resume_path와 배타적.")
 parser.add_argument("--no_rod_filter", action="store_true",
                     help="rod safety filter OFF로 학습 — RL이 회피를 스스로 학습하는지 검증 (Hong2025 노선).")
+parser.add_argument("--max_active_obstacles", type=int, default=None,
+                    help="일반화 실험: 학습 시 활성 장애물 최대치 cap (예: 2 → 활성 ≤2 학습, eval 3-4는 unseen). "
+                         "None이면 cfg 기본(n_obstacles=무제한).")
 parser.add_argument("--curriculum", action="store_true",
                     help="Goal 거리 curriculum: 가까운 거리부터 시작해 점진 확대 (Stage 2 0% 위험 처치).")
 parser.add_argument("--curriculum_start_frac", type=float, default=0.3,
@@ -130,6 +133,9 @@ def main():
     if args.no_rod_filter:
         env_cfg.use_rod_safety_filter = False
         print("⚠️  rod safety filter OFF — RL이 회피를 스스로 학습 (Hong2025 노선)")
+    if args.max_active_obstacles is not None:
+        env_cfg.max_active_obstacles = args.max_active_obstacles
+        print(f"🎯 일반화 실험: 학습 활성 장애물 ≤ {args.max_active_obstacles} (eval >{args.max_active_obstacles}는 unseen)")
     env = DualrobotEnv(cfg=env_cfg, render_mode=None)
 
     # Agent

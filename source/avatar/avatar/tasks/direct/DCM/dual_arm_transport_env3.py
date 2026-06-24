@@ -1002,6 +1002,8 @@ class DualrobotEnv(DirectRLEnv):
             # 장애물 curriculum: frac 0이면 0개(운반만), 1이면 최대 n_obs개.
             frac = getattr(self, "_obstacle_curr_frac", 1.0)
             max_active = int(round(frac * n_obs))
+            # 일반화 실험: 학습 시 활성 장애물 상한 cap (eval은 기본 n_obs라 unseen 수 테스트됨)
+            max_active = min(max_active, int(getattr(self.cfg, "max_active_obstacles", n_obs)))
             if max_active <= 0:
                 K = torch.zeros(num_resets, dtype=torch.long, device=self.device)
             else:
