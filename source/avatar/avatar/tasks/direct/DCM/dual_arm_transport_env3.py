@@ -458,6 +458,17 @@ class DualrobotEnv(DirectRLEnv):
         base_pose_2[:, :3] = base_pose_2_raw[:, :3] - env_origins
         base_poses = torch.stack([base_pose_1, base_pose_2], dim=1)
 
+        # Elbow(panda_link4) 포즈 [B,2,7] env-local — obstacle→robot 엣지를 elbow 프레임 기준으로
+        # (RoboBallet은 tip 기준이나, 우리는 nullspace로 elbow를 제어 → elbow 기준 awareness가 맞음).
+        if not hasattr(self, "_elbow_id"):
+            self._elbow_id = self.robot_1.body_names.index("panda_link4")
+        ep1 = self.robot_1.data.body_pos_w[:, self._elbow_id] - env_origins   # (B,3)
+        ep2 = self.robot_2.data.body_pos_w[:, self._elbow_id] - env_origins
+        eq1 = self.robot_1.data.body_quat_w[:, self._elbow_id]                # (B,4)
+        eq2 = self.robot_2.data.body_quat_w[:, self._elbow_id]
+        elbow_poses = torch.stack([torch.cat([ep1, eq1], -1),
+                                   torch.cat([ep2, eq2], -1)], dim=1)         # (B,2,7)
+
         # 글로벌 (Relative Pose) — frame-invariant (좌표 차이라 env_origins 무관)
         # 1. ee_1의 역회전(inverse rotation) 계산
         ee_state_1_inv_quat = math_utils.quat_conjugate(ee_state_1[:, 3:7])
@@ -525,7 +536,8 @@ class DualrobotEnv(DirectRLEnv):
             "robot_nodes": robot_state,           # [KeyError 원인 해결]
             "current_ee_poses": current_ee_poses, # Edge 계산용
             "goal_poses": task_state,             # Task Node용
-            "base_poses": base_poses,             # Edge 계산용
+            "base_poses": base_poses,             # Edge 계산용 (legacy)
+            "elbow_poses": elbow_poses,           # Robot 노드 pose (link4) — obstacle→robot 엣지 elbow 프레임
             "target_rel_pose": self.target_ee_rel_poses, # Global용
             "target_joint_pos": self.target_joint_pos,   # [추가] Joint Space Target
             "globals": global_state,              # (Legacy, 참고용)

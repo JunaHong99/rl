@@ -184,11 +184,17 @@ def build_edge_template():
     add_pair(EE1_NODE_IDX, EE2_NODE_IDX, 2)
 
     # Proximity edges to obstacles — rod, EE ↔ obstacle.
-    # (robot↔obstacle 엣지는 GNN 전환 시 재추가 — MLP는 엣지 미사용 + buffer 메모리만 먹어 제거.)
     for k in range(N_OBSTACLES):
         add_pair(ROD_NODE_IDX, OBSTACLE_NODE_OFFSET + k, 3)
         add_pair(EE1_NODE_IDX, OBSTACLE_NODE_OFFSET + k, 3)
         add_pair(EE2_NODE_IDX, OBSTACLE_NODE_OFFSET + k, 3)
+
+    # Obstacle → robot (link4/elbow) — 팔-장애물 awareness (2026-06-24, arm 회피 단계).
+    # Unidirectional(RoboBallet식): obstacle→robot으로 정보 흐름. robot 노드 pose=elbow(link4)라
+    # rel_pos가 elbow 프레임 기준 → 정책이 nullspace α로 팔꿈치 swing 방향 결정 가능. type 3 재사용(차원 유지).
+    for k in range(N_OBSTACLES):
+        src.append(OBSTACLE_NODE_OFFSET + k); dst.append(ROBOT1_NODE_IDX); etype.append(3)
+        src.append(OBSTACLE_NODE_OFFSET + k); dst.append(ROBOT2_NODE_IDX); etype.append(3)
 
     return src, dst, etype
 
@@ -424,14 +430,16 @@ def convert_batch_state_to_graph(
 
     # ── Edge feature: type one-hot(4) + 상대 pose(9) (RoboBallet식) ──
     # 노드 pose 조립 (env-local), 순서: Robot1, EE1, Rod, EE2, Robot2, [obstacles].
-    base_poses = raw_state['base_poses']                                   # (B,2,7) env-local
+    # Robot 노드 pose = elbow(link4). obstacle→robot 엣지가 elbow 프레임 기준 rel_pos이 되도록.
+    # (elbow_poses 없으면 base_poses fallback = 구 동작.)
+    robot_poses = raw_state.get('elbow_poses', raw_state['base_poses'])     # (B,2,7) env-local
     node_pos = torch.stack([
-        base_poses[:, 0, :3], current_ee_poses[:, 0, :3], rod_pos,
-        current_ee_poses[:, 1, :3], base_poses[:, 1, :3],
+        robot_poses[:, 0, :3], current_ee_poses[:, 0, :3], rod_pos,
+        current_ee_poses[:, 1, :3], robot_poses[:, 1, :3],
     ], dim=1)                                                              # (B,5,3)
     node_quat = torch.stack([
-        base_poses[:, 0, 3:7], current_ee_poses[:, 0, 3:7], rod_quat,
-        current_ee_poses[:, 1, 3:7], base_poses[:, 1, 3:7],
+        robot_poses[:, 0, 3:7], current_ee_poses[:, 0, 3:7], rod_quat,
+        current_ee_poses[:, 1, 3:7], robot_poses[:, 1, 3:7],
     ], dim=1)                                                              # (B,5,4)
     if obstacle_feat is not None and obstacle_feat.shape[1] > 0:
         node_pos = torch.cat([node_pos, obstacle_pos], dim=1)
