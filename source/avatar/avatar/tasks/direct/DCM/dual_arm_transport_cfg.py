@@ -125,6 +125,12 @@ class DualrobotCfg(DirectRLEnvCfg):
     #   (구 6-DoF 모델 평가 시엔 action_space=6으로 override 필요.)
     action_space = 8
     null_gain = 5.0   # nullspace α→토크 gain (τ_null = N·(α·gain·e − D_null·qd)). 튜닝 대상.
+    # Hard 안전 필터 (RoboBallet velocity-zeroing 근사, 2026-06-25): 팔 링크가 장애물 임박 시
+    #   접근속도 제동 + 강한 barrier (nullspace 투영 X = 안전>task). 충돌 0 지향. 배포/학습 시 켬.
+    use_hard_safety = False
+    hard_d0 = 0.08      # 안전 작동 거리 [m] (링크-장애물 표면거리 < d0면 제동/반발)
+    hard_krep = 30.0    # barrier 반발 게인
+    hard_kbrake = 40.0  # 접근속도 제동 게인
     observation_space = 0 # (자리 채우기, 나중에 _get_obs 수정 시 함께 변경)
     state_space = 0
 

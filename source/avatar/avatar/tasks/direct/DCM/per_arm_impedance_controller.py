@@ -267,6 +267,37 @@ class PerArmImpedanceController:
         tau_sec = alpha.unsqueeze(-1) * gain * e - self.D_null * qd    # α 구동 + 댐핑
         return torch.bmm(N, tau_sec.unsqueeze(-1)).squeeze(-1)        # nullspace 투영
 
+    def _hard_safety_torque(self, robot, joint_ids, obs_pos_w, obs_active):
+        """Hard 안전 토크 (RoboBallet velocity-zeroing 근사). 팔 링크(link4/5/6)가 장애물 임박 시
+        접근속도 제동(kbrake·v_approach) + 강한 barrier(krep/surf) 를 link Jᵀ로 인가.
+        **nullspace 투영 안 함** = 충돌 직전엔 EE(rod)도 양보(안전>task). → 충돌 0 지향."""
+        B = obs_pos_w.shape[0]
+        if self._arm_link_ids is None:
+            names = ["panda_link4", "panda_link5", "panda_link6"]
+            self._arm_link_ids = [robot.body_names.index(n) for n in names]
+        d0 = getattr(self.env.cfg, "hard_d0", 0.08)
+        krep = getattr(self.env.cfg, "hard_krep", 30.0)
+        kbrake = getattr(self.env.cfg, "hard_kbrake", 40.0)
+        lr, r_obs, cap = self.null_link_r, self.env.cfg.obstacle_radius, 80.0
+        jac_full = robot.root_physx_view.get_jacobians()              # (B,nbody,6,ndof)
+        tau = torch.zeros(B, 7, device=self.device)
+        for l in self._arm_link_ids:
+            p_l = robot.data.body_pos_w[:, l, :]                      # (B,3)
+            v_l = robot.data.body_lin_vel_w[:, l, :]                  # (B,3)
+            diff = p_l.unsqueeze(1) - obs_pos_w                       # (B,Nobs,3)
+            dctr = diff.norm(dim=-1)                                  # (B,Nobs)
+            surf = dctr - r_obs - lr                                  # 표면거리
+            within = obs_active & (surf < d0)
+            away = diff / dctr.unsqueeze(-1).clamp_min(1e-6)          # obstacle→link (밀 방향)
+            v_app = -(v_l.unsqueeze(1) * away).sum(-1)               # (B,Nobs) >0 = 접근중
+            surf_safe = surf.clamp_min(5e-3)
+            mag = krep * (1.0 / surf_safe - 1.0 / d0) + kbrake * v_app.clamp_min(0.0)
+            mag = torch.where(within, mag.clamp(max=cap), torch.zeros_like(mag))   # (B,Nobs)
+            f = (mag.unsqueeze(-1) * away).sum(dim=1)                 # (B,3) 합력
+            J_l = jac_full[:, l, :3, :][:, :, joint_ids]             # (B,3,7) 링크 위치 Jacobian
+            tau = tau + torch.bmm(J_l.transpose(-1, -2), f.unsqueeze(-1)).squeeze(-1)
+        return tau
+
     # ──────────────────────────────────────────────────────────────────
     # Main: target → both arms' joint torques
     # ──────────────────────────────────────────────────────────────────
@@ -320,6 +351,14 @@ class PerArmImpedanceController:
         if null_alpha1 is not None:
             tau_1 = tau_1 + self._nullspace_rl_torque(self.robot_1, J1, self.joint_ids_1, null_alpha1)
             tau_2 = tau_2 + self._nullspace_rl_torque(self.robot_2, J2, self.joint_ids_2, null_alpha2)
+
+        # 3a''. Hard 안전 필터 (충돌 0 지향): 팔 링크 장애물 임박 시 제동+반발 (nullspace 투영 X).
+        if (getattr(self.env.cfg, "use_hard_safety", False) and getattr(self.env.cfg, "n_obstacles", 0) > 0
+                and getattr(self.env, "obstacle_active", None) is not None):
+            obs_pos_w = torch.stack([o.data.root_pos_w for o in self.env.obstacles], dim=1)
+            obs_active = self.env.obstacle_active
+            tau_1 = tau_1 + self._hard_safety_torque(self.robot_1, self.joint_ids_1, obs_pos_w, obs_active)
+            tau_2 = tau_2 + self._hard_safety_torque(self.robot_2, self.joint_ids_2, obs_pos_w, obs_active)
 
         # 3b. Gravity compensation (flag-gated). τ += sign·G(q).
         # EOM: M q̈ + C + G = τ → 정적 유지엔 τ=G 필요. sign은 API convention 따라 부호 테스트로 결정.

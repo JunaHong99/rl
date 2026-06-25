@@ -25,6 +25,7 @@ parser.add_argument("--obstacle_frac", type=float, default=1.0, help="평가 시
 parser.add_argument("--zero_nullspace", action="store_true", help="action[6:8](nullspace)를 0으로 강제 — 진단용")
 parser.add_argument("--no_filter", action="store_true", help="rod safety filter OFF (model_paths의 per-entry @가 우선).")
 parser.add_argument("--num_rounds", type=int, default=2, help="GNN message-passing rounds (GNN 체크포인트 평가 시).")
+parser.add_argument("--hard_safety", action="store_true", help="팔 hard 안전 필터 ON (충돌 0 지향) — 기존 모델에 사후 적용 검증용.")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 app = AppLauncher(args); sim_app = app.app
@@ -36,6 +37,9 @@ import isaaclab.utils.math as math_utils
 
 dev = "cuda" if torch.cuda.is_available() else "cpu"
 cfg = DualrobotCfg(); cfg.scene.num_envs = args.num_envs
+if args.hard_safety:
+    cfg.use_hard_safety = True
+    print("🛡️  hard safety filter ON (팔 충돌 0 지향)")
 env = DualrobotEnv(cfg, render_mode=None)            # ★ 부팅/씬 로딩 1회
 env._obstacle_curr_frac = args.obstacle_frac
 A = env.cfg.action_space
