@@ -298,6 +298,39 @@ class PerArmImpedanceController:
             tau = tau + torch.bmm(J_l.transpose(-1, -2), f.unsqueeze(-1)).squeeze(-1)
         return tau
 
+    def _hard_safety_rod_torque(self, J1, J2, obs_pos_w, obs_active):
+        """Rod hard 안전 (velocity-zeroing 근사): rod 선분이 장애물 임박 시 접근속도 제동+barrier.
+        rod에 가할 힘을 양 EE Jᵀ로 분배 인가 → rod가 장애물 직전 stall. 팔과 같은 원리(torque-level)."""
+        B = obs_pos_w.shape[0]
+        HALF_W, ROD_R, cap = 0.4, 0.02, 80.0
+        d0 = getattr(self.env.cfg, "hard_d0", 0.08)
+        krep = getattr(self.env.cfg, "hard_krep", 30.0)
+        kbrake = getattr(self.env.cfg, "hard_kbrake", 40.0)
+        r_obs = self.env.cfg.obstacle_radius
+        rod_pos = self.env.rod.data.root_pos_w                       # (B,3) world
+        rod_quat = self.env.rod.data.root_quat_w
+        rod_vel = self.env.rod.data.root_lin_vel_w                   # (B,3)
+        axis = self._quat_apply(rod_quat, torch.tensor([HALF_W, 0., 0.], device=self.device).expand(B, 3))
+        end1 = rod_pos - axis; seg = 2.0 * axis
+        seg_len2 = (seg * seg).sum(-1, keepdim=True).clamp_min(1e-8)
+        AP = obs_pos_w - end1.unsqueeze(1)                           # (B,N,3)
+        u = ((AP * seg.unsqueeze(1)).sum(-1) / seg_len2).clamp(0., 1.).unsqueeze(-1)
+        closest = end1.unsqueeze(1) + u * seg.unsqueeze(1)          # (B,N,3) rod 선분상 최근접점
+        diff = closest - obs_pos_w                                  # obstacle→rod (밀 방향)
+        dctr = diff.norm(dim=-1)
+        surf = dctr - r_obs - ROD_R
+        within = obs_active & (surf < d0)
+        away = diff / dctr.unsqueeze(-1).clamp_min(1e-6)
+        v_app = -(rod_vel.unsqueeze(1) * away).sum(-1)              # (B,N) >0=접근
+        surf_safe = surf.clamp_min(5e-3)
+        mag = krep * (1.0 / surf_safe - 1.0 / d0) + kbrake * v_app.clamp_min(0.0)
+        mag = torch.where(within, mag.clamp(max=cap), torch.zeros_like(mag))
+        F = (mag.unsqueeze(-1) * away).sum(dim=1)                   # (B,3) rod에 가할 총 힘
+        wrench = torch.cat([0.5 * F, torch.zeros(B, 3, device=self.device)], dim=-1)  # 양 EE에 절반씩
+        tau1 = torch.bmm(J1.transpose(-1, -2), wrench.unsqueeze(-1)).squeeze(-1)
+        tau2 = torch.bmm(J2.transpose(-1, -2), wrench.unsqueeze(-1)).squeeze(-1)
+        return tau1, tau2
+
     # ──────────────────────────────────────────────────────────────────
     # Main: target → both arms' joint torques
     # ──────────────────────────────────────────────────────────────────
@@ -359,6 +392,8 @@ class PerArmImpedanceController:
             obs_active = self.env.obstacle_active
             tau_1 = tau_1 + self._hard_safety_torque(self.robot_1, self.joint_ids_1, obs_pos_w, obs_active)
             tau_2 = tau_2 + self._hard_safety_torque(self.robot_2, self.joint_ids_2, obs_pos_w, obs_active)
+            rt1, rt2 = self._hard_safety_rod_torque(J1, J2, obs_pos_w, obs_active)   # rod도 hard
+            tau_1 = tau_1 + rt1; tau_2 = tau_2 + rt2
 
         # 3b. Gravity compensation (flag-gated). τ += sign·G(q).
         # EOM: M q̈ + C + G = τ → 정적 유지엔 τ=G 필요. sign은 API convention 따라 부호 테스트로 결정.
