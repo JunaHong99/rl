@@ -377,6 +377,53 @@ class DualrobotEnv(DirectRLEnv):
         self.robot_1.set_joint_effort_target(tau_1, joint_ids=self.robot_1_joint_ids)
         self.robot_2.set_joint_effort_target(tau_2, joint_ids=self.robot_2_joint_ids)
         self._last_ctrl_info = info
+        # Velocity-zeroing (RoboBallet식): 충돌 임박+접근 env의 속도를 직접 0 → 즉시 정지 (관성 우회).
+        if getattr(self.cfg, "use_collision_stop", False) and self.cfg.n_obstacles > 0:
+            self._collision_velocity_stop()
+
+    def _collision_velocity_stop(self):
+        """rod/팔 링크가 장애물 표면거리 < stop_margin 이고 *접근 중*이면 그 env의 모든 속도를 0으로 write.
+        방향성(접근중만)이라 물러나는 명령은 다음 스텝 허용 → escapable. RoboBallet velocity-zeroing 근사."""
+        B = self.num_envs
+        margin = getattr(self.cfg, "stop_margin", 0.01)
+        r_obs, ROD_R, HALF_W = self.cfg.obstacle_radius, 0.02, 0.4
+        obs_c = torch.stack([o.data.root_pos_w for o in self.obstacles], dim=1)   # (B,N,3)
+        active = self.obstacle_active                                             # (B,N)
+        # ── rod 선분 최근접점 clearance + 접근 ──
+        rod_pos = self.rod.data.root_pos_w; rod_quat = self.rod.data.root_quat_w
+        rod_vel = self.rod.data.root_lin_vel_w
+        axis = math_utils.quat_apply(rod_quat, torch.tensor([HALF_W, 0., 0.], device=self.device).expand(B, 3))
+        end1 = rod_pos - axis; seg = 2.0 * axis
+        seg_l2 = (seg * seg).sum(-1, keepdim=True).clamp_min(1e-8)
+        u = ((obs_c - end1.unsqueeze(1)) * seg.unsqueeze(1)).sum(-1, keepdim=True) / seg_l2.unsqueeze(1)
+        closest = end1.unsqueeze(1) + u.clamp(0., 1.) * seg.unsqueeze(1)          # (B,N,3)
+        away_r = closest - obs_c; dctr_r = away_r.norm(dim=-1)
+        away_r = away_r / dctr_r.unsqueeze(-1).clamp_min(1e-6)
+        rod_app = -(rod_vel.unsqueeze(1) * away_r).sum(-1)                        # (B,N) >0 접근
+        rod_stall = (active & ((dctr_r - r_obs - ROD_R) < margin) & (rod_app > 0)).any(dim=1)
+        # ── 팔 링크 clearance + 접근 ──
+        if not hasattr(self, "_arm_link_ids"):
+            names = ["panda_link4", "panda_link5", "panda_link6"]
+            self._arm_link_ids = [self.robot_1.body_names.index(n) for n in names]
+        ARM_R = 0.06
+        arm_stall = torch.zeros(B, dtype=torch.bool, device=self.device)
+        for robot in (self.robot_1, self.robot_2):
+            p = robot.data.body_pos_w[:, self._arm_link_ids]                      # (B,L,3)
+            v = robot.data.body_lin_vel_w[:, self._arm_link_ids]                  # (B,L,3)
+            diff = p.unsqueeze(2) - obs_c.unsqueeze(1)                            # (B,L,N,3)
+            d = diff.norm(dim=-1)                                                 # (B,L,N)
+            away = diff / d.unsqueeze(-1).clamp_min(1e-6)
+            app = -(v.unsqueeze(2) * away).sum(-1)                                # (B,L,N)
+            close = active.unsqueeze(1) & ((d - r_obs - ARM_R) < margin) & (app > 0)
+            arm_stall = arm_stall | close.any(dim=(1, 2))
+        stall = rod_stall | arm_stall                                            # (B,)
+        env_ids = stall.nonzero(as_tuple=False).squeeze(-1)
+        if env_ids.numel() > 0:
+            zj = torch.zeros(env_ids.numel(), 7, device=self.device)
+            self.robot_1.write_joint_velocity_to_sim(zj, self.robot_1_joint_ids, env_ids)
+            self.robot_2.write_joint_velocity_to_sim(zj, self.robot_2_joint_ids, env_ids)
+            self.rod.write_root_velocity_to_sim(torch.zeros(env_ids.numel(), 6, device=self.device), env_ids)
+        self._collision_stop_rate = stall.float().mean()
 
     def _get_grasp_wrenches(self):
         """

@@ -85,7 +85,9 @@ parser.add_argument("--max_active_obstacles", type=int, default=None,
                     help="일반화 실험: 학습 시 활성 장애물 최대치 cap (예: 2 → 활성 ≤2 학습, eval 3-4는 unseen). "
                          "None이면 cfg 기본(n_obstacles=무제한).")
 parser.add_argument("--use_hard_safety", action="store_true",
-                    help="팔 hard 안전 필터 ON으로 학습 (충돌 0 지향). RoboBallet velocity-zeroing 근사.")
+                    help="팔 hard 안전 필터 ON으로 학습 (충돌 0 지향). RoboBallet velocity-zeroing 근사(제동토크).")
+parser.add_argument("--use_collision_stop", action="store_true",
+                    help="velocity-zeroing ON: 충돌 임박+접근 시 sim 속도 직접 0 (RoboBallet식, 제동토크보다 즉시정지).")
 parser.add_argument("--curriculum", action="store_true",
                     help="Goal 거리 curriculum: 가까운 거리부터 시작해 점진 확대 (Stage 2 0% 위험 처치).")
 parser.add_argument("--curriculum_start_frac", type=float, default=0.3,
@@ -141,6 +143,9 @@ def main():
     if args.use_hard_safety:
         env_cfg.use_hard_safety = True
         print("🛡️  hard safety filter ON (팔 충돌 0 지향)")
+    if args.use_collision_stop:
+        env_cfg.use_collision_stop = True
+        print("🛑 velocity-zeroing ON (충돌 임박+접근 시 속도 직접 0)")
     env = DualrobotEnv(cfg=env_cfg, render_mode=None)
 
     # Agent

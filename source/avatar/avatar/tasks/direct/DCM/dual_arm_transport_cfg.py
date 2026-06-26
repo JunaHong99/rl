@@ -131,6 +131,10 @@ class DualrobotCfg(DirectRLEnvCfg):
     hard_d0 = 0.08      # 안전 작동 거리 [m] (링크-장애물 표면거리 < d0면 제동/반발)
     hard_krep = 30.0    # barrier 반발 게인
     hard_kbrake = 40.0  # 접근속도 제동 게인
+    # Velocity-zeroing (RoboBallet식, 2026-06-26): 충돌 임박+접근 시 sim 속도를 *직접 0*으로 write.
+    #   제동 토크(effort 한계·관성에 막힘)와 달리 즉시 정지. 방향성=접근중일 때만(물러남은 허용)→escapable.
+    use_collision_stop = False
+    stop_margin = 0.01   # 표면거리 < margin & 접근중이면 그 env 속도 0 [m]
     observation_space = 0 # (자리 채우기, 나중에 _get_obs 수정 시 함께 변경)
     state_space = 0
 
