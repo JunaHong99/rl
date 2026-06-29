@@ -86,6 +86,13 @@ parser.add_argument("--max_active_obstacles", type=int, default=None,
                          "None이면 cfg 기본(n_obstacles=무제한).")
 parser.add_argument("--use_hard_safety", action="store_true",
                     help="팔 hard 안전 필터 ON으로 학습 (충돌 0 지향). RoboBallet velocity-zeroing 근사(제동토크).")
+parser.add_argument("--terminate_on_collision", action="store_true",
+                    help="충돌 시 에피소드 종료(필터/stop 없이 RL이 회피 학습). 페널티=w_collision_term.")
+parser.add_argument("--w_collision_term", type=float, default=None, help="충돌 종료 일회성 페널티 (기본 cfg=20).")
+parser.add_argument("--use_cbf_stop", action="store_true",
+                    help="action-level CBF stop ON (rod 변위를 barrier 밖으로 최소 투영, train-with 교육). soft filter 자동 off.")
+parser.add_argument("--cbf_alpha", type=float, default=None, help="CBF barrier rate (기본 cfg=0.7).")
+parser.add_argument("--cbf_margin", type=float, default=None, help="CBF standoff [m] (기본 cfg=0.03).")
 parser.add_argument("--use_collision_stop", action="store_true",
                     help="velocity-zeroing ON: 충돌 임박+접근 시 sim 속도 직접 0 (RoboBallet식, 제동토크보다 즉시정지).")
 parser.add_argument("--curriculum", action="store_true",
@@ -146,6 +153,20 @@ def main():
     if args.use_collision_stop:
         env_cfg.use_collision_stop = True
         print("🛑 velocity-zeroing ON (충돌 임박+접근 시 속도 직접 0)")
+    if args.terminate_on_collision:
+        env_cfg.terminate_on_collision = True
+        if args.w_collision_term is not None:
+            env_cfg.w_collision_term = args.w_collision_term
+        print(f"🔚 terminate-on-collision ON (penalty=-{env_cfg.w_collision_term}) — 필터/stop 없이 학습으로 회피.")
+    if args.use_cbf_stop:
+        env_cfg.use_cbf_stop = True
+        env_cfg.use_rod_safety_filter = False   # 중복 방지 (CBF가 rod 담당)
+        if args.cbf_alpha is not None:
+            env_cfg.cbf_alpha = args.cbf_alpha
+        if args.cbf_margin is not None:
+            env_cfg.cbf_margin = args.cbf_margin
+        print(f"🧱 CBF stop ON (α={env_cfg.cbf_alpha}, margin={env_cfg.cbf_margin}, soft filter OFF) "
+              f"— train-with 교육 scaffold, eval은 @off로 학습검증")
     env = DualrobotEnv(cfg=env_cfg, render_mode=None)
 
     # Agent
@@ -426,6 +447,10 @@ def main():
             writer.add_scalar("perf/fps", fps, env_steps)
             if args.curriculum:
                 writer.add_scalar("curriculum/frac", env.pose_sampler.curriculum_frac, env_steps)
+            if args.use_cbf_stop and hasattr(env, "_cbf_stop_rate"):
+                writer.add_scalar("diag/cbf_stop_rate", float(env._cbf_stop_rate), env_steps)
+                if hasattr(env, "_cbf_intervene"):
+                    writer.add_scalar("diag/cbf_intervene_mean", float(env._cbf_intervene.mean()), env_steps)
 
             # Action magnitude — 정책 μ가 0으로 collapse하는지 확인용.
             if action_norm_n > 0:

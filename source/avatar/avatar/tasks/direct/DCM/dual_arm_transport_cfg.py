@@ -135,6 +135,18 @@ class DualrobotCfg(DirectRLEnvCfg):
     #   제동 토크(effort 한계·관성에 막힘)와 달리 즉시 정지. 방향성=접근중일 때만(물러남은 허용)→escapable.
     use_collision_stop = False
     stop_margin = 0.01   # 표면거리 < margin & 접근중이면 그 env 속도 0 [m]
+    # ── Action-level CBF stop (2026-06-28): RoboBallet stop의 *외과적* 버전 ──
+    # rod 변위 명령(action[:,0:3])을 장애물 barrier 반평면 밖으로 *최소* 투영(법선 성분만 제거,
+    #   접선=미끄러짐 보존). 이산 CBF: n̂·Δp ≥ −α·h (h=standoff clearance). h→0(벽)에서 법선 침투
+    #   차단=stop, h<0(추종 lag로 안쪽)이면 밀어냄. 상태 overwrite·제동토크 아님 → 명령만 수정(물리적).
+    #   ★ train-WITH(교육 scaffold + 안전탐험), eval은 @off로 *네트워크가 배웠나* 판정. (velocity-zeroing/
+    #   hard brake가 reach 박살낸 원인=과잉 제거; CBF는 법선만 → 협응 보존.) cbf on 시 soft filter는 off.
+    use_cbf_stop = False
+    cbf_alpha = 0.7      # barrier rate (per step). 접근 허용량 = α·h. ↑수록 벽 근처만 개입(=stop에 가까움).
+    cbf_margin = 0.03    # standoff [m] (실제 rod의 추종 lag 흡수 — 목표를 접촉 전 standoff에서 멈춤).
+    cbf_vmargin = 0.06   # 속도 인지 standoff [s]: 접근속도 v_app↑일수록 standoff += vmargin·v_app (정지거리).
+                         #   target-제어는 rod 관성 overshoot를 못 막음 → 빠르면 일찍 개입해 미리 감속.
+    cbf_iters = 3        # 다중 장애물 동시 해소용 투영 반복.
     observation_space = 0 # (자리 채우기, 나중에 _get_obs 수정 시 함께 변경)
     state_space = 0
 
@@ -195,7 +207,13 @@ class DualrobotCfg(DirectRLEnvCfg):
     # 보상 가중치 (2026-06-22 Hong2025 교훈: 충돌 페널티 작게 — 크면 정책이 hesitate/freeze.
     #   RL이 회피를 *배우되* 안 굳도록. rod는 필터 backstop+개입페널티, 팔은 이 작은 페널티로 학습.)
     w_clearance: float = 1.0          # graded clearance 페널티 (5→1 축소)
-    w_collision: float = 7.0          # hard 충돌(관통) 페널티 (25→7 축소, Hong2025 −7 스케일)
+    w_collision: float = 7.0          # hard 충돌(관통) 페널티 (25→7 축소, Hong2025 −7 스케일) [per-step, 비종료 모드]
+    # ── Terminate-on-collision (2026-06-28): 필터/stop 다 폐기 → 충돌 허용하되 *에피소드를 끊어* RL이 회피 학습 ──
+    #   sim과 안 싸우는 표준 RL 교육신호(낙상→종료 식). 충돌 step에서 종료(terminated) + 일회성 페널티.
+    #   ★ 스케일 근거: 일회 페널티 > 잔여 time penalty 최대치(0.2×30=6) 여야 '시간페널티 피하려 자살충돌' 방지.
+    #     +실패 시 foregone success(+100)·progress가 암묵 억제 → 과대페널티(38% 천장) 불필요. 20이 안전대.
+    terminate_on_collision: bool = False
+    w_collision_term: float = 20.0    # 충돌 종료 시 일회성 페널티 (>6 자살방지, <과대 천장).
     w_smooth: float = 0.01            # object-pose 명령 부드러움(가속) 페널티
     w_null: float = 0.2               # nullspace 사용 페널티 (멀 땐 0 → 정밀도 보존, 가까울 땐 팔회피)
     # ── Rod safety filter (RoboBallet식 hard 충돌방지의 rod 버전, 2026-06-22) ──

@@ -287,6 +287,10 @@ class DualrobotEnv(DirectRLEnv):
         self.actions = actions.clone()
         pos_disp = self.actions[:, 0:3]
         rot_aa = self.actions[:, 3:6]
+        # ── Action-level CBF stop: rod 변위 명령을 장애물 barrier 반평면 밖으로 최소 투영 ──
+        # 법선 성분만 제거(접선 보존). train-with 교육 scaffold. cfg 참고. (target 누적 전에 적용.)
+        if getattr(self.cfg, "use_cbf_stop", False) and self.cfg.n_obstacles > 0:
+            pos_disp = self._apply_cbf_stop(pos_disp)
         self.target_obj_pos = self.target_obj_pos + pos_disp
 
         # K_arm 폐기(고정 K).
@@ -326,7 +330,9 @@ class DualrobotEnv(DirectRLEnv):
 
         # ── Rod safety filter (RoboBallet식 hard 충돌방지의 rod 버전) ──
         # RL 목표를 적용하기 직전에, 그 목표 자세의 rod 선분이 활성 장애물을 침범하지 않도록 projection.
-        if getattr(self.cfg, "use_rod_safety_filter", False) and self.cfg.n_obstacles > 0:
+        # CBF stop과 soft filter는 중복 적용 금지 (CBF가 켜지면 soft filter skip).
+        if (getattr(self.cfg, "use_rod_safety_filter", False) and self.cfg.n_obstacles > 0
+                and not getattr(self.cfg, "use_cbf_stop", False)):
             self._apply_rod_safety_filter()
 
     def _apply_rod_safety_filter(self) -> None:
@@ -366,6 +372,47 @@ class DualrobotEnv(DirectRLEnv):
         self.target_obj_pos = torch.clamp(p - env_origins, min=-1.0, max=1.0) + env_origins
         # 개입량(=필터가 target을 민 거리). reward에서 페널티로 사용 (RL이 rod 회피 학습).
         self._rod_filter_push = torch.norm(self.target_obj_pos - p0, dim=-1)      # (B,)
+
+    def _apply_cbf_stop(self, pos_disp: torch.Tensor) -> torch.Tensor:
+        """이산 CBF: rod 변위 명령 Δp를 장애물 barrier 반평면 밖으로 *최소* 투영.
+        제약(활성 장애물 k): n̂_k·Δp ≥ −α·h_k,  h_k = standoff clearance, n̂_k = 장애물→rod(멀어지는) 단위.
+        위반 시 corr = relu(−slack)·n̂_k 만 더함 → *법선 성분만* 제거, 접선(미끄러짐) 보존. h→0에서 법선 침투
+        차단=stop / h<0(lag로 안쪽)이면 밀어냄(자기복구). 현 누적 target rod 선분 기하 사용, margin이 실제 rod의
+        추종 lag 흡수. 보상 페널티 없음 — 교육은 'stop으로 goal 못 감→진행 0'이라는 결과 자체(RoboBallet식)."""
+        B = self.num_envs
+        alpha = float(getattr(self.cfg, "cbf_alpha", 0.7))
+        margin = float(getattr(self.cfg, "cbf_margin", 0.03))
+        vmargin = float(getattr(self.cfg, "cbf_vmargin", 0.06))
+        iters = int(getattr(self.cfg, "cbf_iters", 3))
+        ROD_R, HALF_W = 0.02, 0.4
+        obs_c = torch.stack([o.data.root_pos_w for o in self.obstacles], dim=1)   # (B,N,3)
+        active = self.obstacle_active                                             # (B,N)
+        # 현재 누적 target rod 선분 (변위 적용 전 자세)
+        axis = math_utils.quat_apply(
+            self.target_obj_quat, torch.tensor([HALF_W, 0., 0.], device=self.device).expand(B, 3))
+        end1 = self.target_obj_pos - axis; seg = 2.0 * axis
+        seg_l2 = (seg * seg).sum(-1, keepdim=True).clamp_min(1e-8)
+        u = ((obs_c - end1.unsqueeze(1)) * seg.unsqueeze(1)).sum(-1, keepdim=True) / seg_l2.unsqueeze(1)
+        closest = end1.unsqueeze(1) + u.clamp(0., 1.) * seg.unsqueeze(1)          # (B,N,3)
+        away = closest - obs_c; dctr = away.norm(dim=-1)                          # (B,N)
+        nhat = away / dctr.unsqueeze(-1).clamp_min(1e-6)                          # (B,N,3) 멀어지는 단위
+        # 속도 인지 standoff: 실제 rod가 빠르게 접근하면(관성 overshoot 위험) standoff를 키워 일찍 개입.
+        rod_vel = self.rod.data.root_lin_vel_w                                    # (B,3) 실제 rod 속도
+        v_app = (-(rod_vel.unsqueeze(1) * nhat).sum(-1)).clamp_min(0.0)           # (B,N) 접근속도(>0)
+        h = dctr - self.cfg.obstacle_radius - ROD_R - margin - vmargin * v_app    # (B,N) 속도인지 clearance
+        dp = pos_disp.clone()
+        for _ in range(iters):
+            slack = (nhat * dp.unsqueeze(1)).sum(-1) + alpha * h                  # (B,N) ≥0 ok
+            viol = active & (slack < 0)
+            corr = (torch.relu(-slack).unsqueeze(-1) * nhat * viol.unsqueeze(-1)).sum(dim=1)  # (B,3)
+            dp = dp + corr
+        # target 급점프 방지 안전 clamp
+        dpn = dp.norm(dim=-1, keepdim=True)
+        dp = torch.where(dpn > 0.12, dp * (0.12 / dpn.clamp_min(1e-6)), dp)
+        self._cbf_intervene = torch.norm(dp - pos_disp, dim=-1)                   # (B,) 로깅용 개입량
+        surf = dctr - self.cfg.obstacle_radius - ROD_R                            # 실제 표면거리
+        self._cbf_stop_rate = (active & (surf < margin)).any(dim=1).float().mean()
+        return dp
 
     def _apply_action(self) -> None:
         """target_obj_pos/quat를 controller로 joint torque에 매핑해 양 arm에 인가."""
@@ -716,7 +763,8 @@ class DualrobotEnv(DirectRLEnv):
         r_collision = torch.zeros_like(pos_err)
         r_smooth = torch.zeros_like(pos_err)
         if self.cfg.n_obstacles > 0:
-            ost = self._get_obstacle_state()
+            # _get_dones가 이번 step에 이미 계산해둔 캐시 재사용 (없으면 계산).
+            ost = self._ost_cache if getattr(self, "_ost_cache", None) is not None else self._get_obstacle_state()
             rod_clr = ost["min_clearance"]                      # (B,) rod↔obstacle
             arm_clr = ost["arm_min_clearance"]                  # (B,) arm↔obstacle
             margin = self.cfg.obstacle_collision_margin
@@ -725,8 +773,10 @@ class DualrobotEnv(DirectRLEnv):
             min_clr = torch.minimum(rod_clr, arm_clr)
             r_clearance = -self.cfg.w_clearance * torch.clamp(margin - min_clr, min=0.0)
             in_collision = min_clr < 0.0
-            r_collision = torch.where(in_collision, -float(self.cfg.w_collision),
-                                      torch.zeros_like(pos_err))
+            # terminate-on-collision 모드: 일회성 종료 페널티(w_collision_term). 아니면 기존 per-step 페널티.
+            w_coll = (float(self.cfg.w_collision_term) if getattr(self.cfg, "terminate_on_collision", False)
+                      else float(self.cfg.w_collision))
+            r_collision = torch.where(in_collision, -w_coll, torch.zeros_like(pos_err))
             self._in_collision = in_collision
             self.extras["diag/rod_clearance_mm"] = rod_clr.mean() * 1000
             self.extras["diag/arm_clearance_mm"] = arm_clr.mean() * 1000
@@ -918,13 +968,24 @@ class DualrobotEnv(DirectRLEnv):
 
         is_success = is_reached
         time_out = self.episode_length_buf >= self.max_episode_length - 1
+        # ── 충돌 시 종료 (2026-06-28) ── _get_dones가 _get_rewards보다 먼저 호출되므로 여기서 현재 step
+        # 충돌을 계산해 terminated에 OR. obstacle_state는 캐시해 _get_rewards가 재사용(중복 compute 방지).
+        self._ost_cache = None
+        collide_now = torch.zeros_like(is_success)
+        if self.cfg.n_obstacles > 0:
+            self._ost_cache = self._get_obstacle_state()
+            min_clr_now = torch.minimum(self._ost_cache["min_clearance"], self._ost_cache["arm_min_clearance"])
+            collide_now = (min_clr_now < 0.0)
+        collide_term = collide_now if getattr(self.cfg, "terminate_on_collision", False) else torch.zeros_like(is_success)
         # success 도달 시 episode를 끊어 새로운 goal을 더 자주 보게 한다.
         # (2026-06-11) settle 중 종료 금지: _get_dones는 _get_rewards보다 먼저 호출돼
         # log/is_reached가 직전 step(=직전 episode 성공) 값으로 stale. 성공 직후 reset된
         # 새 episode의 첫 settle step에서 이 stale True가 terminated를 즉시 발화 → RL 0-step
         # phantom episode(실패로 오집계)가 발생했음. settle 중엔 정책이 작동 안 하므로
         # 애초에 success 불가 → ~_is_settle_step gate로 stale 누수와 phantom 동시 차단.
-        terminated = is_success & ~self._is_settle_step
+        terminated = (is_success | collide_term) & ~self._is_settle_step
+        if getattr(self.cfg, "terminate_on_collision", False) and self.cfg.n_obstacles > 0:
+            self.extras["diag/collision_term_rate"] = (collide_term & ~self._is_settle_step).float().mean()
 
         # Episode-level metric은 terminated 또는 timeout 시점에만 갱신한다.
         done = terminated | time_out
