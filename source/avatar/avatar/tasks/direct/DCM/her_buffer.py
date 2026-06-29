@@ -234,6 +234,10 @@ class HERReplayBuffer:
         # goal-무관 보상 (time+smooth+clearance+collision). HER relabel해도 보존돼야 함
         # (RoboBallet: R_collision은 goal 무관 → virtual goal에도 그대로 더함). 2026-06-18.
         self.ep_goal_indep = torch.zeros(L, B, device=d)
+        # 충돌 발생 step 기록 (2026-06-29): future-strategy HER가 충돌 state를 virtual goal로
+        # 쓰지 않도록 (충돌 위치를 "도달 목표"로 보상하는 confound 차단). terminate-on-collision이면
+        # 충돌=마지막 step.
+        self.ep_collision = torch.zeros(L, B, dtype=torch.bool, device=d)
 
         # Per-env episode step pointer
         self.ep_step = torch.zeros(B, dtype=torch.long, device=d)
@@ -253,7 +257,8 @@ class HERReplayBuffer:
 
     def add_step(self, batch_state: Batch, action, reward, next_batch_state: Batch, done,
                  rod_pos, rod_quat, next_rod_pos, next_rod_quat,
-                 goal_pos, goal_quat, valid_mask=None, goal_indep_reward=None):
+                 goal_pos, goal_quat, valid_mask=None, goal_indep_reward=None,
+                 collision_mask=None):
         """매 env.step마다 호출. Episode buffer에 임시 저장 + done env들 HER 처리.
 
         Args:
@@ -298,6 +303,10 @@ class HERReplayBuffer:
         self.ep_goal_quat[s_v, valid_idx] = goal_quat[valid_idx]
         if goal_indep_reward is not None:
             self.ep_goal_indep[s_v, valid_idx] = goal_indep_reward[valid_idx]
+        if collision_mask is not None:
+            self.ep_collision[s_v, valid_idx] = collision_mask[valid_idx]
+        else:
+            self.ep_collision[s_v, valid_idx] = False
 
         # Increment ep_step only for valid envs
         self.ep_step[valid_idx] += 1
@@ -379,8 +388,12 @@ class HERReplayBuffer:
         #   future: (env, t) pair 중 future_t > t 있는 것만. vg = rod 자신의 미래 위치.
         #   random_task: 모든 (env, t). vg = ep_rod_start + (random offset from task pool).
         if self.strategy == "future":
-            valid_mask = t_flat < (T_per - 1)
-        else:  # random_task — 모든 transition을 HER 대상
+            # 충돌 state는 virtual goal 후보에서 제외. terminate-on-collision이면 충돌=마지막 step이므로
+            # last_goal = (T-1) − [마지막 step이 충돌이면 1]. 유효 future가 없는 transition은 HER 제외.
+            term_coll_flat = self.ep_collision[(T_per - 1).clamp(min=0), env_flat]   # (M_orig,)
+            last_goal_flat = (T_per - 1) - term_coll_flat.long()
+            valid_mask = t_flat < last_goal_flat
+        else:  # random_task — 모든 transition을 HER 대상 (virtual goal=합성, 충돌 state 안 씀 → 무관)
             valid_mask = torch.ones_like(t_flat, dtype=torch.bool)
 
         if self.k_future > 0 and bool(valid_mask.any().item()):
@@ -394,10 +407,12 @@ class HERReplayBuffer:
             M_her = int(t_her.numel())
 
             if self.strategy == "future":
-                # future_t ~ Uniform{t+1, ..., T_her - 1}
-                range_size = (T_her - 1 - t_her).clamp(min=1).float()
+                # future_t ~ Uniform{t+1, ..., last_goal}  (충돌 step 제외; valid_mask가 last_goal≥t+1 보장)
+                term_coll_w = self.ep_collision[(T_her - 1).clamp(min=0), env_her]
+                last_goal_her = (T_her - 1) - term_coll_w.long()
+                range_size = (last_goal_her - t_her).clamp(min=1).float()
                 rand_off = (torch.rand(M_her, device=d) * range_size).long()
-                future_t = (t_her + 1 + rand_off).clamp(max=T_her - 1)
+                future_t = (t_her + 1 + rand_off).clamp(max=last_goal_her)
                 vg_pos = self.ep_next_rod_pos[future_t, env_her]
                 vg_quat = self.ep_next_rod_quat[future_t, env_her]
             else:  # random_task

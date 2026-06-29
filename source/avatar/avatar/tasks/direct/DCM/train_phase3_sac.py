@@ -387,6 +387,7 @@ def main():
                 goal_pos, goal_quat,
                 valid_mask=valid_mask,
                 goal_indep_reward=getattr(env, "_goal_indep_reward", None),
+                collision_mask=getattr(env, "_collision_now", None),
             )
         else:
             # add_batch는 valid_mask 미지원 — 전체 settle 중일 때만 skip (보수적)

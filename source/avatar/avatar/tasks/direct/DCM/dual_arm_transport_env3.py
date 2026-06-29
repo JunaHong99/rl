@@ -880,17 +880,27 @@ class DualrobotEnv(DirectRLEnv):
         clearance = dist - ROD_R - radius
         clr_masked = torch.where(self.obstacle_active, clearance, torch.full_like(clearance, 1e3))
 
-        # ── 팔 링크↔장애물 clearance (nullspace로 제어 가능 → 보상으로 학습) ──
-        # feature 아님(정책엔 관절각+상대pose 엣지만). 여기선 보상 신호용 실제 충돌 검사.
-        if not hasattr(self, "_arm_link_ids"):
-            names = ["panda_link4", "panda_link5", "panda_link6"]   # 팔꿈치/팔뚝/손목
-            self._arm_link_ids = [self.robot_1.body_names.index(n) for n in names]
+        # ── 팔 capsule chain ↔ 장애물 clearance (2026-06-29: 3-점근사 → capsule) ──
+        # 연속 링크 프레임 사이를 *선분(capsule)*으로 근사 → 장애물-선분 거리. 이전엔 link4/5/6
+        # 프레임 원점 3점뿐이라 링크 *몸체*(forearm 등)가 빈틈 → 가는 장애물이 점 사이로 빠졌음.
+        # feature 아님(정책엔 관절각+상대pose 엣지만). 여기선 보상/종료 신호용 실제 충돌 검사.
+        if not hasattr(self, "_arm_chain_ids"):
+            chain = ["panda_link3", "panda_link4", "panda_link5", "panda_link6", "panda_link7", "panda_hand"]
+            self._arm_chain_ids = [self.robot_1.body_names.index(n) for n in chain
+                                   if n in self.robot_1.body_names]
         ARM_R = 0.06
-        l1 = self.robot_1.data.body_pos_w[:, self._arm_link_ids]    # (B,L,3)
-        l2 = self.robot_2.data.body_pos_w[:, self._arm_link_ids]
-        arm_pts = torch.cat([l1, l2], dim=1)                        # (B,2L,3)
-        d_am = torch.cdist(obs_pos_w, arm_pts)                      # (B,n_obs,2L)
-        arm_clr = d_am.min(dim=2).values - ARM_R - radius           # (B,n_obs)
+        def _arm_capsule_clr(robot):
+            pts = robot.data.body_pos_w[:, self._arm_chain_ids]     # (B,M,3) chain 점들
+            a = pts[:, :-1].unsqueeze(1)                            # (B,1,S,3) 선분 시작
+            b = pts[:, 1:].unsqueeze(1)                             # (B,1,S,3) 선분 끝
+            ab = b - a
+            ab2 = (ab * ab).sum(-1).clamp_min(1e-8)                 # (B,1,S)
+            o = obs_pos_w.unsqueeze(2)                              # (B,N,1,3)
+            t = (((o - a) * ab).sum(-1) / ab2).clamp(0.0, 1.0)      # (B,N,S)
+            closest = a + t.unsqueeze(-1) * ab                      # (B,N,S,3)
+            return (o - closest).norm(dim=-1).min(dim=2).values     # (B,N) 최근접 선분거리
+        d_arm = torch.minimum(_arm_capsule_clr(self.robot_1), _arm_capsule_clr(self.robot_2))  # (B,N)
+        arm_clr = d_arm - ARM_R - radius                            # (B,n_obs)
         arm_clr_masked = torch.where(self.obstacle_active, arm_clr, torch.full_like(arm_clr, 1e3))
 
         return {
@@ -976,6 +986,8 @@ class DualrobotEnv(DirectRLEnv):
             self._ost_cache = self._get_obstacle_state()
             min_clr_now = torch.minimum(self._ost_cache["min_clearance"], self._ost_cache["arm_min_clearance"])
             collide_now = (min_clr_now < 0.0)
+        # HER 버퍼가 충돌 state를 virtual goal에서 제외하도록 노출 (future strategy용).
+        self._collision_now = collide_now & ~self._is_settle_step
         collide_term = collide_now if getattr(self.cfg, "terminate_on_collision", False) else torch.zeros_like(is_success)
         # success 도달 시 episode를 끊어 새로운 goal을 더 자주 보게 한다.
         # (2026-06-11) settle 중 종료 금지: _get_dones는 _get_rewards보다 먼저 호출돼
