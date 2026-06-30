@@ -890,6 +890,7 @@ class DualrobotEnv(DirectRLEnv):
                                    if n in self.robot_1.body_names]
         ARM_R = 0.06
         def _arm_capsule_clr(robot):
+            """returns (min_dist (B,N), closest_pt (B,N,3)) — 장애물별 팔 chain 최근접 거리·점."""
             pts = robot.data.body_pos_w[:, self._arm_chain_ids]     # (B,M,3) chain 점들
             a = pts[:, :-1].unsqueeze(1)                            # (B,1,S,3) 선분 시작
             b = pts[:, 1:].unsqueeze(1)                             # (B,1,S,3) 선분 끝
@@ -897,11 +898,22 @@ class DualrobotEnv(DirectRLEnv):
             ab2 = (ab * ab).sum(-1).clamp_min(1e-8)                 # (B,1,S)
             o = obs_pos_w.unsqueeze(2)                              # (B,N,1,3)
             t = (((o - a) * ab).sum(-1) / ab2).clamp(0.0, 1.0)      # (B,N,S)
-            closest = a + t.unsqueeze(-1) * ab                      # (B,N,S,3)
-            return (o - closest).norm(dim=-1).min(dim=2).values     # (B,N) 최근접 선분거리
-        d_arm = torch.minimum(_arm_capsule_clr(self.robot_1), _arm_capsule_clr(self.robot_2))  # (B,N)
+            cp = a + t.unsqueeze(-1) * ab                           # (B,N,S,3)
+            d = (o - cp).norm(dim=-1)                               # (B,N,S)
+            dmin, smin = d.min(dim=2)                               # (B,N),(B,N) 최근접 선분
+            closest_pt = torch.gather(cp, 2, smin[..., None, None].expand(-1, -1, 1, 3)).squeeze(2)  # (B,N,3)
+            return dmin, closest_pt
+        d1, cp1 = _arm_capsule_clr(self.robot_1)
+        d2, cp2 = _arm_capsule_clr(self.robot_2)
+        d_arm = torch.minimum(d1, d2)                               # (B,N)
         arm_clr = d_arm - ARM_R - radius                            # (B,n_obs)
         arm_clr_masked = torch.where(self.obstacle_active, arm_clr, torch.full_like(arm_clr, 1e3))
+
+        # ── 최근접점 clearance 벡터 (장애물→최근접점 차이벡터; observation용, 2026-06-30) ──
+        # 정책이 "어느 부위가 얼마나·어느 방향으로 가까운지" 직접 지각 → 학습된 회피.
+        rod_clr_vec = closest - obs_pos_w                           # (B,N,3) rod 선분 최근접점
+        arm1_clr_vec = cp1 - obs_pos_w                              # (B,N,3) 팔1 chain 최근접점
+        arm2_clr_vec = cp2 - obs_pos_w                              # (B,N,3) 팔2 chain 최근접점
 
         return {
             "pos_local": obs_pos_w - env_origins.unsqueeze(1),
@@ -912,6 +924,9 @@ class DualrobotEnv(DirectRLEnv):
             "min_clearance": clr_masked.min(dim=1).values,          # rod↔obstacle
             "arm_min_clearance": arm_clr_masked.min(dim=1).values,  # arm↔obstacle
             "clearance_all": clr_masked,
+            "rod_clr_vec": rod_clr_vec,
+            "arm1_clr_vec": arm1_clr_vec,
+            "arm2_clr_vec": arm2_clr_vec,
         }
 
     def _build_policy_batch(self):
@@ -947,6 +962,9 @@ class DualrobotEnv(DirectRLEnv):
                 obstacle_radius=ost["radius"],
                 obstacle_vel=ost["vel"],
                 obstacle_dist=ost["dist_to_rod"],
+                obstacle_rod_clr=ost["rod_clr_vec"],
+                obstacle_arm1_clr=ost["arm1_clr_vec"],
+                obstacle_arm2_clr=ost["arm2_clr_vec"],
             )
 
         return gc.convert_batch_state_to_graph(
