@@ -28,6 +28,7 @@ parser.add_argument("--num_rounds", type=int, default=2, help="GNN message-passi
 parser.add_argument("--hard_safety", action="store_true", help="팔 hard 안전 필터 ON (충돌 0 지향) — 기존 모델에 사후 적용 검증용.")
 parser.add_argument("--collision_stop", action="store_true", help="velocity-zeroing ON (충돌 임박+접근 시 속도 직접 0).")
 parser.add_argument("--cbf_stop", action="store_true", help="action-level CBF stop ON. @off(미지정)이 학습검증 기본 — thesis 판정.")
+parser.add_argument("--swivel", action="store_true", help="ψ_des swivel handle ON (swivel로 학습한 모델 평가 시 필수 — 안 켜면 ψ_des를 α로 오해석).")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 app = AppLauncher(args); sim_app = app.app
@@ -39,6 +40,9 @@ import isaaclab.utils.math as math_utils
 
 dev = "cuda" if torch.cuda.is_available() else "cpu"
 cfg = DualrobotCfg(); cfg.scene.num_envs = args.num_envs
+if args.swivel:
+    cfg.use_swivel_nullspace = True
+    print(f"🦾 swivel nullspace handle ON (ψ_des, K_sw={cfg.swivel_gain}) — swivel로 학습한 모델 평가 시 필수")
 if args.hard_safety:
     cfg.use_hard_safety = True
     print("🛡️  hard safety filter ON (팔 충돌 0 지향)")
