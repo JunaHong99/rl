@@ -96,6 +96,7 @@ class PerArmImpedanceController:
         self.null_link_r = 0.06    # 팔 링크 반경 근사 [m]
         self.null_tau_cap = 30.0   # 링크당 반발 토크 크기 제한
         self._arm_link_ids = None  # lazy: 팔 링크 body 인덱스
+        self._swivel_ids = None    # lazy: (shoulder, elbow, wrist) body 인덱스 (ψ_des handle)
         # 2026-06-19: 당장은 nullspace 팔-회피 OFF. RL(GNN, obstacle→arm 엣지)이 거시 회피를
         # 먼저 학습하게 두고, task 수행이 안 되면(미세 팔 충돌 잔여) 그때 True로 재활성.
         self.use_nullspace_avoidance = False
@@ -267,6 +268,53 @@ class PerArmImpedanceController:
         tau_sec = alpha.unsqueeze(-1) * gain * e - self.D_null * qd    # α 구동 + 댐핑
         return torch.bmm(N, tau_sec.unsqueeze(-1)).squeeze(-1)        # nullspace 투영
 
+    def _nullspace_swivel_torque(self, robot, J, joint_ids, psi_des):
+        """RL이 출력한 목표 swivel각 ψ_des(B,)로 팔꿈치를 nullspace로 *servo* (전 범위 position setpoint).
+        swivel각 = 어깨(link2)–손목(link6) 축 둘레 팔꿈치(link4) 원 위 위치. ψ_des∈[-1,1] → [-π,π].
+        τ_null = N·(Jₑᵀ·K·(E_des−E_cur) − D·qd). N으로 EE(=rod) 불간섭. α 핸들(e=ones, 1방향 blunt push)과
+        달리 *전 원 도달* + position setpoint라 rod 끌림에 self-correct (예측 부담 없음)."""
+        B = J.shape[0]
+        if self._swivel_ids is None:
+            bn = list(robot.body_names)
+            self._swivel_ids = (bn.index("panda_link2"), bn.index("panda_link4"), bn.index("panda_link6"))
+        sh_i, el_i, wr_i = self._swivel_ids
+        # ★ 동역학적으로 일관된 nullspace projector (2026-06-30):
+        # kinematic N=I−Jᵀ(JJᵀ)⁻¹J는 *속도*만 EE 고정 → 토크로 쓰면 M⁻¹ 커플링으로 EE 가속 leak →
+        # 닫힌사슬 rod 200mm 드리프트(K_sw 무관). N_dyn=I−Jᵀ(JM⁻¹Jᵀ)⁻¹JM⁻¹ → EE 가속 0 보장.
+        JT = J.transpose(-1, -2)
+        eye6 = torch.eye(6, device=self.device).expand(B, 6, 6)
+        eye7 = torch.eye(7, device=self.device).expand(B, 7, 7)
+        M_full = robot.root_physx_view.get_mass_matrices()        # (B, ndof, ndof)
+        M = M_full[:, joint_ids][:, :, joint_ids]                 # (B,7,7) 팔 관절만
+        Minv = torch.linalg.inv(M)
+        JMinv = torch.bmm(J, Minv)                                # (B,6,7)
+        Lam = torch.linalg.inv(torch.bmm(JMinv, JT) + self._null_lambda * eye6)   # (B,6,6)
+        N = eye7 - torch.bmm(JT, torch.bmm(Lam, JMinv))           # (B,7,7) dynamically consistent
+        # 어깨/팔꿈치/손목 world 위치 → SW 축 + 팔꿈치 원(중심·반지름)
+        sh = robot.data.body_pos_w[:, sh_i]; el = robot.data.body_pos_w[:, el_i]; wr = robot.data.body_pos_w[:, wr_i]
+        axis = wr - sh; axis = axis / axis.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        rel = el - sh
+        center = sh + (rel * axis).sum(-1, keepdim=True) * axis
+        radius = (el - center).norm(dim=-1, keepdim=True)
+        # 원 평면 기준축 (world up를 축에 수직 투영; 축이 거의 수직이면 x로 fallback)
+        up = torch.tensor([0., 0., 1.], device=self.device).expand(B, 3)
+        ref = up - (up * axis).sum(-1, keepdim=True) * axis
+        fb = torch.tensor([1., 0., 0.], device=self.device).expand(B, 3)
+        ref = torch.where(ref.norm(dim=-1, keepdim=True) < 1e-3,
+                          fb - (fb * axis).sum(-1, keepdim=True) * axis, ref)
+        ref = ref / ref.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        ref2 = torch.cross(axis, ref, dim=-1)
+        # ψ_des → 목표 팔꿈치 점 E_des (원 위)
+        psi = psi_des.clamp(-1., 1.) * torch.pi
+        E_des = center + radius * (torch.cos(psi).unsqueeze(-1) * ref + torch.sin(psi).unsqueeze(-1) * ref2)
+        # 팔꿈치 position Jacobian (3×7) — body index로 직접 인덱싱(EE와 동일 규약)
+        Je = robot.root_physx_view.get_jacobians()[:, el_i, :3, :][:, :, joint_ids]   # (B,3,7)
+        qd = robot.data.joint_vel[:, joint_ids]
+        K_sw = getattr(self.env.cfg, "swivel_gain", 60.0)
+        f = K_sw * (E_des - el)                                                       # (B,3) 목표로 끄는 힘
+        tau_sec = torch.bmm(Je.transpose(-1, -2), f.unsqueeze(-1)).squeeze(-1) - self.D_null * qd
+        return torch.bmm(N, tau_sec.unsqueeze(-1)).squeeze(-1)                        # nullspace 투영
+
     def _hard_safety_torque(self, robot, joint_ids, obs_pos_w, obs_active):
         """Hard 안전 토크 (RoboBallet velocity-zeroing 근사). 팔 링크(link4/5/6)가 장애물 임박 시
         접근속도 제동(kbrake·v_approach) + 강한 barrier(krep/surf) 를 link Jᵀ로 인가.
@@ -382,8 +430,13 @@ class PerArmImpedanceController:
 
         # 3a'. RL 구동 nullspace (control: 8-DoF action의 α로 팔꿈치 제어 → 팔-장애물 회피 학습).
         if null_alpha1 is not None:
-            tau_1 = tau_1 + self._nullspace_rl_torque(self.robot_1, J1, self.joint_ids_1, null_alpha1)
-            tau_2 = tau_2 + self._nullspace_rl_torque(self.robot_2, J2, self.joint_ids_2, null_alpha2)
+            if getattr(self.env.cfg, "use_swivel_nullspace", False):
+                # ψ_des handle: action[6:8]=목표 swivel각 → 팔꿈치 servo (전 범위·setpoint).
+                tau_1 = tau_1 + self._nullspace_swivel_torque(self.robot_1, J1, self.joint_ids_1, null_alpha1)
+                tau_2 = tau_2 + self._nullspace_swivel_torque(self.robot_2, J2, self.joint_ids_2, null_alpha2)
+            else:
+                tau_1 = tau_1 + self._nullspace_rl_torque(self.robot_1, J1, self.joint_ids_1, null_alpha1)
+                tau_2 = tau_2 + self._nullspace_rl_torque(self.robot_2, J2, self.joint_ids_2, null_alpha2)
 
         # 3a''. Hard 안전 필터 (충돌 0 지향): 팔 링크 장애물 임박 시 제동+반발 (nullspace 투영 X).
         if (getattr(self.env.cfg, "use_hard_safety", False) and getattr(self.env.cfg, "n_obstacles", 0) > 0

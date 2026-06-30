@@ -125,6 +125,13 @@ class DualrobotCfg(DirectRLEnvCfg):
     #   (구 6-DoF 모델 평가 시엔 action_space=6으로 override 필요.)
     action_space = 8
     null_gain = 5.0   # nullspace α→토크 gain (τ_null = N·(α·gain·e − D_null·qd)). 튜닝 대상.
+    # ── ψ_des swivel nullspace handle (2026-06-30): action[6:8]을 α(토크계수)→*목표 swivel각*으로 ──
+    # 7-DoF 팔이 6-DoF EE 고정 시 여분 1-DoF = swivel각(어깨-손목 축 둘레 팔꿈치 원 위 위치). 네트워크가
+    #   ψ_des 출력 → 컨트롤러가 팔꿈치를 그 각으로 servo (τ_null=N·Jₑᵀ·K·(E_des−E_cur)). α(e=ones, 1방향
+    #   blunt push)와 달리 *전 원 도달* + position setpoint라 rod 끌림에 self-correct. 4번의 페널티-실패가
+    #   "병목=회피 *능력*"을 가리켜 도입. use False면 기존 α 경로.
+    use_swivel_nullspace = False
+    swivel_gain = 60.0   # E_des servo 게인 (K_sw). 튜닝 대상(스모크).
     # Hard 안전 필터 (RoboBallet velocity-zeroing 근사, 2026-06-25): 팔 링크가 장애물 임박 시
     #   접근속도 제동 + 강한 barrier (nullspace 투영 X = 안전>task). 충돌 0 지향. 배포/학습 시 켬.
     use_hard_safety = False

@@ -86,6 +86,9 @@ parser.add_argument("--max_active_obstacles", type=int, default=None,
                          "None이면 cfg 기본(n_obstacles=무제한).")
 parser.add_argument("--use_hard_safety", action="store_true",
                     help="팔 hard 안전 필터 ON으로 학습 (충돌 0 지향). RoboBallet velocity-zeroing 근사(제동토크).")
+parser.add_argument("--use_swivel_nullspace", action="store_true",
+                    help="action[6:8]을 α(토크계수)→목표 swivel각 ψ_des로 (팔꿈치 전범위 servo handle).")
+parser.add_argument("--swivel_gain", type=float, default=None, help="swivel servo 게인 K_sw (기본 cfg=60).")
 parser.add_argument("--terminate_on_collision", action="store_true",
                     help="충돌 시 에피소드 종료(필터/stop 없이 RL이 회피 학습). 페널티=w_collision_term.")
 parser.add_argument("--w_collision_term", type=float, default=None, help="충돌 종료 일회성 페널티 (기본 cfg=20).")
@@ -153,6 +156,11 @@ def main():
     if args.use_collision_stop:
         env_cfg.use_collision_stop = True
         print("🛑 velocity-zeroing ON (충돌 임박+접근 시 속도 직접 0)")
+    if args.use_swivel_nullspace:
+        env_cfg.use_swivel_nullspace = True
+        if args.swivel_gain is not None:
+            env_cfg.swivel_gain = args.swivel_gain
+        print(f"🦾 swivel nullspace handle ON (ψ_des, K_sw={env_cfg.swivel_gain}) — 팔꿈치 전범위 servo")
     if args.terminate_on_collision:
         env_cfg.terminate_on_collision = True
         if args.w_collision_term is not None:
