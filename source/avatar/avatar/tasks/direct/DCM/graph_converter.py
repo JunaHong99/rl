@@ -82,11 +82,7 @@ NODES_PER_ENV = OBSTACLE_NODE_OFFSET + N_OBSTACLES     # 5 (+N_OBS)
 ROBOT_RAW_DIM = 28      # q(7) + dq(7) + margin_low(7) + margin_high(7)
 EE_RAW_DIM = 19         # pos(3) + quat(4) + lin_vel(3) + ang_vel(3) + wrench(6)
 ROD_RAW_DIM = 26        # pos(3) + quat(4) + lin_vel(3) + ang_vel(3) + goal_pos(3) + goal_quat(4) + pos_err(3) + rot_err_aa(3)
-OBSTACLE_RAW_DIM = 17   # pos(3)+radius(1)+lin_vel(3)+dist_to_rod(1) + 최근접점 clearance 벡터: rod(3)+arm1(3)+arm2(3)
-# ★ 최근접점 clearance 벡터 (2026-06-30): 장애물→(rod 선분/팔 capsule chain) *최근접점* 방향·거리.
-# 기존엔 장애물 중심-상대pos + 스칼라 거리뿐이라 정책이 "어디가 얼마나·어느 방향으로 가까운지" 못 봄
-# (특히 팔은 elbow만 관측, forearm/wrist 못 봄 → ψ_des 줘도 회피 못함). 이 벡터로 위협을 직접 지각.
-# 차이벡터(closest−obs)라 translation-invariant → 배치 일반화 + per-primitive라 임의 형태로 확장.
+OBSTACLE_RAW_DIM = 8    # pos(3) + radius(1) + lin_vel(3) + dist_to_rod(1)
 
 # 통합 padding dim — 모든 raw 중 최대
 NODE_RAW_PADDED_DIM = max(ROBOT_RAW_DIM, EE_RAW_DIM, ROD_RAW_DIM, OBSTACLE_RAW_DIM)  # 28
@@ -287,24 +283,17 @@ def _rod_features(rod_pos, rod_quat, rod_lin, rod_ang, goal_pos, goal_quat):
     return feat.unsqueeze(1)                                    # (B, 1, 26)
 
 
-def _obstacle_features(obs_pos_local, radius, vel, dist_to_rod,
-                       rod_clr_vec=None, arm1_clr_vec=None, arm2_clr_vec=None):
+def _obstacle_features(obs_pos_local, radius, vel, dist_to_rod):
     """장애물 노드 feature (cluttered transport).
     obs_pos_local: (B, N_OBS, 3) env-local, radius/dist_to_rod: (B, N_OBS), vel: (B, N_OBS, 3).
-    rod/arm1/arm2_clr_vec: (B, N_OBS, 3) 장애물→해당 geometry 최근접점 벡터(차이, world=env-local 무관).
-    Returns: (B, N_OBS, OBSTACLE_RAW_DIM=17) — normalized [-CLIP, CLIP].
-        Schema: pos(3)+radius(1)+lin_vel(3)+dist(1) + rod_clr(3)+arm1_clr(3)+arm2_clr(3).
-    비활성 장애물은 멀리(dist·clr 큼)라 clip되어 'far' 노드로 표현됨 → GNN이 무시 학습."""
-    B, N = obs_pos_local.shape[0], obs_pos_local.shape[1]
+    Returns: (B, N_OBS, OBSTACLE_RAW_DIM=8) — normalized [-CLIP, CLIP].
+        Schema: pos(3) + radius(1) + lin_vel(3) + dist_to_rod(1).
+    비활성 장애물은 멀리(dist 큼)라 clip되어 'far' 노드로 표현됨 → GNN이 무시 학습."""
     p = obs_pos_local / POS_NORM
     r = (radius / POS_NORM).unsqueeze(-1)
     v = vel / VEL_LIN_NORM
     d = (dist_to_rod / POS_NORM).unsqueeze(-1)
-    z = torch.zeros(B, N, 3, device=obs_pos_local.device)
-    rcv = (rod_clr_vec / POS_NORM) if rod_clr_vec is not None else z
-    a1 = (arm1_clr_vec / POS_NORM) if arm1_clr_vec is not None else z
-    a2 = (arm2_clr_vec / POS_NORM) if arm2_clr_vec is not None else z
-    feat = torch.cat([p, r, v, d, rcv, a1, a2], dim=-1)         # (B, N_OBS, 17)
+    feat = torch.cat([p, r, v, d], dim=-1)                      # (B, N_OBS, 8)
     return torch.clamp(feat, -FEAT_CLIP, FEAT_CLIP)
 
 
@@ -371,9 +360,6 @@ def convert_batch_state_to_graph(
     obstacle_radius: torch.Tensor | None = None,   # (B, N_OBS)
     obstacle_vel: torch.Tensor | None = None,      # (B, N_OBS, 3)
     obstacle_dist: torch.Tensor | None = None,     # (B, N_OBS) dist to rod
-    obstacle_rod_clr: torch.Tensor | None = None,  # (B, N_OBS, 3) 장애물→rod 최근접점 벡터
-    obstacle_arm1_clr: torch.Tensor | None = None, # (B, N_OBS, 3) 장애물→팔1 chain 최근접점 벡터
-    obstacle_arm2_clr: torch.Tensor | None = None, # (B, N_OBS, 3) 장애물→팔2 chain 최근접점 벡터
 ) -> Batch:
     """
     Raw observation dict + control state → PyG Batch.
@@ -424,9 +410,7 @@ def convert_batch_state_to_graph(
             obstacle_radius = torch.zeros(B, N_OBSTACLES, device=device)
             obstacle_vel = torch.zeros(B, N_OBSTACLES, 3, device=device)
             obstacle_dist = torch.full((B, N_OBSTACLES), 1e3, device=device)
-        obstacle_feat = _obstacle_features(obstacle_pos, obstacle_radius, obstacle_vel, obstacle_dist,
-                                           rod_clr_vec=obstacle_rod_clr,
-                                           arm1_clr_vec=obstacle_arm1_clr, arm2_clr_vec=obstacle_arm2_clr)
+        obstacle_feat = _obstacle_features(obstacle_pos, obstacle_radius, obstacle_vel, obstacle_dist)
 
     # node assembly (Robot1, EE1, Rod, EE2, Robot2, [Obstacles...] 순서)
     x_per_env = _assemble_nodes(robot_feat, ee_feat, rod_feat, obstacle_feat, B, device)
