@@ -75,17 +75,25 @@ EE1_NODE_IDX = 1
 ROD_NODE_IDX = 2
 EE2_NODE_IDX = 3
 ROBOT2_NODE_IDX = 4
-OBSTACLE_NODE_OFFSET = 5
-NODES_PER_ENV = OBSTACLE_NODE_OFFSET + N_OBSTACLES     # 5 (+N_OBS)
+# ── 팔 분해 (2026-06-30, Run 1): robot 노드(elbow=link4) 외에 forearm(link5)/wrist(link6) 노드 추가 ──
+# 기존엔 obstacle→elbow 엣지만 → 정책이 팔 *중간부* 위협 못 봄(팔 충돌 14.8% 구조원인). link5/6 노드 +
+# obstacle→armseg 엣지로 forearm/wrist 위협을 *지각*. 노드 pose만(상대pose 엣지) → GNN이 회피 학습(일반화).
+N_ARMSEG_PER_ARM = 2                                   # link5(forearm), link6(wrist)
+ARMSEG1_OFFSET = 5                                     # arm1: link5=5, link6=6
+ARMSEG2_OFFSET = ARMSEG1_OFFSET + N_ARMSEG_PER_ARM     # arm2: link5=7, link6=8
+N_ARMSEG = N_ARMSEG_PER_ARM * 2                        # 4
+OBSTACLE_NODE_OFFSET = 5 + N_ARMSEG                    # 9
+NODES_PER_ENV = OBSTACLE_NODE_OFFSET + N_OBSTACLES     # 9 (+N_OBS)
 
 # Per-node-type raw feature 차원
 ROBOT_RAW_DIM = 28      # q(7) + dq(7) + margin_low(7) + margin_high(7)
 EE_RAW_DIM = 19         # pos(3) + quat(4) + lin_vel(3) + ang_vel(3) + wrench(6)
 ROD_RAW_DIM = 26        # pos(3) + quat(4) + lin_vel(3) + ang_vel(3) + goal_pos(3) + goal_quat(4) + pos_err(3) + rot_err_aa(3)
 OBSTACLE_RAW_DIM = 8    # pos(3) + radius(1) + lin_vel(3) + dist_to_rod(1)
+ARMSEG_RAW_DIM = 10     # pos(3) + quat(4) + lin_vel(3)  — 팔 중간링크(forearm/wrist) 노드
 
 # 통합 padding dim — 모든 raw 중 최대
-NODE_RAW_PADDED_DIM = max(ROBOT_RAW_DIM, EE_RAW_DIM, ROD_RAW_DIM, OBSTACLE_RAW_DIM)  # 28
+NODE_RAW_PADDED_DIM = max(ROBOT_RAW_DIM, EE_RAW_DIM, ROD_RAW_DIM, OBSTACLE_RAW_DIM, ARMSEG_RAW_DIM)  # 28
 N_NODE_TYPES = 4  # robot, ee, rod, obstacle
 NODE_FEATURE_DIM = NODE_RAW_PADDED_DIM + N_NODE_TYPES  # 28 + 4 = 32
 
@@ -196,6 +204,17 @@ def build_edge_template():
         src.append(OBSTACLE_NODE_OFFSET + k); dst.append(ROBOT1_NODE_IDX); etype.append(3)
         src.append(OBSTACLE_NODE_OFFSET + k); dst.append(ROBOT2_NODE_IDX); etype.append(3)
 
+    # ── 팔 분해 (Run 1): forearm(link5)/wrist(link6) 노드 ──
+    A1 = [ARMSEG1_OFFSET + i for i in range(N_ARMSEG_PER_ARM)]   # [5,6]
+    A2 = [ARMSEG2_OFFSET + i for i in range(N_ARMSEG_PER_ARM)]   # [7,8]
+    # arm chain (kinematic): Robot(elbow=link4)↔link5↔link6↔EE(hand) — 구조 정보
+    add_pair(ROBOT1_NODE_IDX, A1[0], 0); add_pair(A1[0], A1[1], 0); add_pair(A1[1], EE1_NODE_IDX, 0)
+    add_pair(ROBOT2_NODE_IDX, A2[0], 0); add_pair(A2[0], A2[1], 0); add_pair(A2[1], EE2_NODE_IDX, 0)
+    # obstacle → armseg (proximity, 단방향) — forearm/wrist 위협 지각
+    for k in range(N_OBSTACLES):
+        for seg in A1 + A2:
+            src.append(OBSTACLE_NODE_OFFSET + k); dst.append(seg); etype.append(3)
+
     return src, dst, etype
 
 
@@ -297,10 +316,21 @@ def _obstacle_features(obs_pos_local, radius, vel, dist_to_rod):
     return torch.clamp(feat, -FEAT_CLIP, FEAT_CLIP)
 
 
+def _armseg_features(poses, vels):
+    """팔 중간링크(forearm=link5/wrist=link6) 노드 feature (2026-06-30).
+    poses: (B, N_ARMSEG, 7) env-local pos+quat, vels: (B, N_ARMSEG, 3).
+    Returns: (B, N_ARMSEG, ARMSEG_RAW_DIM=10) normalized. Schema: pos(3)+quat(4)+lin_vel(3)."""
+    p = poses[..., :3] / POS_NORM
+    q = poses[..., 3:7]                                          # quat (정규화돼 있음, [-1,1])
+    v = vels / VEL_LIN_NORM
+    feat = torch.cat([p, q, v], dim=-1)                         # (B, N_ARMSEG, 10)
+    return torch.clamp(feat, -FEAT_CLIP, FEAT_CLIP)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Pad + add type one-hot
 # ──────────────────────────────────────────────────────────────────────
-def _assemble_nodes(robot_feat, ee_feat, rod_feat, obstacle_feat, B: int, device):
+def _assemble_nodes(robot_feat, ee_feat, rod_feat, obstacle_feat, B: int, device, armseg_feat=None):
     """
     5-node ordering: [Robot1, EE1, Rod, EE2, Robot2, (Obstacles...)].
 
@@ -335,6 +365,11 @@ def _assemble_nodes(robot_feat, ee_feat, rod_feat, obstacle_feat, B: int, device
         ee_padded[:, 1],        # EE2
         robot_padded[:, 1],     # Robot2
     ], dim=1)                                                # (B, 5, 32)
+
+    # 팔 분해 노드 (armseg) 삽입: Robot2 다음, 장애물 앞 (인덱스 5..5+N_ARMSEG-1)
+    if armseg_feat is not None and armseg_feat.shape[1] > 0:
+        armseg_padded = _wrap(armseg_feat, 'robot')          # 팔 부위 = robot type
+        nodes = torch.cat([nodes, armseg_padded], dim=1)     # (B, 5+N_ARMSEG, 32)
 
     if obstacle_feat is not None and obstacle_feat.shape[1] > 0:
         obs_padded = _wrap(obstacle_feat, 'obstacle')
@@ -412,8 +447,15 @@ def convert_batch_state_to_graph(
             obstacle_dist = torch.full((B, N_OBSTACLES), 1e3, device=device)
         obstacle_feat = _obstacle_features(obstacle_pos, obstacle_radius, obstacle_vel, obstacle_dist)
 
-    # node assembly (Robot1, EE1, Rod, EE2, Robot2, [Obstacles...] 순서)
-    x_per_env = _assemble_nodes(robot_feat, ee_feat, rod_feat, obstacle_feat, B, device)
+    # 팔 분해 노드 features (forearm/wrist). 없으면 None → 노드 미추가(구 동작).
+    armseg_poses = raw_state.get('armseg_poses', None)                  # (B, N_ARMSEG, 7) env-local
+    armseg_feat = None
+    if armseg_poses is not None:
+        armseg_vels = raw_state.get('armseg_vels', torch.zeros(B, N_ARMSEG, 3, device=device))
+        armseg_feat = _armseg_features(armseg_poses, armseg_vels)
+
+    # node assembly (Robot1, EE1, Rod, EE2, Robot2, [armseg...], [Obstacles...] 순서)
+    x_per_env = _assemble_nodes(robot_feat, ee_feat, rod_feat, obstacle_feat, B, device, armseg_feat=armseg_feat)
     nodes_per_env = x_per_env.shape[1]
 
     # ── Edge index (env-local → global with batch offset) ──
@@ -441,6 +483,10 @@ def convert_batch_state_to_graph(
         robot_poses[:, 0, 3:7], current_ee_poses[:, 0, 3:7], rod_quat,
         current_ee_poses[:, 1, 3:7], robot_poses[:, 1, 3:7],
     ], dim=1)                                                              # (B,5,4)
+    # 팔 분해 노드 pose 삽입 (장애물 앞) — obstacle→armseg 엣지 rel_pos이 armseg 프레임 기준이 되도록
+    if armseg_poses is not None:
+        node_pos = torch.cat([node_pos, armseg_poses[..., :3]], dim=1)     # (B, 5+N_ARMSEG, 3)
+        node_quat = torch.cat([node_quat, armseg_poses[..., 3:7]], dim=1)
     if obstacle_feat is not None and obstacle_feat.shape[1] > 0:
         node_pos = torch.cat([node_pos, obstacle_pos], dim=1)
         ident_q = torch.zeros(B, obstacle_pos.shape[1], 4, device=device); ident_q[..., 0] = 1.0

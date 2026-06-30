@@ -563,6 +563,20 @@ class DualrobotEnv(DirectRLEnv):
         elbow_poses = torch.stack([torch.cat([ep1, eq1], -1),
                                    torch.cat([ep2, eq2], -1)], dim=1)         # (B,2,7)
 
+        # 팔 분해 노드 (forearm=link5, wrist=link6) pose+vel — obstacle→armseg 엣지용 (2026-06-30)
+        if not hasattr(self, "_armseg_ids"):
+            self._armseg_ids = [self.robot_1.body_names.index(n) for n in ["panda_link5", "panda_link6"]]
+        def _armseg(robot):
+            ps, vs = [], []
+            for bid in self._armseg_ids:
+                ps.append(torch.cat([robot.data.body_pos_w[:, bid] - env_origins,
+                                     robot.data.body_quat_w[:, bid]], dim=-1))   # (B,7)
+                vs.append(robot.data.body_lin_vel_w[:, bid])                     # (B,3)
+            return ps, vs
+        ap1, av1 = _armseg(self.robot_1); ap2, av2 = _armseg(self.robot_2)
+        armseg_poses = torch.stack(ap1 + ap2, dim=1)                         # (B,4,7) a1l5,a1l6,a2l5,a2l6
+        armseg_vels = torch.stack(av1 + av2, dim=1)                          # (B,4,3)
+
         # 글로벌 (Relative Pose) — frame-invariant (좌표 차이라 env_origins 무관)
         # 1. ee_1의 역회전(inverse rotation) 계산
         ee_state_1_inv_quat = math_utils.quat_conjugate(ee_state_1[:, 3:7])
@@ -632,6 +646,8 @@ class DualrobotEnv(DirectRLEnv):
             "goal_poses": task_state,             # Task Node용
             "base_poses": base_poses,             # Edge 계산용 (legacy)
             "elbow_poses": elbow_poses,           # Robot 노드 pose (link4) — obstacle→robot 엣지 elbow 프레임
+            "armseg_poses": armseg_poses,         # 팔 분해 노드 pose (link5/6 ×2팔) — forearm/wrist 지각
+            "armseg_vels": armseg_vels,           # (B,4,3)
             "target_rel_pose": self.target_ee_rel_poses, # Global용
             "target_joint_pos": self.target_joint_pos,   # [추가] Joint Space Target
             "globals": global_state,              # (Legacy, 참고용)
