@@ -85,6 +85,12 @@ class PerArmImpedanceController:
         # 중력 보상 (gravity ON): τ += grav_sign·G(q). gravity_test.py로 sign=+1 검증됨(2026-06-15).
         self.gravity_comp = True
         self.grav_sign = 1.0
+        # gravity API: 신 PhysX는 get_gravity_compensation_forces, 구버전은 get_generalized_gravity_forces
+        # (deprecated → 매 스텝 워닝 spam). 있는 쪽을 1회 감지해 저장(로그 오염 방지).
+        _gview = self.robot_1.root_physx_view
+        self._grav_method = ("get_gravity_compensation_forces"
+                             if hasattr(_gview, "get_gravity_compensation_forces")
+                             else "get_generalized_gravity_forces")
 
         # ── Nullspace 모델기반 장애물 회피 (2026-06-19, control 기법 A) ──
         # 7-DoF 팔이 6-DoF EE를 잡으면 1-DoF redundancy(팔꿈치 swing). **RL이 아니라 컨트롤러가**
@@ -451,8 +457,8 @@ class PerArmImpedanceController:
         # 3b. Gravity compensation (flag-gated). τ += sign·G(q).
         # EOM: M q̈ + C + G = τ → 정적 유지엔 τ=G 필요. sign은 API convention 따라 부호 테스트로 결정.
         if getattr(self, "gravity_comp", False):
-            g1 = self.robot_1.root_physx_view.get_generalized_gravity_forces()[:, self.joint_ids_1]
-            g2 = self.robot_2.root_physx_view.get_generalized_gravity_forces()[:, self.joint_ids_2]
+            g1 = getattr(self.robot_1.root_physx_view, self._grav_method)()[:, self.joint_ids_1]
+            g2 = getattr(self.robot_2.root_physx_view, self._grav_method)()[:, self.joint_ids_2]
             tau_1 = tau_1 + self.grav_sign * g1
             tau_2 = tau_2 + self.grav_sign * g2
 
