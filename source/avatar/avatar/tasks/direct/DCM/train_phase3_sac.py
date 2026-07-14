@@ -140,6 +140,12 @@ def main():
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir)
     print(f"📂 log_dir: {log_dir}")
+    # ── 재현용 args/command 저장 (2026-07-15) — 명령 유실로 재현 불가 사태 방지 ──
+    import json as _json, sys as _sys
+    with open(os.path.join(log_dir, "args.json"), "w") as _f:
+        _json.dump(vars(args), _f, indent=2, default=str)
+    with open(os.path.join(log_dir, "command.txt"), "w") as _f:
+        _f.write("python " + " ".join(_sys.argv) + "\n")
 
     # Env
     env_cfg = DualrobotCfg()
