@@ -141,7 +141,7 @@ def main():
     parser.add_argument("--model_path", type=str, default=None)
     parser.add_argument("--num_envs", type=int, default=256)
     parser.add_argument("--num_steps", type=int, default=300)
-    parser.add_argument("--action_scale_pos", type=float, default=0.05)
+    parser.add_argument("--action_scale_pos", type=float, default=0.02)   # ★ 학습 기본과 일치(0.02). ckpt에 있으면 그걸 우선.
     parser.add_argument("--action_scale_rot", type=float, default=0.05)
     parser.add_argument("--obstacle_frac", type=float, default=1.0)
     parser.add_argument("--max_active_obstacles", type=int, default=None,
@@ -196,7 +196,13 @@ def main():
     # ── 정책 로드 (eval_cluttered 구조 재사용) ─────────────────────────
     sd = torch.load(os.path.abspath(args.model_path), map_location=dev,
                     weights_only=False)["model"]
-    scale = [args.action_scale_pos] * 3 + [args.action_scale_rot] * 3 + [1.0] * (A - 6)
+    # ★ action_scale: ckpt에 저장돼 있으면 그걸 우선(학습값 정합). 없으면 args 기본(0.02/0.05).
+    if "actor.action_scale" in sd:
+        scale = sd["actor.action_scale"].detach().cpu().tolist()
+        print(f"  action_scale ← ckpt: {[round(s,3) for s in scale]}")
+    else:
+        scale = [args.action_scale_pos] * 3 + [args.action_scale_rot] * 3 + [1.0] * (A - 6)
+        print(f"  action_scale ← args(ckpt에 없음): pos={args.action_scale_pos} rot={args.action_scale_rot}")
     if "actor.mean_head.0.weight" in sd:
         import mlp_policy
         in_dim = sd["actor.mean_head.0.weight"].shape[1]
