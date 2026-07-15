@@ -29,16 +29,11 @@ POS_NORM = gc.POS_NORM
 ROT_ERR_NORM = gc.ROT_ERR_NORM
 FEAT_CLIP = gc.FEAT_CLIP
 
-# Rod node feature layout (graph_converter._rod_features 순서 따라)
-# 0-2: rod_pos / POS_NORM
-# 3-6: rod_quat
-# 7-9: rod_lin_vel / VEL_LIN_NORM
-# 10-12: rod_ang_vel / VEL_ANG_NORM
-# 13-15: goal_pos / POS_NORM        ← HER에서 교체
-# 16-19: goal_quat                   ← HER에서 교체
-# 20-22: pos_err / POS_NORM          ← HER에서 재계산
-# 23-25: rot_err_aa / ROT_ERR_NORM   ← HER에서 재계산
-ROD_NODE_IDX = gc.ROD_NODE_IDX     # 5-node graph에서 rod 위치 (= 2)
+# Rod node feature layout (LEAN 3-node graph, graph_converter._rod_features 순서 따라)
+# 0-2: pos_err / POS_NORM          ← HER에서 재계산 (goal_pos - rod_pos)
+# 3-5: rot_err_aa / ROT_ERR_NORM   ← HER에서 재계산
+#   (절대 rod pos/quat, goal pos/quat은 더 이상 feature에 없음)
+ROD_NODE_IDX = gc.ROD_NODE_IDX     # 3-node lean graph에서 rod 위치 (= 1)
 
 
 def _quat_conj(q):
@@ -84,24 +79,19 @@ def replace_goal_in_node_features(x_per_env, rod_pos, rod_quat, new_goal_pos, ne
         x_modified: (B, N, F) — modified node features with new goal
     """
     x_modified = x_per_env.clone()
-    rod_x = x_modified[:, ROD_NODE_IDX, :]   # (B, F=32)
+    rod_x = x_modified[:, ROD_NODE_IDX, :]   # (B, F=NODE_FEATURE_DIM)
 
-    # 13-15: goal_pos (normalized)
-    rod_x[:, 13:16] = new_goal_pos / POS_NORM
-    # 16-19: goal_quat (raw [-1, 1])
-    rod_x[:, 16:20] = new_goal_quat
-
-    # 20-22: pos_err = goal_pos - rod_pos (normalized)
+    # 0-2: pos_err = goal_pos - rod_pos (normalized)
     pos_err = (new_goal_pos - rod_pos) / POS_NORM
-    rod_x[:, 20:23] = pos_err
+    rod_x[:, 0:3] = pos_err
 
-    # 23-25: rot_err_aa (normalized by π)
+    # 3-5: rot_err_aa (normalized by π)
     q_err = _quat_mul(new_goal_quat, _quat_conj(rod_quat))
     rot_err_aa = _quat_to_axis_angle(q_err)
-    rod_x[:, 23:26] = rot_err_aa / ROT_ERR_NORM
+    rod_x[:, 3:6] = rot_err_aa / ROT_ERR_NORM
 
-    # Clip
-    rod_x[:, :26] = rod_x[:, :26].clamp(-FEAT_CLIP, FEAT_CLIP)
+    # Clip (raw block = ROD_RAW_DIM=6, type one-hot은 건드리지 않음)
+    rod_x[:, :gc.ROD_RAW_DIM] = rod_x[:, :gc.ROD_RAW_DIM].clamp(-FEAT_CLIP, FEAT_CLIP)
     x_modified[:, ROD_NODE_IDX, :] = rod_x
 
     return x_modified
