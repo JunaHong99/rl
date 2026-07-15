@@ -9,7 +9,7 @@ Output:
     Critic: V(s) scalar (PPO path) or Q(s, a) scalar (SAC path)
 
 아키텍처:
-  1. Per-type node embedding (robot/ee/rod/obstacle 4종 → 공통 dim)
+  1. Per-type node embedding (ee/rod 2종 → 공통 dim)
   2. K rounds of RoboBalletGNNBlock (default K=2)
   3. Rod 노드만 추출 (객체 레벨 의사결정) + global feature concat
   4. Actor head: raw mean + global log_std parameter
@@ -38,7 +38,7 @@ import graph_converter as gc
 # ──────────────────────────────────────────────────────────────────────
 class NodeTypeEmbedder(nn.Module):
     """
-    Input: (N_total, NODE_FEATURE_DIM) — raw padded features + 4-d type one-hot
+    Input: (N_total, NODE_FEATURE_DIM) — raw padded features + N_NODE_TYPES-d type one-hot
     Output: (N_total, embed_dim)
 
     Strategy: 각 type별 별도 linear projection이 이상적이나, 일단 단일 MLP로 통합
@@ -171,7 +171,7 @@ class GNNActor(nn.Module):
     def _extract_rod_features(self, x, num_envs):
         """
         Batch x (B*nodes_per_env, dim) → rod 노드만 추출 (B, dim).
-        Rod is at index ROD_NODE_IDX per env (5-node refactor: idx=2).
+        Rod is at index ROD_NODE_IDX per env (LEAN 3-node: idx=1).
         """
         nodes_per_env = gc.NODES_PER_ENV
         rod_idx = gc.ROD_NODE_IDX + torch.arange(num_envs, device=x.device) * nodes_per_env

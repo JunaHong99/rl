@@ -5,7 +5,7 @@ MLP-based SAC agent (drop-in replacement for gnn_policy.GNNSACAgent).
 GNN과 동일한 interface 유지 → sac_trainer / train script 수정 불필요.
 
 전략:
-  - batch (PyG Batch) 입력에서 rod node feature만 추출 (5-node 중 idx=2)
+  - batch (PyG Batch) 입력에서 rod node feature만 추출 (LEAN 3-node 중 ROD_NODE_IDX=1)
   - rod feature + global feature → flat vector → MLP
   - Squashed Gaussian actor (SAC standard, GNN과 동일)
   - Twin Q critic
@@ -33,7 +33,7 @@ def _extract_rod_and_global(batch):
 
 
 def _extract_all_and_global(batch):
-    """PyG Batch → (flattened_all_node_features, global_features). 5-node 모두 사용."""
+    """PyG Batch → (flattened_all_node_features, global_features). 3-node 모두 사용."""
     x = batch.x
     u = batch.u
     B = batch.num_graphs
@@ -42,29 +42,13 @@ def _extract_all_and_global(batch):
     return all_x, u
 
 
-def _extract_lean_obstacle(batch):
-    """rod 노드(32) + 각 장애물 요약[rod기준 상대pos(3)+dist(1)+radius(1)] + global.
-    Stage 0의 깨끗한 rod+global 입력 유지(희석 X) + rod 라우팅용 장애물 정보만 compact 추가.
-    장애물 노드 layout: [0:3]=pos, [3]=radius, [7]=dist_to_rod (graph_converter._obstacle_features)."""
-    x = batch.x; u = batch.u
-    B = batch.num_graphs; N = gc.NODES_PER_ENV
-    ar = torch.arange(B, device=x.device)
-    rod_x = x[gc.ROD_NODE_IDX + ar * N]                         # (B,32)
-    rod_pos = rod_x[:, 0:3]
-    parts = [rod_x]
-    for k in range(gc.N_OBSTACLES):
-        ox = x[(gc.OBSTACLE_NODE_OFFSET + k) + ar * N]          # (B,32)
-        radius = ox[:, 3:4]                                     # 비활성 장애물은 radius==0
-        active = (radius > 0).float()                           # (B,1) 활성 마스크
-        rel = ox[:, 0:3] - rod_pos                              # 상대 pos (정규화 env-local)
-        summary = torch.cat([rel, ox[:, 7:8], radius], dim=-1)  # rel(3)+dist(1)+radius(1)
-        parts.append(summary * active)                          # 비활성은 0 벡터 (무의미 신호 제거)
-    return torch.cat(parts, dim=-1), u                         # (B, 32 + 5*N_OBS), global
+# NOTE: LEAN 3-node graph(2026-07)에는 장애물 노드가 없다. use_lean_obstacle 경로는
+# 더 이상 지원하지 않으며, 켜면 명시적으로 에러를 낸다(잘못된 checkpoint 사용 방지).
 
 
 def _state_dim(use_full_state: bool, use_lean_obstacle: bool = False) -> int:
     if use_lean_obstacle:
-        return gc.NODE_FEATURE_DIM + 5 * gc.N_OBSTACLES + gc.GLOBAL_FEATURE_DIM
+        raise NotImplementedError("use_lean_obstacle는 LEAN 3-node graph에서 제거됨 (장애물 노드 없음).")
     if use_full_state:
         return gc.NODES_PER_ENV * gc.NODE_FEATURE_DIM + gc.GLOBAL_FEATURE_DIM
     return gc.NODE_FEATURE_DIM + gc.GLOBAL_FEATURE_DIM
@@ -72,7 +56,7 @@ def _state_dim(use_full_state: bool, use_lean_obstacle: bool = False) -> int:
 
 def _extract_state(batch, use_full_state: bool, use_lean_obstacle: bool = False):
     if use_lean_obstacle:
-        return _extract_lean_obstacle(batch)
+        raise NotImplementedError("use_lean_obstacle는 LEAN 3-node graph에서 제거됨 (장애물 노드 없음).")
     if use_full_state:
         return _extract_all_and_global(batch)
     return _extract_rod_and_global(batch)

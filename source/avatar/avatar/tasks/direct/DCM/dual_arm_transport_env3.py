@@ -639,30 +639,13 @@ class DualrobotEnv(DirectRLEnv):
         # ---------------------------------------------------------
         # 4. 딕셔너리 조립 (키 이름 중요!)
         # ---------------------------------------------------------
-        # graph_converter.py가 이 키 이름들을 찾습니다.
+        # graph_converter.py(LEAN 3-node)가 찾는 키만 남긴다.
+        # 위의 계산들(wrench/velocity/armseg 등)은 diagnostic/reward 경로에서 쓰이므로
+        # 계산 자체는 유지하되, graph에는 아래 세 키만 전달한다.
         raw_state_dict = {
-            "robot_nodes": robot_state,           # [KeyError 원인 해결]
-            "current_ee_poses": current_ee_poses, # Edge 계산용
-            "goal_poses": task_state,             # Task Node용
-            "base_poses": base_poses,             # Edge 계산용 (legacy)
-            "elbow_poses": elbow_poses,           # Robot 노드 pose (link4) — obstacle→robot 엣지 elbow 프레임
-            "armseg_poses": armseg_poses,         # 팔 분해 노드 pose (link5/6 ×2팔) — forearm/wrist 지각
-            "armseg_vels": armseg_vels,           # (B,4,3)
-            "target_rel_pose": self.target_ee_rel_poses, # Global용
-            "target_joint_pos": self.target_joint_pos,   # [추가] Joint Space Target
-            "globals": global_state,              # (Legacy, 참고용)
-            # ── Phase 3.5: Grasp wrenches (RL observation + safety) ──
-            "wrench_panda_1": wrench_panda_1,     # (B, 6) panda_hand_1 wrench
-            "wrench_panda_2": wrench_panda_2,     # (B, 6) panda_hand_2 wrench
-            "internal_wrench": internal_wrench,   # (B, 6) squeeze
-            "external_wrench": external_wrench,   # (B, 6) total
-            # ── Phase 3.1: graph_converter 입력 ──
+            "current_ee_poses": current_ee_poses, # (B, 2, 7) — EE 노드 + 엣지
             "rod_pos": rod_pos,                   # (B, 3)
             "rod_quat": rod_quat,                 # (B, 4)
-            "rod_lin_vel": rod_lin_vel,           # (B, 3)
-            "rod_ang_vel": rod_ang_vel,           # (B, 3)
-            "ee_lin_vel": ee_lin_vel,             # (B, 2, 3)
-            "ee_ang_vel": ee_ang_vel,             # (B, 2, 3)
         }
 
         return {"policy": raw_state_dict}
@@ -938,13 +921,6 @@ class DualrobotEnv(DirectRLEnv):
         ★ goal_rod_marker의 실제 목표 자세를 graph에 노출 (이전엔 target_obj_pos만 전달해
           RL이 진짜 목표를 못 봤음 — 학습 정체 핵심 원인).
         """
-        # Lazy init joint limits
-        if not hasattr(self, "_joint_limits_low"):
-            limits_1 = self.robot_1.data.soft_joint_pos_limits[0, self.robot_1_joint_ids]  # (7, 2)
-            limits_2 = self.robot_2.data.soft_joint_pos_limits[0, self.robot_2_joint_ids]
-            self._joint_limits_low = torch.stack([limits_1[:, 0], limits_2[:, 0]], dim=0)   # (2, 7)
-            self._joint_limits_high = torch.stack([limits_1[:, 1], limits_2[:, 1]], dim=0)
-
         import graph_converter as gc
         raw_state = self._get_observations()["policy"]
         normalized_time = (self.episode_length_buf.float() / self.max_episode_length).clamp(0.0, 1.0)
@@ -954,28 +930,12 @@ class DualrobotEnv(DirectRLEnv):
         goal_pos = self.goal_rod_marker.data.root_pos_w - env_origins  # (B, 3) env-local
         goal_quat = self.goal_rod_marker.data.root_quat_w              # (B, 4)
 
-        # 장애물 상태 (cluttered transport)
-        obs_kw = {}
-        if self.cfg.n_obstacles > 0:
-            ost = self._get_obstacle_state()
-            obs_kw = dict(
-                obstacle_pos=ost["pos_local"],
-                obstacle_radius=ost["radius"],
-                obstacle_vel=ost["vel"],
-                obstacle_dist=ost["dist_to_rod"],
-            )
-
         return gc.convert_batch_state_to_graph(
             raw_state=raw_state,
             num_envs=self.num_envs,
             goal_pos=goal_pos,
             goal_quat=goal_quat,
-            target_x_rel=self.target_x_rel,
             normalized_time=normalized_time,
-            joint_limits_low=self._joint_limits_low,
-            joint_limits_high=self._joint_limits_high,
-            joint_torque=None,
-            **obs_kw,
         )
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
