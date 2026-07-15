@@ -639,13 +639,16 @@ class DualrobotEnv(DirectRLEnv):
         # ---------------------------------------------------------
         # 4. 딕셔너리 조립 (키 이름 중요!)
         # ---------------------------------------------------------
-        # graph_converter.py(LEAN 3-node)가 찾는 키만 남긴다.
+        # graph_converter.py(5-node pose-only)가 찾는 키만 남긴다.
         # 위의 계산들(wrench/velocity/armseg 등)은 diagnostic/reward 경로에서 쓰이므로
-        # 계산 자체는 유지하되, graph에는 아래 세 키만 전달한다.
+        # 계산 자체는 유지하되, graph에는 아래 키만 전달한다.
+        # elbow_poses = Robot 노드 (pose only, 관절각 q/dq/limit는 전달 안 함).
         raw_state_dict = {
             "current_ee_poses": current_ee_poses, # (B, 2, 7) — EE 노드 + 엣지
             "rod_pos": rod_pos,                   # (B, 3)
             "rod_quat": rod_quat,                 # (B, 4)
+            "elbow_poses": elbow_poses,           # (B, 2, 7) — Robot 노드 (elbow pose)
+            "base_poses": base_poses,             # (B, 2, 7) — elbow 없을 때 fallback
         }
 
         return {"policy": raw_state_dict}
