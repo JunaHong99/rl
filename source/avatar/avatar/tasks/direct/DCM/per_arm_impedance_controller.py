@@ -425,6 +425,13 @@ class PerArmImpedanceController:
         tau_1 = torch.bmm(J1.transpose(-1, -2), wrench_1.unsqueeze(-1)).squeeze(-1)
         tau_2 = torch.bmm(J2.transpose(-1, -2), wrench_2.unsqueeze(-1)).squeeze(-1)
 
+        # ── 진단: manipulability w = sqrt(det(J Jᵀ)). 0 근처면 특이자세(추종 붕괴). per-env 저장 → env가 로깅 ──
+        with torch.no_grad():
+            jjt1 = torch.bmm(J1, J1.transpose(-1, -2))   # (B,6,6)
+            jjt2 = torch.bmm(J2, J2.transpose(-1, -2))
+            self._manip1 = torch.sqrt(torch.clamp(torch.det(jjt1), min=0.0))   # (B,)
+            self._manip2 = torch.sqrt(torch.clamp(torch.det(jjt2), min=0.0))
+
         # 3a. 모델기반 nullspace 팔-장애물 회피 (control A): 컨트롤러가 여분 DoF로 팔을 장애물에서 밀어냄.
         # use_nullspace_avoidance=False면 OFF (당장은 RL이 거시 회피 학습. 필요시 재활성).
         if (self.use_nullspace_avoidance and getattr(self.env.cfg, "n_obstacles", 0) > 0
