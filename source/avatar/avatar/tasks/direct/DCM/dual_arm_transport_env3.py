@@ -94,8 +94,11 @@ class DualrobotEnv(DirectRLEnv):
         self.episode_min_pos_err = torch.full((self.num_envs,), float("inf"), device=self.device)
         self.episode_min_rot_err = torch.full((self.num_envs,), float("inf"), device=self.device)
         # 진단 (2026-07-15): 에피소드 내 최소 manipulability(특이점) + 최대 내력(f_int 스파이크)
+        #   + 최대 도달거리(IK 해 존재 여부 — Franka reach 0.855m 초과면 도달불가 명령)
         self.episode_min_manip = torch.full((self.num_envs,), float("inf"), device=self.device)
         self.episode_max_fint = torch.zeros(self.num_envs, device=self.device)
+        self.episode_max_reach = torch.zeros(self.num_envs, device=self.device)
+        self.FRANKA_MAX_REACH = 0.855   # [m] EE target이 이보다 멀면 도달불가(no IK solution)
 
         # ── Phase 3: Cooperative impedance controller ──
         # action(3-dim positional delta)을 누적해 target_obj_pos를 만듦
@@ -737,6 +740,13 @@ class DualrobotEnv(DirectRLEnv):
             self.extras["diag/manip_min_mean"] = _mmin.mean()
         self.episode_max_fint = torch.maximum(self.episode_max_fint, f_int_lin_norm)
         self.extras["diag/f_int_max"] = f_int_lin_norm.max()
+        # 도달거리 (IK 해 존재 여부): 두 팔 중 더 먼 EE target 거리. 0.855m 초과 = 도달불가 명령.
+        _r1 = getattr(self.controller, "_reach1", None)
+        if _r1 is not None:
+            _rmax = torch.maximum(_r1, self.controller._reach2)
+            self.episode_max_reach = torch.maximum(self.episode_max_reach, _rmax)
+            self.extras["diag/reach_mean_m"] = _rmax.mean()
+            self.extras["diag/out_of_reach_rate"] = (_rmax > self.FRANKA_MAX_REACH).float().mean()
 
         # ── 3. r_success ── sparse one-shot (episode 내 첫 도달 시 한 번만)
         # 현재 threshold는 10cm / 17°.
@@ -1009,11 +1019,14 @@ class DualrobotEnv(DirectRLEnv):
             # 실패가 특이자세(manip↓)에 몰리면 IK/특이점 원인, 내력(f_int↑)에 몰리면 제어 원인.
             succ_d = self.reached_once[done]
             mman = self.episode_min_manip[done]; mfint = self.episode_max_fint[done]
+            mreach = self.episode_max_reach[done]
             vman = ~torch.isinf(mman)
             for lbl, msk in (("SUCCESS", succ_d & vman), ("FAIL", (~succ_d) & vman)):
                 if msk.any():
                     self.extras[f"diag/manip_min_{lbl}"] = mman[msk].mean()
                     self.extras[f"diag/fint_max_{lbl}"] = mfint[msk].mean()
+                    self.extras[f"diag/reach_max_{lbl}"] = mreach[msk].mean()          # 도달불가(IK) 지표
+                    self.extras[f"diag/oor_rate_{lbl}"] = (mreach[msk] > self.FRANKA_MAX_REACH).float().mean()
 
         # Internal flag (0-dim 아니라 자동 logging 안 됨). 다른 모듈이 참조할 수 있음.
         self.extras["log/is_reached"] = is_reached.float()
@@ -1207,6 +1220,7 @@ class DualrobotEnv(DirectRLEnv):
         self.episode_min_rot_err[env_ids] = float('inf')
         self.episode_min_manip[env_ids] = float('inf')
         self.episode_max_fint[env_ids] = 0.0
+        self.episode_max_reach[env_ids] = 0.0
 
         # [2026-06-08] Post-reset settle counter — N step zero-action 강제 적용
         self._settle_remaining[env_ids] = self.SETTLE_STEPS_AT_RESET

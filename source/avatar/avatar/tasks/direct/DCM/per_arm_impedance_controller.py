@@ -431,6 +431,11 @@ class PerArmImpedanceController:
             jjt2 = torch.bmm(J2, J2.transpose(-1, -2))
             self._manip1 = torch.sqrt(torch.clamp(torch.det(jjt1), min=0.0))   # (B,)
             self._manip2 = torch.sqrt(torch.clamp(torch.det(jjt2), min=0.0))
+            # ── 진단: 도달거리 (IK 해 존재 여부). 명령된 EE target이 base에서 먼 거리.
+            #    Franka reach ≈ 0.855m 초과면 도달불가(no IK) → SAC가 불가능 pose를 명령한 것.
+            b1 = self.robot_1.data.root_pos_w; b2 = self.robot_2.data.root_pos_w
+            self._reach1 = torch.norm(ee1_target_pos - b1, dim=-1)   # (B,) 명령 EE target 도달거리
+            self._reach2 = torch.norm(ee2_target_pos - b2, dim=-1)
 
         # 3a. 모델기반 nullspace 팔-장애물 회피 (control A): 컨트롤러가 여분 DoF로 팔을 장애물에서 밀어냄.
         # use_nullspace_avoidance=False면 OFF (당장은 RL이 거시 회피 학습. 필요시 재활성).
