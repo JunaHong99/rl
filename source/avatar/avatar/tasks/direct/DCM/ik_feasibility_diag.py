@@ -158,8 +158,8 @@ def main():
     parser.add_argument("--action_scale_pos", type=float, default=0.05)
     parser.add_argument("--action_scale_rot", type=float, default=0.05)
     parser.add_argument("--obstacle_frac", type=float, default=1.0)
-    parser.add_argument("--max_active_obstacles", type=int, default=None,
-                        help="장애물 활성 상한(진단시 0 권장 = obstacle-free). None이면 env 기본.")
+    parser.add_argument("--max_active_obstacles", type=int, default=0,
+                        help="장애물 활성 상한. 기본 0 = obstacle-free(진단 기본). env 기본 쓰려면 4.")
     parser.add_argument("--num_rounds", type=int, default=2,
                         help="GNN message-passing rounds (GNN 체크포인트).")
     parser.add_argument("--ik_threshold", type=float, default=0.03,
