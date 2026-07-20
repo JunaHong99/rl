@@ -25,6 +25,23 @@ from cooperative_impedance_controller import CooperativeImpedanceController
 from per_arm_impedance_controller import PerArmImpedanceController
 from per_arm_velocity_controller import PerArmVelocityController
 
+
+def grasp_quat_ry_rxpi(theta: torch.Tensor) -> torch.Tensor:
+    """(N,) tilt θ → (N,4) grasp quat = Ry(θ)·Rx(π) (wxyz).
+    base=Rx(π)(top-grasp, hand z가 아래) → rod y축 둘레 θ tilt.
+    닫힌형: Ry(θ)·Rx(π) = (0, cos(θ/2), 0, -sin(θ/2)). θ=0이면 Rx(π)=(0,1,0,0).
+    approach축(hand z) = R·(0,0,1) = (-sinθ, 0, -cosθ) → dot(a(+θ),a(-θ))=cos(2θ)."""
+    h = 0.5 * theta
+    z = torch.zeros_like(theta)
+    return torch.stack([z, torch.cos(h), z, -torch.sin(h)], dim=-1).contiguous()
+
+
+def grasp_approach_axis(theta: torch.Tensor) -> torch.Tensor:
+    """(N,) tilt θ → (N,3) EE approach축 = Ry(θ)·Rx(π)·(0,0,1) = (-sinθ, 0, -cosθ)."""
+    z = torch.zeros_like(theta)
+    return torch.stack([-torch.sin(theta), z, -torch.cos(theta)], dim=-1).contiguous()
+
+
 class DualrobotEnv(DirectRLEnv):
     """
     Dofbot 2대를 스폰하는 환경 클래스입니다.
@@ -44,13 +61,25 @@ class DualrobotEnv(DirectRLEnv):
 
     def __init__(self, cfg: DualrobotCfg, render_mode: str | None = None, **kwargs):
         # 원본 Cfg를 부모 클래스에 전달
+        # 파지 변이(grasp 일반화): env별 독립 용접 앵커 편집 필요 → 물리 env마다 파싱.
+        #   (per-env rod_joint LocalPos1/Rot1 override가 물리에 반영되려면 replicate_physics=False.)
+        if getattr(cfg, "vary_grasp", False):
+            cfg.scene.replicate_physics = False
         super().__init__(cfg, render_mode, **kwargs)
 
         # Phase A (2026-05-26): CachedPoseSampler 사용. 학습 시작 시 100k samples 사전 생성 +
         # 파일 저장. 매 reset은 cache에서 O(1) random pick → PoseSampler 호출 폭주 회피.
-        self.pose_sampler = CachedPoseSampler(
-            device=self.device, cache_size=100_000, fixed_grasp_roll=True
-        )
+        # 파지 변이 시: 버킷별(d,θ) grasp-정합 캐시 (용접/컨트롤러 오프셋과 일치하는 IK).
+        if getattr(self.cfg, "vary_grasp", False):
+            self.pose_sampler = CachedPoseSampler(
+                device=self.device, cache_size=100_000, fixed_grasp_roll=True,
+                bucket_grasp_offs=self._grasp_bucket_grasp_offs(),
+                cache_tag=f"graspvar_{self.cfg.grasp_n_buckets}b",
+            )
+        else:
+            self.pose_sampler = CachedPoseSampler(
+                device=self.device, cache_size=100_000, fixed_grasp_roll=True
+            )
         self.external_samples = None # 외부 샘플 저장용 (테스트용)
 
         # (관절 인덱스 등은 나중에 필요시 여기에 추가)
@@ -192,7 +221,16 @@ class DualrobotEnv(DirectRLEnv):
 
         # 4. 씬 복제 (num_envs 개수만큼)
         # (이 시점에 로봇 2대와 바닥이 모두 복제됨)
-        self.scene.clone_environments(copy_from_source=False)
+        # 파지 변이 시 copy_from_source=True: env별 독립·편집가능 rod_joint 확보(instanceable
+        # 참조면 per-env 용접 앵커 override 불가). 변이 off면 기존 False(메모리 효율) 유지.
+        self.scene.clone_environments(
+            copy_from_source=getattr(self.cfg, "vary_grasp", False)
+        )
+
+        # ── 파지 변이(straight rod): clone된 rod_joint_1/2에 per-env 용접 앵커 override ──
+        # env별 (d,θ): LocalPos1=(±d,0,0)=파지점, LocalRot1=Ry(±θ)·Rx(π)=파지자세. (sim play 전 필수.)
+        if getattr(self.cfg, "vary_grasp", False):
+            self._apply_per_env_grasp_welds()
 
         # 5. 씬(Scene)에 로봇들 등록 (필수)
         self.scene.articulations["robot_1"] = self.robot_1
@@ -274,6 +312,86 @@ class DualrobotEnv(DirectRLEnv):
 
         mode = "rigid fixed" if K_couple is None else f"compliant D6 (K_couple={K_couple} N/m)"
         print(f"[grasp] Added joints ({mode}, TCP offset={tcp_z}m, grasp_roll=π)")
+
+    # ──────────────────────────────────────────────────────────────────
+    # Grasp 변이 (straight rod, per-env 파지점 d + tilt θ, 2026-07-20)
+    # ──────────────────────────────────────────────────────────────────
+    def _compute_grasp_specs(self):
+        """per-env 파지 (d, θ) + 파지 quat q1/q2 + 버킷 idx를 1회 계산해 self에 캐시.
+        - 대칭 미러: hand1=(-d,0,0)+Ry(+θ)·Rx(π), hand2=(+d,0,0)+Ry(-θ)·Rx(π).
+        - HARD 제약 a1·a2>0: a_i=approach축. dot=cos(2θ)이므로 |θ|<π/4로 clamp해 항상 보장.
+        - 버킷화: grasp_n_buckets개 (d,θ) 버킷을 env에 라운드로빈 → grasp-정합 캐시 1버킷=1엔트리.
+        (재진입 안전: 이미 계산됐으면 재사용. reproducibility 위해 고정 seed generator 사용.)"""
+        if getattr(self, "_grasp_bucket_idx", None) is not None:
+            return
+        cfg = self.cfg
+        nb = int(cfg.grasp_n_buckets)
+        d_lo, d_hi = float(cfg.grasp_d_range[0]), float(cfg.grasp_d_range[1])
+        th_max = float(cfg.grasp_theta_max)
+        # a1·a2>0 = cos(2θ)>0 → |θ|<π/4. th_max가 이보다 크면 안전하게 clamp(제약 위반 방지).
+        th_cap = min(th_max, 0.999 * (math.pi / 4.0))
+        gen = torch.Generator(device="cpu").manual_seed(12345)   # 버킷 (d,θ) 재현성
+        # 버킷별 대표 (d,θ): d는 range 균등, θ는 [-cap,+cap] 균등 (버킷당 1 스펙).
+        du = torch.rand(nb, generator=gen)
+        tu = torch.rand(nb, generator=gen)
+        bucket_d = (d_lo + du * (d_hi - d_lo)).to(self.device)               # (nb,)
+        bucket_theta = ((tu * 2.0 - 1.0) * th_cap).to(self.device)           # (nb,) ∈ [-cap,+cap]
+        # env → 버킷 라운드로빈 (재현성 고정)
+        bucket_idx = torch.arange(self.num_envs, device=self.device) % nb    # (N,)
+        self._grasp_bucket_idx = bucket_idx
+        self._grasp_bucket_d = bucket_d
+        self._grasp_bucket_theta = bucket_theta
+        self._grasp_d = bucket_d[bucket_idx]                                 # (N,) per-env
+        self._grasp_theta = bucket_theta[bucket_idx]                         # (N,)
+        # per-env 파지 quat (미러): hand1=+θ, hand2=-θ.
+        self._grasp_q1 = grasp_quat_ry_rxpi(self._grasp_theta)              # (N,4)
+        self._grasp_q2 = grasp_quat_ry_rxpi(-self._grasp_theta)             # (N,4)
+        # HARD 제약 검증: a1·a2>0 (모든 env).
+        a1 = grasp_approach_axis(self._grasp_theta)
+        a2 = grasp_approach_axis(-self._grasp_theta)
+        dots = (a1 * a2).sum(dim=-1)
+        assert bool((dots > 0).all()), f"grasp a1·a2>0 위반: min={float(dots.min()):.4f}"
+        print(f"[grasp-var] {nb} buckets, d∈[{d_lo:.2f},{d_hi:.2f}] θ∈±{th_cap:.3f}rad "
+              f"a1·a2 min={float(dots.min()):.3f} ({self.num_envs} envs, 라운드로빈)")
+
+    def _grasp_bucket_grasp_offs(self):
+        """각 (d,θ) 버킷의 grasp_off dict 리스트 → 버킷별 pose cache 생성용 (용접/컨트롤러와 정합).
+        off_pos_1=(-d,0,TCP), off_quat_1=Ry(+θ)·Rx(π); off_pos_2=(+d,0,TCP), off_quat_2=Ry(-θ)·Rx(π)."""
+        self._compute_grasp_specs()
+        TCP = VectorizedPoseSampler.TCP_OFFSET
+        dev = self.device
+        offs = []
+        for b in range(int(self.cfg.grasp_n_buckets)):
+            d = float(self._grasp_bucket_d[b]); th = float(self._grasp_bucket_theta[b])
+            q1 = grasp_quat_ry_rxpi(torch.tensor([th], device=dev))[0]
+            q2 = grasp_quat_ry_rxpi(torch.tensor([-th], device=dev))[0]
+            offs.append({
+                "off_pos_1": torch.tensor([-d, 0.0, TCP], device=dev), "off_quat_1": q1,
+                "off_pos_2": torch.tensor([+d, 0.0, TCP], device=dev), "off_quat_2": q2,
+            })
+        return offs
+
+    def _apply_per_env_grasp_welds(self):
+        """clone된 각 env의 rod_joint_1/2 용접 앵커를 per-env (d,θ)로 override (sim play 전).
+        LocalPos1=(±d,0,0)=파지점(rod frame), LocalRot1=Ry(±θ)·Rx(π)=파지자세. 컨트롤러/캐시와 정합."""
+        import omni.usd
+        from pxr import UsdPhysics, Gf
+        self._compute_grasp_specs()
+        stage = omni.usd.get_context().get_stage()
+        d = self._grasp_bucket_d[self._grasp_bucket_idx].cpu()     # (N,)
+        q1 = self._grasp_q1.cpu(); q2 = self._grasp_q2.cpu()        # (N,4) wxyz
+        def _gq(q):
+            return Gf.Quatf(float(q[0]), float(q[1]), float(q[2]), float(q[3]))
+        for i in range(self.num_envs):
+            base = f"/World/envs/env_{i}"
+            di = float(d[i])
+            for jn, xoff, qq in [("rod_joint_1", -di, q1[i]), ("rod_joint_2", +di, q2[i])]:
+                jp = stage.GetPrimAtPath(f"{base}/{jn}")
+                if jp.IsValid():
+                    fj = UsdPhysics.FixedJoint(jp)
+                    fj.CreateLocalPos1Attr().Set(Gf.Vec3f(xoff, 0.0, 0.0))
+                    fj.CreateLocalRot1Attr().Set(_gq(qq))
+        print(f"[grasp-var] per-env 용접 앵커 override 완료 ({self.num_envs} envs)")
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         """Accumulating action + bounds. NaN 방지."""
@@ -1057,7 +1175,12 @@ class DualrobotEnv(DirectRLEnv):
              self.current_sample_idxs[env_ids] = -1  # external은 cache idx 의미 없음
         else:
              # 기존 방식: 샘플러로부터 Base, Joint, Goal EE Pose를 모두 받아옵니다.
-             samples = self.pose_sampler.sample_episodes(num_resets)
+             # 파지 변이 시: 이 env들의 (d,θ) 버킷에 맞는 샘플만 draw (grasp 정합).
+             if getattr(self.cfg, "vary_grasp", False):
+                 _bidx = self._grasp_bucket_idx[env_ids]
+                 samples = self.pose_sampler.sample_episodes(num_resets, bucket_idx=_bidx)
+             else:
+                 samples = self.pose_sampler.sample_episodes(num_resets)
              # 마지막 sample_episodes의 cache idx를 env별로 저장 (실패 episode 재현용)
              if hasattr(self.pose_sampler, "last_idxs"):
                  self.current_sample_idxs[env_ids] = self.pose_sampler.last_idxs

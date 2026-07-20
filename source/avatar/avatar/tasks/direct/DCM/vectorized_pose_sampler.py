@@ -15,13 +15,29 @@ class CachedPoseSampler:
     """
     def __init__(self, device='cuda:0', cache_size: int = 100_000,
                  cache_path: str | None = None,
-                 fixed_grasp_roll: bool = True):
+                 fixed_grasp_roll: bool = True,
+                 bucket_vals=None, bucket_grasp_offs=None, cache_tag=None):
         self.device = device
         self.cache_size = cache_size
+        # 버킷: None=고정(기존). bucket_vals=버킷별 half_len(크기변이). bucket_grasp_offs=버킷별
+        #   grasp_off dict(형태/파지 변이). 둘 다 버킷 pool + env 버킷별 draw는 동일, 생성만 다름.
+        self.bucket_vals = None if bucket_vals is None else [float(v) for v in bucket_vals]
+        self.bucket_grasp_offs = bucket_grasp_offs
+        self._bucketed = (self.bucket_vals is not None) or (bucket_grasp_offs is not None)
+        self.n_buckets = (len(self.bucket_vals) if self.bucket_vals is not None
+                          else len(bucket_grasp_offs) if bucket_grasp_offs is not None else 1)
         if cache_path is None:
             # 학습 스크립트 위치 기준 cache 파일
             script_dir = os.path.dirname(os.path.abspath(__file__))
-            cache_path = os.path.join(script_dir, f"pose_cache_{cache_size}.pt")
+            if not self._bucketed:
+                cache_path = os.path.join(script_dir, f"pose_cache_{cache_size}.pt")
+            elif self.bucket_vals is not None:
+                lo, hi = min(self.bucket_vals), max(self.bucket_vals)
+                cache_path = os.path.join(
+                    script_dir, f"pose_cache_vary_{cache_size}_{self.n_buckets}_{lo:.2f}_{hi:.2f}.pt")
+            else:
+                cache_path = os.path.join(
+                    script_dir, f"pose_cache_{cache_tag or 'chain'}_{cache_size}_{self.n_buckets}.pt")
         self.cache_path = cache_path
         self.cache: dict | None = None
 
@@ -38,14 +54,24 @@ class CachedPoseSampler:
         self._build_curriculum_order()
 
     def _build_curriculum_order(self):
-        """cache의 (start→goal) 거리 오름차순 정렬 인덱스 생성. curriculum 샘플링에 사용."""
+        """cache의 (start→goal) 거리 오름차순 정렬 인덱스 생성. curriculum 샘플링에 사용.
+        버킷 모드면 버킷별 정렬 pool 생성(env가 자기 버킷에서 curriculum draw)."""
         start = self.cache["start_obj_pose"][:, :3]
         goal = self.cache["goal_obj_pose"][:, :3]
         dist = (goal - start).norm(dim=-1)               # (P,)
-        self.sorted_idxs = torch.argsort(dist)           # 가까운 순
-        print(f"  Curriculum order built: dist range "
-              f"[{dist.min()*1000:.0f}, {dist.max()*1000:.0f}] mm, "
-              f"mean {dist.mean()*1000:.0f} mm")
+        self.sorted_idxs = torch.argsort(dist)           # 가까운 순 (비-버킷 경로용)
+        if self._bucketed:
+            bkt = self.cache["bucket"]
+            self._bucket_pools = []                      # 버킷별 (거리 오름차순) cache 인덱스
+            for b in range(self.n_buckets):
+                pool = torch.nonzero(bkt == b).flatten()
+                self._bucket_pools.append(pool[torch.argsort(dist[pool])])
+            print(f"  Bucket pools built: sizes {[p.numel() for p in self._bucket_pools]}, "
+                  f"dist [{dist.min()*1000:.0f},{dist.max()*1000:.0f}] mm")
+        else:
+            print(f"  Curriculum order built: dist range "
+                  f"[{dist.min()*1000:.0f}, {dist.max()*1000:.0f}] mm, "
+                  f"mean {dist.mean()*1000:.0f} mm")
 
     def _load_or_generate(self):
         if os.path.exists(self.cache_path):
@@ -55,7 +81,7 @@ class CachedPoseSampler:
             self.scalar_extras = {}  # tensor 아닌 값은 base sampler가 별도로 노출
             actual_size = next(iter(self.cache.values())).shape[0]
             print(f"  Loaded {actual_size:,} samples ✓")
-        else:
+        elif not self._bucketed:
             print(f"[CachedPoseSampler] Generating {self.cache_size:,} samples (one-time)…")
             raw = self._base.sample_episodes(self.cache_size)
             # tensor만 cache 저장, scalar는 별도 보관
@@ -63,13 +89,54 @@ class CachedPoseSampler:
             self.scalar_extras = {k: v for k, v in raw.items() if not torch.is_tensor(v)}
             torch.save({k: v.cpu() for k, v in self.cache.items()}, self.cache_path)
             print(f"  Saved to {self.cache_path} ✓  (tensors only, scalars: {list(self.scalar_extras.keys())})")
+        else:
+            # ── 버킷별 정합 캐시: 각 버킷 spec(half_len 또는 grasp_off)으로 per-bucket 생성 + 태그 ──
+            per = self.cache_size // self.n_buckets
+            grasp = self.bucket_grasp_offs is not None
+            desc = "grasp_off" if grasp else f"half_len={[round(v,3) for v in self.bucket_vals]}"
+            print(f"[CachedPoseSampler] Generating {self.n_buckets} buckets × {per:,} ({desc}) …")
+            merged, tags = {}, []
+            for b in range(self.n_buckets):
+                if grasp:
+                    raw = self._base.sample_episodes(per, grasp_off=self.bucket_grasp_offs[b])
+                else:
+                    raw = self._base.sample_episodes(per, half_len=self.bucket_vals[b])
+                for k, v in raw.items():
+                    if torch.is_tensor(v):
+                        merged.setdefault(k, []).append(v)
+                tags.append(torch.full((per,), b, dtype=torch.long, device=self.device))
+            self.cache = {k: torch.cat(vs) for k, vs in merged.items()}
+            self.cache["bucket"] = torch.cat(tags)
+            self.scalar_extras = {}
+            torch.save({k: v.cpu() for k, v in self.cache.items()}, self.cache_path)
+            print(f"  Saved to {self.cache_path} ✓  ({self.cache['bucket'].numel():,} samples, bucketed)")
 
-    def sample_episodes(self, num_envs):
+    def sample_episodes(self, num_envs, bucket_idx=None):
         """Cache에서 random index로 pick. O(1) per reset.
 
         Side effect: self.last_idxs에 마지막으로 사용한 cache index 저장.
         외부 (env3, eval script)에서 실패 episode 재현용 lookup에 사용.
+
+        bucket_idx: 버킷 모드면 (num_envs,) 각 env의 버킷 id → 그 버킷 pool에서만 draw
+                    (env 고정 파지/크기와 grasp 분리 정합 보장). 비-버킷이면 무시.
         """
+        # ── 버킷 모드: env별 버킷 pool에서 draw (curriculum_frac은 버킷 내 거리순에 적용) ──
+        if self._bucketed:
+            assert bucket_idx is not None, "버킷 캐시엔 bucket_idx 필요"
+            frac = self.curriculum_frac
+            idxs = torch.empty(num_envs, dtype=torch.long, device=self.device)
+            for b in range(self.n_buckets):
+                m = (bucket_idx == b)
+                cnt = int(m.sum())
+                if cnt == 0:
+                    continue
+                pool = self._bucket_pools[b]
+                psize = pool.numel()
+                max_n = psize if frac >= 1.0 else max(min(500, psize), int(frac * psize))
+                idxs[m] = pool[torch.randint(0, max_n, (cnt,), device=self.device)]
+            self.last_idxs = idxs
+            return {k: v[idxs].clone() for k, v in self.cache.items() if k != "bucket"}
+
         cache_size = next(iter(self.cache.values())).shape[0]
         if self.curriculum_frac < 1.0 and self.sorted_idxs is not None:
             # Curriculum: 가까운 거리부터 frac 비율만큼만 샘플 풀로 사용.
@@ -190,11 +257,21 @@ class VectorizedPoseSampler:
         z = w1*z2 + x1*y2 - y1*x2 + z1*w2
         return torch.stack([w, x, y, z], dim=1)
 
-    def sample_episodes(self, num_envs):
+    def sample_episodes(self, num_envs, half_len: float = 0.4, grasp_off=None):
         """
         Generates 'num_envs' valid episodes using vectorized operations.
         Ensures IK feasibility for both Start and Goal poses.
+
+        half_len: rod 절반 길이 [m] (grasp 분리 = 2*half_len). 기본 0.4 (기존 0.8m rod).
+                  크기 일반화: 버킷별로 이 값을 바꿔 호출 → 해당 크기의 grasp IK 생성.
+        grasp_off: per-arm grasp 오프셋 (object frame). None이면 half_len 대칭(top-grasp Rx(π)).
+                   dict(off_pos_1(3,), off_quat_1(4,), off_pos_2(3,), off_quat_2(4,)).
+                   off_pos엔 이미 TCP_OFFSET(z) 포함. 직선 파지변이=off_pos_i=(±d,0,TCP),
+                   off_quat_i=Ry(±θ)·Rx(π). (grasp_off 주면 half_len/fixed_grasp_roll 무시.)
         """
+        _go = None
+        if grasp_off is not None:
+            _go = {k: torch.as_tensor(v, dtype=torch.float32, device=self.device) for k, v in grasp_off.items()}
         collected = {
             "base_pose_1": [], "base_pose_2": [],
             "start_obj_pose": [], "goal_obj_pose": [],
@@ -266,8 +343,8 @@ class VectorizedPoseSampler:
                 
                 # --- C. Distance Filter (Strict EE-based) ---
                 # Calculate tentative EE positions at Goal to check distance from base
-                width = 0.8; half_width = width / 2.0
-                
+                half_width = half_len   # rod 절반 길이 (grasp offset). 크기 일반화용 파라미터.
+
                 # [NEW] Sample Random Grasp Roll (Parallel Grasp Direction)
                 # Roll around Object X-axis: 0=Up, pi=Down, pi/2=Back, -pi/2=Front
                 # Phase 2: fixed_grasp_roll=True면 π로 고정 (gripper 아래 방향, 자연스런 grasp)
@@ -283,10 +360,16 @@ class VectorizedPoseSampler:
                 # Euler(Roll, 0, 0)
                 off_q_shared = self._euler_to_quat(grasp_roll, torch.zeros(N, device=self.device), torch.zeros(N, device=self.device))
 
-                off_p1_temp = torch.tensor([-half_width, 0.0, z_offset], device=self.device).repeat(N, 1)
-                off_q1_temp = off_q_shared
-                off_p2_temp = torch.tensor([half_width, 0.0, z_offset], device=self.device).repeat(N, 1)
-                off_q2_temp = off_q_shared
+                if _go is not None:   # 파지변이: per-arm grasp 오프셋 (±d, 0, TCP) + Ry(±θ)·Rx(π)
+                    off_p1_temp = _go["off_pos_1"].expand(N, 3)
+                    off_q1_temp = _go["off_quat_1"].expand(N, 4)
+                    off_p2_temp = _go["off_pos_2"].expand(N, 3)
+                    off_q2_temp = _go["off_quat_2"].expand(N, 4)
+                else:
+                    off_p1_temp = torch.tensor([-half_width, 0.0, z_offset], device=self.device).repeat(N, 1)
+                    off_q1_temp = off_q_shared
+                    off_p2_temp = torch.tensor([half_width, 0.0, z_offset], device=self.device).repeat(N, 1)
+                    off_q2_temp = off_q_shared
 
                 ee1_goal_p, _ = self._get_ee_pose_world(goal_obj_pos, goal_obj_quat, off_p1_temp, off_q1_temp)
                 ee2_goal_p, _ = self._get_ee_pose_world(goal_obj_pos, goal_obj_quat, off_p2_temp, off_q2_temp)
@@ -320,13 +403,19 @@ class VectorizedPoseSampler:
                 g_obj_p = goal_obj_pos[cand_indices]; g_obj_q = goal_obj_quat[cand_indices]
                 
                 # Offsets
-                width = 0.8; half_width = width / 2.0
-                
-                # Use the same shared quaternion (z_offset은 위에서 계산된 값을 그대로 적용)
-                off_pos_1 = torch.tensor([-half_width, 0.0, z_offset], device=self.device).repeat(count, 1)
-                off_quat_1 = off_q_shared[cand_indices]
-                off_pos_2 = torch.tensor([half_width, 0.0, z_offset], device=self.device).repeat(count, 1)
-                off_quat_2 = off_q_shared[cand_indices]
+                half_width = half_len
+
+                if _go is not None:   # 파지변이: per-arm grasp 오프셋
+                    off_pos_1 = _go["off_pos_1"].expand(count, 3)
+                    off_quat_1 = _go["off_quat_1"].expand(count, 4)
+                    off_pos_2 = _go["off_pos_2"].expand(count, 3)
+                    off_quat_2 = _go["off_quat_2"].expand(count, 4)
+                else:
+                    # Use the same shared quaternion (z_offset은 위에서 계산된 값을 그대로 적용)
+                    off_pos_1 = torch.tensor([-half_width, 0.0, z_offset], device=self.device).repeat(count, 1)
+                    off_quat_1 = off_q_shared[cand_indices]
+                    off_pos_2 = torch.tensor([half_width, 0.0, z_offset], device=self.device).repeat(count, 1)
+                    off_quat_2 = off_q_shared[cand_indices]
 
                 # --- D. IK Solve & Verify ---
                 # Start
@@ -454,5 +543,5 @@ class VectorizedPoseSampler:
             "goal_obj_pose": torch.cat(collected["goal_obj_pose"]),
             "goal_ee1_pose": torch.cat(collected["goal_ee1_pose"]),
             "goal_ee2_pose": torch.cat(collected["goal_ee2_pose"]),
-            "obj_width": 0.8
+            "obj_width": 2.0 * half_len   # 기본 half_len=0.4 → 0.8 (기존과 동일)
         }

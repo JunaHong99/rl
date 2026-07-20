@@ -231,6 +231,18 @@ class DualrobotCfg(DirectRLEnvCfg):
     use_rod_safety_filter: bool = True
     rod_safety_margin: float = 0.04   # contact(=ROD_R+obs_R) 위로 추가 버퍼 [m] (tracking lag 흡수)
     rod_safety_iters: int = 3         # 다중 장애물 동시 해소용 projection 반복 횟수
+
+    # === 7. Grasp 변이 (straight rod, per-env 파지 일반화, 2026-07-20) ===
+    # 직선 rod를 (거리 d, 기울기 θ)로 파지 변이 → 파지 일반화(GNN grasp feat 전제).
+    #   d = rod 중심에서 각 hand까지의 파지점 거리(대칭). θ = rod y축 둘레 tilt(대칭 미러).
+    #   파지점: hand1=(-d,0,0), hand2=(+d,0,0). 파지자세: base=Rx(π)(top-grasp), tilt=Ry(±θ).
+    #   HARD 제약 a1·a2>0 (=cos(2θ)>0 → |θ|<45°): approach축(hand z) 동측 유지(대향파지 배제).
+    #   버킷화(grasp_n_buckets개) + env 라운드로빈 → grasp 정합 pose cache 버킷당 1개.
+    # ★ vary_grasp=False면 현 master와 완전 동일(d=0.4, θ=0). 모든 신규 경로는 이 flag에 gate.
+    vary_grasp: bool = False
+    grasp_d_range: tuple = (0.25, 0.40)   # per-env 파지점 거리 d ∈ [lo,hi] [m] (rod 반길이 이내)
+    grasp_theta_max: float = 0.70         # per-env tilt |θ| 최대 [rad] (≈40°, <45°라 a1·a2>0 보장)
+    grasp_n_buckets: int = 8              # (d,θ) 버킷 수 (버킷당 pose cache 1개, env 라운드로빈)
     # 필터 개입 페널티 (2026-06-22, 방향(b)): 필터가 target을 밀어낸 양(=RL이 장애물로 명령한 정도)에
     # 비례 페널티 → RL이 rod 회피를 *학습*(필터=안전backstop, 페널티=학습신호. RoboBallet 충실판).
     w_filter_intervene: float = 20.0  # × push[m]. push≤~0.02-0.04/step → -0.4~0.8/step (gentle)

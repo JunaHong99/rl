@@ -73,13 +73,27 @@ class PerArmImpedanceController:
         # Rx(π) quat: w=0, x=1, y=0, z=0
         self._rx_pi = torch.tensor([0.0, 1.0, 0.0, 0.0], device=self.device).unsqueeze(0).expand(self.num_envs, 4).contiguous()
 
-        # Constant local offsets in rod frame
-        self._left_offset_local = torch.tensor(
-            [-self.ROD_HALF_LENGTH, 0.0, self.TCP_OFFSET], device=self.device
-        ).unsqueeze(0).expand(self.num_envs, 3).contiguous()
-        self._right_offset_local = torch.tensor(
-            [+self.ROD_HALF_LENGTH, 0.0, self.TCP_OFFSET], device=self.device
-        ).unsqueeze(0).expand(self.num_envs, 3).contiguous()
+        # Local offsets + grasp quat in rod frame.
+        # 파지 변이(straight rod): per-env (±d,0,TCP) + Ry(±θ)·Rx(π) (env마다 다름).
+        #   직선 고정(기본): ±half_len + Rx(π) (공유). vary_grasp=False면 아래 else 경로=기존과 동일.
+        if getattr(env, "_grasp_d", None) is not None:
+            d = env._grasp_d                                                # (N,) per-env 파지점 거리
+            tcp = torch.full((self.num_envs,), self.TCP_OFFSET, device=self.device)
+            zero = torch.zeros(self.num_envs, device=self.device)
+            self._left_offset_local = torch.stack([-d, zero, tcp], dim=1).contiguous()
+            self._right_offset_local = torch.stack([+d, zero, tcp], dim=1).contiguous()
+            self._left_grasp_quat = env._grasp_q1.contiguous()             # (N,4) Ry(+θ)·Rx(π)
+            self._right_grasp_quat = env._grasp_q2.contiguous()            # (N,4) Ry(-θ)·Rx(π)
+        else:
+            # Constant local offsets in rod frame (기본: 대칭 ±half_len top-grasp)
+            self._left_offset_local = torch.tensor(
+                [-self.ROD_HALF_LENGTH, 0.0, self.TCP_OFFSET], device=self.device
+            ).unsqueeze(0).expand(self.num_envs, 3).contiguous()
+            self._right_offset_local = torch.tensor(
+                [+self.ROD_HALF_LENGTH, 0.0, self.TCP_OFFSET], device=self.device
+            ).unsqueeze(0).expand(self.num_envs, 3).contiguous()
+            self._left_grasp_quat = self._rx_pi
+            self._right_grasp_quat = self._rx_pi
 
         self._last_info: dict = {}
         # 중력 보상 (gravity ON): τ += grav_sign·G(q). gravity_test.py로 sign=+1 검증됨(2026-06-15).
@@ -172,12 +186,13 @@ class PerArmImpedanceController:
         ee1_target_pos = target_obj_pos + self._quat_apply(target_obj_quat, self._left_offset_local)
         ee2_target_pos = target_obj_pos + self._quat_apply(target_obj_quat, self._right_offset_local)
 
-        # panda_hand quaternion = quat_mul(target_obj_quat, Rx(π))
-        ee_target_quat = self._quat_mul(target_obj_quat, self._rx_pi)
-        # Normalize
-        ee_target_quat = ee_target_quat / torch.norm(ee_target_quat, dim=-1, keepdim=True)
+        # panda_hand quaternion = quat_mul(target_obj_quat, grasp_quat). 파지변이면 per-arm 다름.
+        ee1_quat = self._quat_mul(target_obj_quat, self._left_grasp_quat)
+        ee2_quat = self._quat_mul(target_obj_quat, self._right_grasp_quat)
+        ee1_quat = ee1_quat / torch.norm(ee1_quat, dim=-1, keepdim=True)
+        ee2_quat = ee2_quat / torch.norm(ee2_quat, dim=-1, keepdim=True)
 
-        return ee1_target_pos, ee_target_quat, ee2_target_pos, ee_target_quat
+        return ee1_target_pos, ee1_quat, ee2_target_pos, ee2_quat
 
     # ──────────────────────────────────────────────────────────────────
     # Single-arm impedance
