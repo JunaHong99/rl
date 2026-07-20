@@ -84,6 +84,8 @@ parser.add_argument("--no_rod_filter", action="store_true",
 parser.add_argument("--max_active_obstacles", type=int, default=None,
                     help="일반화 실험: 학습 시 활성 장애물 최대치 cap (예: 2 → 활성 ≤2 학습, eval 3-4는 unseen). "
                          "None이면 cfg 기본(n_obstacles=무제한).")
+parser.add_argument("--vary_grasp", action="store_true",
+                    help="파지 변이 학습(S2): per-env grasp 위치 d + 각도 θ(a1·a2>0). replicate_physics=False 강제.")
 parser.add_argument("--use_hard_safety", action="store_true",
                     help="팔 hard 안전 필터 ON으로 학습 (충돌 0 지향). RoboBallet velocity-zeroing 근사(제동토크).")
 parser.add_argument("--use_swivel_nullspace", action="store_true",
@@ -156,6 +158,9 @@ def main():
     if args.max_active_obstacles is not None:
         env_cfg.max_active_obstacles = args.max_active_obstacles
         print(f"🎯 일반화 실험: 학습 활성 장애물 ≤ {args.max_active_obstacles} (eval >{args.max_active_obstacles}는 unseen)")
+    if args.vary_grasp:
+        env_cfg.vary_grasp = True
+        print("✋ 파지 변이 ON (S2): per-env grasp 위치+각도 (a1·a2>0), replicate_physics=False")
     if args.use_hard_safety:
         env_cfg.use_hard_safety = True
         print("🛡️  hard safety filter ON (팔 충돌 0 지향)")
