@@ -357,28 +357,31 @@ class DualrobotEnv(DirectRLEnv):
         self._grasp_bucket_theta = bucket_theta
         self._grasp_d = bucket_d[bucket_idx]                                 # (N,) per-env
         self._grasp_theta = bucket_theta[bucket_idx]                         # (N,)
-        # per-env 파지 quat (미러): hand1=+θ, hand2=-θ.
+        # per-env 파지 quat. tsign: 같은 쪽(비미러)=+θ 둘 다 / 미러=hand2 -θ.
+        tsign = -1.0 if getattr(cfg, "grasp_tilt_mirror", False) else 1.0
         self._grasp_q1 = grasp_quat_ry_rxpi(self._grasp_theta)              # (N,4)
-        self._grasp_q2 = grasp_quat_ry_rxpi(-self._grasp_theta)             # (N,4)
-        # HARD 제약 검증: a1·a2>0 (모든 env).
+        self._grasp_q2 = grasp_quat_ry_rxpi(tsign * self._grasp_theta)      # (N,4)
+        # HARD 제약 검증: a1·a2>0 (모든 env). 같은 쪽이면 dot=1, 미러면 cos2θ.
         a1 = grasp_approach_axis(self._grasp_theta)
-        a2 = grasp_approach_axis(-self._grasp_theta)
+        a2 = grasp_approach_axis(tsign * self._grasp_theta)
         dots = (a1 * a2).sum(dim=-1)
         assert bool((dots > 0).all()), f"grasp a1·a2>0 위반: min={float(dots.min()):.4f}"
+        _mode = "미러(splay)" if tsign < 0 else "같은 쪽(평행)"
         print(f"[grasp-var] {nb} buckets, d∈[{d_lo:.2f},{d_hi:.2f}] θ∈±{th_cap:.3f}rad "
-              f"a1·a2 min={float(dots.min()):.3f} ({self.num_envs} envs, 라운드로빈)")
+              f"tilt={_mode} a1·a2 min={float(dots.min()):.3f} ({self.num_envs} envs, 라운드로빈)")
 
     def _grasp_bucket_grasp_offs(self):
         """각 (d,θ) 버킷의 grasp_off dict 리스트 → 버킷별 pose cache 생성용 (용접/컨트롤러와 정합).
-        off_pos_1=(-d,0,TCP), off_quat_1=Ry(+θ)·Rx(π); off_pos_2=(+d,0,TCP), off_quat_2=Ry(-θ)·Rx(π)."""
+        off_pos_1=(-d,0,TCP), off_quat_1=Ry(+θ)·Rx(π); off_pos_2=(+d,0,TCP), off_quat_2=Ry(tsign·θ)·Rx(π)."""
         self._compute_grasp_specs()
         TCP = VectorizedPoseSampler.TCP_OFFSET
         dev = self.device
+        tsign = -1.0 if getattr(self.cfg, "grasp_tilt_mirror", False) else 1.0
         offs = []
         for b in range(int(self.cfg.grasp_n_buckets)):
             d = float(self._grasp_bucket_d[b]); th = float(self._grasp_bucket_theta[b])
             q1 = grasp_quat_ry_rxpi(torch.tensor([th], device=dev))[0]
-            q2 = grasp_quat_ry_rxpi(torch.tensor([-th], device=dev))[0]
+            q2 = grasp_quat_ry_rxpi(torch.tensor([tsign * th], device=dev))[0]
             offs.append({
                 "off_pos_1": torch.tensor([-d, 0.0, TCP], device=dev), "off_quat_1": q1,
                 "off_pos_2": torch.tensor([+d, 0.0, TCP], device=dev), "off_quat_2": q2,
