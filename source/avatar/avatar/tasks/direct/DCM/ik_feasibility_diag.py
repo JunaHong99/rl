@@ -6,16 +6,28 @@ per-arm EE target들이 IK 해가 존재하는지(도달가능) 판정하고, �
 상관되는지 확정적으로 확인한다. 이는 "IK 없음/도달불가 명령"을 "특이점(singularity)"
 (manipulability로 따로 로깅됨)과 분리하기 위한 진단이다.
 
+★ 설계 원칙 (2026-07-20 재작성):
+  롤아웃 루프는 KNOWN-GOOD eval_cluttered.py 의 롤아웃을 그대로 복제한다
+  (동일 env setup / 동일 action 계산 / 동일 env.step / 동일 success 집계 / 동일 settle 처리).
+  그 위에 "EE target 기록 + 배치 IK feasibility 판정 + success/fail split 리포트" 만 얹는다.
+  → 이렇게 해야 IK 숫자가 학습/eval 과 동일한 정책 거동에서 나온 것임이 보장된다.
+  (이전 버전은 success 라벨을 env.reached_once 로, genuine 판정을 무조건 True 로 잘못 처리해
+   eval_cluttered 와 다른 집계를 냈다. 이제 eval_cluttered 와 동일하게
+   min_pos<2cm & min_rot<10° 누적 + rr_len>settle genuine 게이트를 쓴다.)
+
 파이프라인:
-  1. eval_cluttered.py 와 동일하게 env + 학습 정책(GNN/MLP) 로드.
-  2. 정해진 스텝 수만큼 deterministic 롤아웃.
-  3. 매 스텝, per-env 로 controller._compute_ee_targets(target_obj_pos, target_obj_quat)
+  1. eval_cluttered.py 와 동일하게 env + 학습 정책(GNN/MLP) 로드
+     (action_scale 은 constructor 에 넘기지만 load_state_dict 가 ckpt 값으로 덮어씀 — eval 과 동일).
+  2. eval_cluttered 와 동일한 deterministic 롤아웃 (_build_policy_batch → actor(det=True) → env.step).
+  3. 매 스텝(settle step 제외), per-env 로 controller._compute_ee_targets(target_obj_pos, target_obj_quat)
      가 반환하는 world-frame EE target(arm1/arm2)과 각 arm base pose(root_pos_w/root_quat_w)
      를 기록. FrankaTensorIK 는 ARM BASE frame 에서 동작하므로 world→base 변환 후 저장.
-  4. 에피소드 종료 시 env.reached_once 로 success/fail 라벨링.
+  4. 에피소드 종료 시 eval_cluttered 와 동일하게 (min_pos<2cm & min_rot<10°) 로 success 라벨링,
+     rr_len>settle 인 genuine 에피소드만 채택. 라벨은 running episode id 로 back-fill.
   5. 롤아웃 후, 기록된 모든 EE target(양 arm)에 대해 배치 IK(solve_ik_gradient) 실행,
      residual = ||FK(q_sol) - target_pos|| 계산. residual > threshold → IK 해 없음(infeasible).
-  6. SUCCESS vs FAIL 에피소드로 나누어 infeasible 비율, mean/max reach(||EE-base||) 리포트.
+  6. 먼저 롤아웃 success rate 를 출력(eval_cluttered ~93% 와 일치하는지 sanity gate),
+     그다음 SUCCESS vs FAIL 에피소드로 나누어 infeasible 비율, mean/max reach 리포트.
 
 사용:
   export LD_LIBRARY_PATH=/home/hjh/anaconda3/envs/env-isaaclab/lib:$LD_LIBRARY_PATH
@@ -141,11 +153,13 @@ def main():
     parser.add_argument("--model_path", type=str, default=None)
     parser.add_argument("--num_envs", type=int, default=256)
     parser.add_argument("--num_steps", type=int, default=300)
-    parser.add_argument("--action_scale_pos", type=float, default=0.02)   # ★ 학습 기본과 일치(0.02). ckpt에 있으면 그걸 우선.
+    # ★ eval_cluttered 와 동일한 기본값(0.05/0.05). ckpt 의 actor.action_scale 버퍼가
+    #   load_state_dict 로 덮어쓰므로 실제로는 ckpt 값이 사용됨(= eval_cluttered 와 완전 동일).
+    parser.add_argument("--action_scale_pos", type=float, default=0.05)
     parser.add_argument("--action_scale_rot", type=float, default=0.05)
     parser.add_argument("--obstacle_frac", type=float, default=1.0)
     parser.add_argument("--max_active_obstacles", type=int, default=None,
-                        help="장애물 활성 상한(진단시 0 권장). None이면 env 기본.")
+                        help="장애물 활성 상한(진단시 0 권장 = obstacle-free). None이면 env 기본.")
     parser.add_argument("--num_rounds", type=int, default=2,
                         help="GNN message-passing rounds (GNN 체크포인트).")
     parser.add_argument("--ik_threshold", type=float, default=0.03,
@@ -178,32 +192,38 @@ def main():
     import numpy as np
     from dual_arm_transport_env3 import DualrobotEnv, DualrobotCfg
     from franka_tensor_ik import FrankaTensorIK
+    import isaaclab.utils.math as math_utils
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # ── env 구성 (eval_cluttered 와 동일) ──────────────────────────────
     cfg = DualrobotCfg()
     cfg.scene.num_envs = args.num_envs
-    env = DualrobotEnv(cfg, render_mode=None)
+    env = DualrobotEnv(cfg, render_mode=None)             # ★ 부팅/씬 로딩 1회
     env._obstacle_curr_frac = args.obstacle_frac
-    if args.max_active_obstacles is not None and hasattr(env, "max_active_obstacles"):
+    # obstacle-free 진단: 장애물 활성 상한. eval_cluttered 는 건드리지 않지만
+    # 진단 목적상 --max_active_obstacles 0 으로 obstacle-free 롤아웃을 얻는다.
+    if args.max_active_obstacles is not None:
+        try:
+            env.cfg.max_active_obstacles = args.max_active_obstacles
+        except Exception:
+            pass
         try:
             env.max_active_obstacles = args.max_active_obstacles
         except Exception:
             pass
     A = env.cfg.action_space
     B = args.num_envs
+    POS_T, ROT_T = 0.02, math.radians(10)                 # eval_cluttered 와 동일한 success 임계
     settle = getattr(env, "SETTLE_STEPS_AT_RESET", 0)
 
-    # ── 정책 로드 (eval_cluttered 구조 재사용) ─────────────────────────
+    # ── 정책 로드 (eval_cluttered 와 동일 구조) ─────────────────────────
     sd = torch.load(os.path.abspath(args.model_path), map_location=dev,
                     weights_only=False)["model"]
-    # ★ action_scale: ckpt에 저장돼 있으면 그걸 우선(학습값 정합). 없으면 args 기본(0.02/0.05).
-    if "actor.action_scale" in sd:
-        scale = sd["actor.action_scale"].detach().cpu().tolist()
-        print(f"  action_scale ← ckpt: {[round(s,3) for s in scale]}")
-    else:
-        scale = [args.action_scale_pos] * 3 + [args.action_scale_rot] * 3 + [1.0] * (A - 6)
-        print(f"  action_scale ← args(ckpt에 없음): pos={args.action_scale_pos} rot={args.action_scale_rot}")
-    if "actor.mean_head.0.weight" in sd:
+    # eval_cluttered 와 동일: constructor 에는 args 기반 scale 을 주지만,
+    # load_state_dict 가 ckpt 의 actor.action_scale 버퍼를 덮어쓰므로 실제 사용값은 ckpt 값.
+    scale = [args.action_scale_pos] * 3 + [args.action_scale_rot] * 3 + [1.0] * (A - 6)
+    if "actor.mean_head.0.weight" in sd:                  # MLP vs GNN 자동 판별 (eval_cluttered 와 동일)
         import mlp_policy
         in_dim = sd["actor.mean_head.0.weight"].shape[1]
         use_full = (in_dim == mlp_policy._state_dim(True))
@@ -211,47 +231,69 @@ def main():
         agent = mlp_policy.MLPSACAgent(action_dim=A, action_scale=scale, hidden_dim=256,
                                        num_hidden_layers=2, use_full_state=use_full,
                                        use_lean_obstacle=use_lean).to(dev)
-        mode = "MLP"
+        mode = "full_state" if use_full else ("lean_obstacle" if use_lean else "rod+global")
+        mode = f"MLP/{mode}"
     else:
         import gnn_policy
         agent = gnn_policy.GNNSACAgent(action_dim=A, num_rounds=args.num_rounds,
                                        action_scale=scale).to(dev)
         mode = "GNN"
-    agent.load_state_dict(sd)
+    agent.load_state_dict(sd)                             # ★ action_scale 버퍼도 ckpt 값으로 덮어씀
     agent.eval()
+    used_scale = agent.actor.action_scale.detach().cpu().tolist()
     print("=" * 70)
     print(f"IK-feasibility diag  |  {os.path.basename(args.model_path)}  "
           f"policy={mode}  num_envs={B}  steps={args.num_steps}  thr={args.ik_threshold}m")
+    print(f"  action_scale (load_state_dict 후, 실사용): {[round(s, 3) for s in used_scale]}")
+    print(f"  obstacle_frac={args.obstacle_frac}  max_active_obstacles={args.max_active_obstacles}")
 
     ik = FrankaTensorIK(dev)
 
-    # ── 롤아웃 + 기록 ──────────────────────────────────────────────────
-    # per (step, env, arm) 로 base-frame EE target(pos, rot) + reach + env 인덱스 기록.
-    # 에피소드 라벨은 done 시점에 확정 → 각 기록에 (running episode id)를 태깅해두고
-    # 종료 시 그 id 의 success 를 채운다.
+    # ── 롤아웃 (eval_cluttered.run_eval 를 그대로 복제 + EE target 기록) ──
     env.reset()
     batch = env._build_policy_batch()
 
-    rec_pos = []      # list of (B,3) base-frame pos, per arm concat
-    rec_rot = []      # list of (B,3,3)
-    rec_reach = []    # list of (B,) ||EE-base||
-    rec_epid = []     # list of (B,) long   running episode id per env
-    rec_env = []      # list of (B,) long   env index
-    # 각 (env) 의 현재 진행중 episode id, 그리고 최종 라벨 저장
-    ep_counter = torch.zeros(B, dtype=torch.long, device=dev)
-    global_epid = torch.arange(B, dtype=torch.long, device=dev)   # 유니크 episode id
+    # eval_cluttered 의 에피소드 집계 상태 (동일)
+    rr_min_pos = torch.full((B,), float("inf"), device=dev)
+    rr_min_rot = torch.full((B,), float("inf"), device=dev)
+    rr_len = torch.zeros(B, dtype=torch.long, device=dev)
+
+    # ── EE target 기록 (얹은 부분) ──
+    # 각 (step, env, arm) 로 base-frame EE target(pos, rot) + reach + running episode id 기록.
+    # 에피소드 라벨(success)은 done 시점에 eval_cluttered 와 동일 기준으로 확정 → back-fill.
+    rec_pos = []      # list of (2B,3) base-frame pos  (arm1 concat arm2)
+    rec_rot = []      # list of (2B,3,3)
+    rec_reach = []    # list of (2B,) ||EE-base||
+    rec_epid = []     # list of (2B,) long  running episode id per (env,arm)
+
+    ep_label = {}     # global_epid(int) -> success(bool)   (genuine 에피소드만 등재)
+    global_epid = torch.arange(B, dtype=torch.long, device=dev)  # env 별 현재 진행 episode id
     next_id = B
-    ep_label = {}     # global_epid(int) -> success(bool)
-    ep_valid = {}     # global_epid(int) -> settle 넘긴 genuine 인지
 
-    step_env_idx = torch.arange(B, dtype=torch.long, device=dev)
-
+    import time
+    t0 = time.time()
     for step in range(args.num_steps):
+        # ── 정책 action (eval_cluttered 와 동일: deterministic) ──
         with torch.no_grad():
             action, _, _ = agent.actor.get_action_and_log_prob(batch, deterministic=True)
             _, _, term, trunc, _ = env.step(action)
 
-        # 명령된 rod pose → per-arm world EE target
+        # settle step 마스크 (eval_cluttered 와 동일한 노출 사용)
+        nonsettle = ~env._is_settle_step if hasattr(env, "_is_settle_step") \
+            else torch.ones(B, dtype=torch.bool, device=dev)
+
+        # ── success 집계 (eval_cluttered 와 동일: rod↔goal min pos/rot 누적) ──
+        rod_pos = env.rod.data.root_pos_w
+        goal_pos = env.goal_rod_marker.data.root_pos_w
+        pos_err = torch.norm(goal_pos - rod_pos, dim=-1)
+        q_diff = math_utils.quat_mul(env.goal_rod_marker.data.root_quat_w,
+                                     math_utils.quat_conjugate(env.rod.data.root_quat_w))
+        rot_err = 2.0 * torch.atan2(torch.norm(q_diff[:, 1:4], dim=-1), torch.abs(q_diff[:, 0]))
+        rr_min_pos = torch.min(rr_min_pos, pos_err)
+        rr_min_rot = torch.min(rr_min_rot, rot_err)
+        rr_len += 1
+
+        # ── EE target 기록 (settle step 은 target 동결이라 제외) ──
         ee1_p, ee1_q, ee2_p, ee2_q = env.controller._compute_ee_targets(
             env.target_obj_pos, env.target_obj_quat
         )
@@ -259,56 +301,69 @@ def main():
         b1_q = env.robot_1.data.root_quat_w
         b2_p = env.robot_2.data.root_pos_w
         b2_q = env.robot_2.data.root_quat_w
-
-        # world→base 변환
         p1_b, R1_b = world_to_base(ee1_p, ee1_q, b1_p, b1_q)
         p2_b, R2_b = world_to_base(ee2_p, ee2_q, b2_p, b2_q)
         reach1 = torch.norm(ee1_p - b1_p, dim=-1)
         reach2 = torch.norm(ee2_p - b2_p, dim=-1)
 
-        # 양 arm 을 하나로 concat (2B 레코드)
-        rec_pos.append(torch.cat([p1_b, p2_b], dim=0))
-        rec_rot.append(torch.cat([R1_b, R2_b], dim=0))
-        rec_reach.append(torch.cat([reach1, reach2], dim=0))
-        rec_epid.append(global_epid.repeat(2))
-        rec_env.append(step_env_idx.repeat(2))
+        keep = nonsettle                                  # settle step 제외 (genuine 만 기록)
+        if keep.any():
+            ki = keep.nonzero(as_tuple=True)[0]
+            rec_pos.append(torch.cat([p1_b[ki], p2_b[ki]], dim=0))
+            rec_rot.append(torch.cat([R1_b[ki], R2_b[ki]], dim=0))
+            rec_reach.append(torch.cat([reach1[ki], reach2[ki]], dim=0))
+            rec_epid.append(global_epid[ki].repeat(2))
 
-        # 종료 처리: 라벨 확정 + 새 episode id 발급
+        # ── 종료 처리 (eval_cluttered 와 동일: rr_len>settle 인 genuine 만 라벨 + 카운트) ──
         done = term | trunc
         if done.any():
+            for i in done.nonzero(as_tuple=True)[0].tolist():
+                if rr_len[i].item() > settle:
+                    succ = (rr_min_pos[i].item() < POS_T) and (rr_min_rot[i].item() < ROT_T)
+                    ep_label[int(global_epid[i].item())] = bool(succ)
+                # eval_cluttered 와 동일: 상태 리셋
+                rr_min_pos[i] = float("inf")
+                rr_min_rot[i] = float("inf")
+                rr_len[i] = 0
+            # 종료된 env 에 새 unique episode id 발급 (다음 에피소드 기록용)
             di = done.nonzero(as_tuple=True)[0]
-            for i in di.tolist():
-                eid = int(global_epid[i].item())
-                succ = bool(env.reached_once[i].item())
-                ep_label[eid] = succ
-                # settle 이후 스텝이 있었는지 대략 판정: step>settle 이면 genuine 로 취급
-                ep_valid[eid] = True
-            # 새 episode id 발급
             n = di.numel()
             global_epid[di] = torch.arange(next_id, next_id + n, device=dev, dtype=torch.long)
             next_id += n
+
         batch = env._build_policy_batch()
 
-    # 진행중(미종료) 에피소드는 현재 reached_once 로 라벨(부분 관측이나 참고용)
-    for i in range(B):
-        eid = int(global_epid[i].item())
-        if eid not in ep_label:
-            ep_label[eid] = bool(env.reached_once[i].item())
-            ep_valid[eid] = False   # 미완결
+    # ── 롤아웃 success rate (sanity gate: eval_cluttered ~93% obstacle-free 와 일치해야 함) ──
+    genuine_ids = list(ep_label.keys())
+    n_ep = len(genuine_ids)
+    n_succ_ep = sum(1 for e in genuine_ids if ep_label[e])
+    n_fail_ep = n_ep - n_succ_ep
+    succ_rate = (100.0 * n_succ_ep / n_ep) if n_ep else 0.0
+    print("=" * 70)
+    print(f"[ROLLOUT SANITY GATE]  eval_cluttered 롤아웃 복제 결과 ({time.time()-t0:.0f}s)")
+    print(f"  genuine finished episodes: {n_ep}  (success={n_succ_ep}, fail={n_fail_ep})")
+    print(f"  ROLLOUT SUCCESS RATE (도달, min_pos<2cm & min_rot<10°): {succ_rate:.1f}%")
+    print(f"  → 이 값이 eval_cluttered 의 success(~93% obstacle-free)와 일치해야 IK 숫자가 유효.")
 
     # ── 배치 IK ────────────────────────────────────────────────────────
+    if not rec_pos:
+        print("기록된 EE target 없음 (모든 step 이 settle?). 종료.")
+        os._exit(0)
     all_pos = torch.cat(rec_pos, dim=0)     # (M,3)
     all_rot = torch.cat(rec_rot, dim=0)     # (M,3,3)
     all_reach = torch.cat(rec_reach, dim=0)  # (M,)
     all_epid = torch.cat(rec_epid, dim=0)   # (M,)
     M = all_pos.shape[0]
-    print(f"Recorded {M} EE targets (2 arms x {len(rec_pos)} steps x {B} envs). Running batched IK...")
+    print("-" * 70)
+    print(f"Recorded {M} EE targets (settle 제외, 2 arms). Running batched IK...")
 
     res, feas = classify_ik_feasible(ik, all_pos, all_rot, threshold=args.ik_threshold,
                                      max_iter=args.ik_max_iter, tol=1e-4)
     infeasible = ~feas
 
-    # 각 레코드의 episode success 라벨을 벡터화
+    # 각 레코드에 대응하는 에피소드 라벨. genuine(=종료 라벨 확정)만 통계에 포함.
+    labeled = torch.tensor([e in ep_label for e in all_epid.tolist()],
+                           dtype=torch.bool, device=dev)
     succ_arr = torch.tensor([ep_label.get(int(e), False) for e in all_epid.tolist()],
                             dtype=torch.bool, device=dev)
 
@@ -322,21 +377,17 @@ def main():
         max_reach = all_reach[mask].max().item()
         return n, inf_rate, mean_reach, max_reach
 
-    succ_mask = succ_arr
-    fail_mask = ~succ_arr
+    succ_mask = labeled & succ_arr
+    fail_mask = labeled & (~succ_arr)
     n_s, inf_s, mr_s, xr_s = _stats(succ_mask)
     n_f, inf_f, mr_f, xr_f = _stats(fail_mask)
-    n_all, inf_all, mr_all, xr_all = _stats(torch.ones_like(succ_arr))
-
-    # 에피소드 단위 카운트
-    genuine = [e for e in ep_label if ep_valid.get(e, False)]
-    n_succ_ep = sum(1 for e in genuine if ep_label[e])
-    n_fail_ep = sum(1 for e in genuine if not ep_label[e])
+    n_all, inf_all, mr_all, xr_all = _stats(labeled)
 
     print("=" * 70)
     print("IK-FEASIBILITY DIAGNOSTIC REPORT")
     print(f"  IK residual threshold: {args.ik_threshold} m  (residual>thr => NO IK / unreachable)")
-    print(f"  genuine finished episodes: {len(genuine)}  (success={n_succ_ep}, fail={n_fail_ep})")
+    print(f"  genuine finished episodes: {n_ep}  (success={n_succ_ep}, fail={n_fail_ep})")
+    print(f"  (통계는 종료 라벨이 확정된 genuine 에피소드의 EE target 만 포함)")
     print("-" * 70)
     print(f"  {'group':<10}{'#EEtargets':>12}{'infeasible%':>14}{'mean_reach':>12}{'max_reach':>12}")
     print(f"  {'SUCCESS':<10}{n_s:>12}{inf_s:>13.2f}%{mr_s:>11.3f}m{xr_s:>11.3f}m")
