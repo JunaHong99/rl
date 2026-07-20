@@ -242,9 +242,6 @@ class DualrobotCfg(DirectRLEnvCfg):
     vary_grasp: bool = False
     grasp_d_range: tuple = (0.25, 0.40)   # per-env 파지점 거리 d ∈ [lo,hi] [m] (rod 반길이 이내)
     grasp_theta_max: float = 0.70         # per-env tilt |θ| 최대 [rad] (≈40°, <45°라 a1·a2>0 보장)
-    # 두 손 tilt 방향. False=같은 쪽(비미러, 두 approach축 평행=같은 쪽 파지, a1·a2=1) ← 기본.
-    #   True=미러(hand2=-θ, 옆에서 보면 서로 반대로 벌어짐(splay), a1·a2=cos2θ). 위치는 항상 ∓d/±d 대칭.
-    grasp_tilt_mirror: bool = False
     grasp_n_buckets: int = 8              # (d,θ) 버킷 수 (버킷당 pose cache 1개, env 라운드로빈)
     # 저장된 파지 세트 로드(육안 확인/재현용). 경로 지정 시 랜덤 버킷 샘플링 대신 파일의 (d,θ)를
     #   버킷으로 사용(grasp_n_buckets는 파일 길이로 덮어씀). gen_grasp.py로 생성. None이면 랜덤.
