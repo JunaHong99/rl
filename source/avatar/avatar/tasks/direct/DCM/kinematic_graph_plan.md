@@ -126,6 +126,34 @@
 
 ---
 
-## 다음 액션
-**§3 결정포인트 6개 확정 → Phase 1a 스키마 fix → 1b 그래프빌더(Isaac-free 테스트) → 1c 정책.**
-Phase 1 게이트(고정로봇 kinematic 그래프 ≥90%) 통과가 전체의 관문.
+---
+
+## ★ 실행 계획 확정 (2026-07-20 재구성) — grasp 일반화 우선
+
+### 확정된 전제
+- **액션 = object-pose(6) + per-arm nullspace(2) = 8** = 닫힌사슬 시스템 DoF(6+1+1)와 정확히 일치 = **완전·대칭·로봇무관 파라미터화. 유지.** (관절액션/leader-follower 불필요. 내력 명시제어는 병목 아니라 보류 — 필요시 대칭 admittance.)
+- **양팔 = 같은 로봇** (크기/종류 함께 변이). **충돌 회피 뒤로.** **한 스텝당 한 변경 + 93% 재확인.**
+
+### 일차 목표 = 다양한 grasp pose 운반 성공 (held-out zero-shot)
+
+**grasp 변이 스펙 (확정):**
+- **위치**: rod 중심 거리 d ∈ [0.25, 0.40]m (대칭, 양손 ∓d/±d).
+- **각도**: 각 손 approach축 ±40°, **하드제약 a₁·a₂ > 0** (두 EE 나가는 축 내적 양수 = 90° 이내, 근본있는 파지).
+- **대칭** (거울, 파라미터: d, θ 각 1개).
+- **held-out**: 위치 학습 [0.25,0.30]∪[0.34,0.40]/hold-out[0.30,0.34]; 각도 학습 |θ|≤30°/hold-out 30~40°. (S2b eval서 확정)
+
+### 단계 (cheapest-first + make-or-break 베이스라인 내장)
+- **S0 ✅**: lean 3노드, 고정 grasp, 93%. (grasp 엣지=EE↔물체 상대pose=파지 이미 인코딩)
+- **S1**: per-env grasp **위치** 변이 인프라 (sim 용접앵커 per-env / 컨트롤러 per-env offset / grasp-matched pose 캐시). **chain-backup(2d2b64e) 참조.** 게이트: **고정파지 93% 유지**.
+- **S2**: **lean 그래프로 위치변이 학습** (★make-or-break 베이스). 게이트: held-out 위치 zero-shot. 되면 S2b / 안 되면 S4.
+- **S2b**: **각도 변이 추가** (a₁·a₂>0). 게이트: held-out 위치+각도 zero-shot.
+- **S4 (S2/S2b 실패 시)**: kinematic 그래프 도입 — **S4a** base노드 → **S4b** 관절/링크 사슬(identity) → **S4c** 기구학 feature(축·값·한계·링크길이). 각 고정-grasp 93% 재확인 → grasp 변이 재학습 → held-out. **S2 실패 + S4 성공 = "kinematic 그래프가 grasp 일반화 원천" 입증(논문 핵심).**
+
+### 이후 (grasp 후)
+base 간격 → 로봇 크기 → 로봇 종류/DoF(여기서 kinematic 확실히 필요) → 충돌 회피. (kinematic 그래프 §1 설계 재사용.)
+
+### 진단
+매 게이트에서 `ik_feasibility_diag.py`(rollout success gate 먼저!) + reach/특이점 성공·실패 분해. **S2 실패 원인이 "도달불가↑"면 kinematic 동기 정확히 입증.**
+
+### 다음 액션
+**S1 착수**: chain-backup에서 per-env 용접앵커·컨트롤러 grasp offset·grasp-matched 캐시 참조 → 현재 master(lean)에 위치변이만 재구현 → 고정파지 93% 게이트.
