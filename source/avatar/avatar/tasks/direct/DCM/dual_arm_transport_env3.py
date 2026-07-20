@@ -74,7 +74,7 @@ class DualrobotEnv(DirectRLEnv):
             self.pose_sampler = CachedPoseSampler(
                 device=self.device, cache_size=100_000, fixed_grasp_roll=True,
                 bucket_grasp_offs=self._grasp_bucket_grasp_offs(),
-                cache_tag=f"graspvar_{self.cfg.grasp_n_buckets}b",
+                cache_tag=getattr(self, "_grasp_cache_tag", f"graspvar_{self.cfg.grasp_n_buckets}b"),
             )
         else:
             self.pose_sampler = CachedPoseSampler(
@@ -330,12 +330,25 @@ class DualrobotEnv(DirectRLEnv):
         th_max = float(cfg.grasp_theta_max)
         # a1·a2>0 = cos(2θ)>0 → |θ|<π/4. th_max가 이보다 크면 안전하게 clamp(제약 위반 방지).
         th_cap = min(th_max, 0.999 * (math.pi / 4.0))
-        gen = torch.Generator(device="cpu").manual_seed(12345)   # 버킷 (d,θ) 재현성
-        # 버킷별 대표 (d,θ): d는 range 균등, θ는 [-cap,+cap] 균등 (버킷당 1 스펙).
-        du = torch.rand(nb, generator=gen)
-        tu = torch.rand(nb, generator=gen)
-        bucket_d = (d_lo + du * (d_hi - d_lo)).to(self.device)               # (nb,)
-        bucket_theta = ((tu * 2.0 - 1.0) * th_cap).to(self.device)           # (nb,) ∈ [-cap,+cap]
+        preset = getattr(cfg, "grasp_preset_path", None)
+        if preset:
+            # 저장된 파지 세트 로드: 파일의 (d,θ)를 버킷으로 사용. nb를 파일 길이로 덮어씀.
+            blob = torch.load(preset, map_location="cpu")
+            bucket_d = blob["d"].to(self.device).float()                     # (nb,)
+            bucket_theta = blob["theta"].to(self.device).float().clamp(-th_cap, th_cap)
+            nb = int(bucket_d.numel())
+            cfg.grasp_n_buckets = nb        # 다운스트림(버킷 순회)과 일치
+            # preset 전용 cache_tag: 랜덤 캐시(graspvar_Nb)와 충돌 방지(파지 기하가 다름).
+            import os as _os
+            self._grasp_cache_tag = f"preset_{_os.path.basename(preset).replace('.','_')}_{nb}b"
+            print(f"[grasp-var] preset 로드 '{preset}': {nb}개 파지")
+        else:
+            gen = torch.Generator(device="cpu").manual_seed(12345)   # 버킷 (d,θ) 재현성
+            # 버킷별 대표 (d,θ): d는 range 균등, θ는 [-cap,+cap] 균등 (버킷당 1 스펙).
+            du = torch.rand(nb, generator=gen)
+            tu = torch.rand(nb, generator=gen)
+            bucket_d = (d_lo + du * (d_hi - d_lo)).to(self.device)               # (nb,)
+            bucket_theta = ((tu * 2.0 - 1.0) * th_cap).to(self.device)           # (nb,) ∈ [-cap,+cap]
         # env → 버킷 라운드로빈 (재현성 고정)
         bucket_idx = torch.arange(self.num_envs, device=self.device) % nb    # (N,)
         self._grasp_bucket_idx = bucket_idx

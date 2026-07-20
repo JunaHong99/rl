@@ -1,0 +1,594 @@
+from __future__ import annotations
+#----------------------얘넨 항상 최상단------------------------
+from isaaclab.app import AppLauncher
+import argparse
+#-----------------------------------------------------------
+import math
+import torch
+import numpy as np
+
+from collections.abc import Sequence
+
+import isaaclab.sim as sim_utils
+from isaaclab.assets import Articulation, RigidObject
+from isaaclab.envs import DirectRLEnv
+from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
+from isaaclab.scene import InteractiveScene
+
+import isaaclab.utils.math as math_utils
+
+from dual_arm_transport_cfg import DualrobotCfg
+from vectorized_pose_sampler import VectorizedPoseSampler        
+from safety_filter import SafetyFilter
+from franka_jacobian_ik import FrankaJacobianIK
+
+class DualrobotEnv(DirectRLEnv):
+    """
+    Dofbot 2대를 스폰하는 환경 클래스입니다.
+    Potential-based Reward (PBR) 적용 버전.
+    """
+    cfg: DualrobotCfg # Cfg 클래스 타입 힌트
+
+    def __init__(self, cfg: DualrobotCfg, render_mode: str | None = None, **kwargs):
+        # 원본 Cfg를 부모 클래스에 전달
+        super().__init__(cfg, render_mode, **kwargs)
+
+        # Phase 2: fixed joint 사용을 위해 grasp_roll=0 고정
+        self.pose_sampler = VectorizedPoseSampler(device=self.device, fixed_grasp_roll=True)
+        self.external_samples = None # 외부 샘플 저장용 (테스트용)
+
+        # (관절 인덱스 등은 나중에 필요시 여기에 추가)
+        self.robot_1_joint_ids = self.robot_1.actuators["all_joints"].joint_indices
+        self.robot_2_joint_ids = self.robot_2.actuators["all_joints"].joint_indices
+
+        self.vel_limit_1 = self.cfg.robot_1.actuators["all_joints"].velocity_limit_sim
+        self.vel_limit_2 = self.cfg.robot_2.actuators["all_joints"].velocity_limit_sim
+        #
+        try:
+            self.ee_body_idx_1 = self.robot_1.body_names.index("panda_hand")
+            self.ee_body_idx_2 = self.robot_2.body_names.index("panda_hand")
+        except ValueError as e:
+            raise ValueError(
+                "Could not find 'panda_hand' in the robot's body_names."
+                "Check the USD file or link name."
+            ) from e
+        
+        self.safety_filter = SafetyFilter(self)
+
+        #각 에피소드의 목표 상대 포즈
+        self.target_ee_rel_poses = torch.zeros(self.num_envs, 7, device=self.device)
+        self.violation_occurred = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        
+        # [NEW] 에피소드 내 최대 오차 추적용 버퍼
+        self.episode_max_pos_error = torch.zeros(self.num_envs, device=self.device)
+        self.episode_max_rot_error = torch.zeros(self.num_envs, device=self.device)
+
+        # [NEW] Joint Space Reward용 버퍼
+        self.target_joint_pos = torch.zeros(self.num_envs, 14, device=self.device)
+        self.prev_joint_dist = torch.full((self.num_envs,), float('inf'), device=self.device)
+        self.prev_dist = torch.full((self.num_envs,), float('inf'), device=self.device)
+
+
+    def _setup_scene(self):
+        """씬에 모든 에셋을 로드하고 등록합니다."""
+        
+        # 1. 로봇  로드
+        self.robot_1 = Articulation(self.cfg.robot_1)
+        self.robot_2 = Articulation(self.cfg.robot_2)
+        # 3. 바닥 평면 로드
+        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
+
+        # (수정) 목표 마커를 RigidObject로 스폰
+        self.goal_marker_ee1 = RigidObject(self.cfg.goal_1)
+        self.goal_marker_ee2 = RigidObject(self.cfg.goal_2)
+
+        # 공유 강체 (rod) + 목표 위치 표시용 marker
+        self.rod = RigidObject(self.cfg.rod)
+        self.goal_rod_marker = RigidObject(self.cfg.goal_rod)
+
+        # Phase 2: env_0 템플릿에 rod-gripper fixed joint 2개 추가
+        # clone_environments가 PhysX 레벨에서 모든 env에 복제함
+        self._add_rod_fixed_joints_template()
+
+        # 4. 씬 복제 (num_envs 개수만큼)
+        # (이 시점에 로봇 2대와 바닥이 모두 복제됨)
+        self.scene.clone_environments(copy_from_source=False)
+
+        # 5. 씬(Scene)에 로봇들 등록 (필수)
+        self.scene.articulations["robot_1"] = self.robot_1
+        self.scene.articulations["robot_2"] = self.robot_2
+
+        # Scene 등록
+        self.scene.rigid_objects["goal_ee1"] = self.goal_marker_ee1
+        self.scene.rigid_objects["goal_ee2"] = self.goal_marker_ee2
+        self.scene.rigid_objects["rod"] = self.rod
+        self.scene.rigid_objects["goal_rod"] = self.goal_rod_marker
+        
+        # 6. 조명 추가
+        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+        light_cfg.func("/World/Light", light_cfg)
+
+    def _add_rod_fixed_joints_template(self):
+        """
+        Phase 2 (TCP 정합): env_0 템플릿에 fixed joint 2개를 추가.
+        - joint_1: Robot_1.panda_hand <-> rod (rod 왼쪽 끝)
+        - joint_2: Robot_2.panda_hand <-> rod (rod 오른쪽 끝)
+
+        anchor 정의 (sampler가 grasp_roll=π로 고정 → panda_hand가 rod에 대해 Rx(π) 회전):
+        - body0(panda_hand) local: pos=(0, 0, +TCP_OFFSET), rot=identity
+            → anchor가 TCP(fingers 사이) 위치
+        - body1(rod) local:        pos=(±0.4, 0, 0), rot=Rx(π)=(0,1,0,0)
+            → anchor가 rod 양 끝, frame은 panda_hand 방향에 맞춤
+
+        검증: panda_hand_world = rod_end + (0,0,+TCP_OFFSET), R_panda_hand = R_rod × Rx(π)
+              ⇒ TCP world via body0 = rod_end ✓
+              ⇒ 회전 정합 R_panda_hand × identity = R_rod × Rx(π) ✓
+        """
+        import omni.usd
+        from pxr import UsdPhysics, Gf, Sdf
+        from vectorized_pose_sampler import VectorizedPoseSampler
+
+        stage = omni.usd.get_context().get_stage()
+        base = "/World/envs/env_0"
+        half_width = 0.4                       # rod 길이 0.8m / 2
+        tcp_z = VectorizedPoseSampler.TCP_OFFSET  # 0.1034m
+        # Rx(π) quaternion in wxyz: (cos(π/2), sin(π/2), 0, 0) = (0, 1, 0, 0)
+        rx_pi = Gf.Quatf(0.0, 1.0, 0.0, 0.0)
+        identity = Gf.Quatf(1.0, 0.0, 0.0, 0.0)
+
+        # Joint 1: panda_hand_1 <-> rod 왼쪽 끝
+        j1_path = f"{base}/rod_joint_1"
+        j1 = UsdPhysics.FixedJoint.Define(stage, j1_path)
+        j1.CreateBody0Rel().SetTargets([Sdf.Path(f"{base}/Robot_1/panda_hand")])
+        j1.CreateBody1Rel().SetTargets([Sdf.Path(f"{base}/rod")])
+        j1.CreateLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, tcp_z))   # panda_hand 로컬 TCP
+        j1.CreateLocalRot0Attr().Set(identity)
+        j1.CreateLocalPos1Attr().Set(Gf.Vec3f(-half_width, 0.0, 0.0))
+        j1.CreateLocalRot1Attr().Set(rx_pi)                       # Rx(π) frame match
+        j1.CreateExcludeFromArticulationAttr().Set(True)
+
+        # Joint 2: panda_hand_2 <-> rod 오른쪽 끝
+        j2_path = f"{base}/rod_joint_2"
+        j2 = UsdPhysics.FixedJoint.Define(stage, j2_path)
+        j2.CreateBody0Rel().SetTargets([Sdf.Path(f"{base}/Robot_2/panda_hand")])
+        j2.CreateBody1Rel().SetTargets([Sdf.Path(f"{base}/rod")])
+        j2.CreateLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, tcp_z))
+        j2.CreateLocalRot0Attr().Set(identity)
+        j2.CreateLocalPos1Attr().Set(Gf.Vec3f(+half_width, 0.0, 0.0))
+        j2.CreateLocalRot1Attr().Set(rx_pi)
+        j2.CreateExcludeFromArticulationAttr().Set(True)
+
+        print(f"[Phase 2 TCP] Added fixed joints (TCP offset={tcp_z}m, grasp_roll=π): "
+              f"{j1_path}, {j2_path}")
+
+    def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        """액션을 받아서 저장합니다."""
+        # 8차원 액션을 저장
+        self.actions = actions.clone()
+
+    def _apply_action(self) -> None:
+        # 1. 액션 텐서 가져오기 (self.actions는 _pre_physics_step에서 저장됨)
+        # Shape: [Num_Envs, 14]
+        actions = self.actions.clone()
+        
+        # 2. 로봇별 액션 분리
+        # 앞 7개: Robot 1, 뒤 7개: Robot 2
+        actions_1 = actions[:, :7]
+        actions_2 = actions[:, 7:]
+        # 3. 스케일링 (Normalized -> Physical Value)
+        # vel_limit는 cfg에서 정의됨 (보통 1.5 rad/s 등) 학습 초기에는 안전을 위해 0.5 정도로 스케일링 팩터를 곱해주기도 함
+        scaling_factor = 0.3 #원래 0.3
+        
+        targets_1 = actions_1 * self.vel_limit_1 * scaling_factor
+        targets_2 = actions_2 * self.vel_limit_2 * scaling_factor
+
+        # [NEW] Safety Filter Application (Closed-loop Projection)
+        # This uses simulator's internal Jacobian to strictly enforce relative constraints.
+        
+        #test 시에만 아래 코드 주석 없이 풀 것.
+        #targets_1, targets_2 = self.safety_filter.apply_filter(targets_1, targets_2)
+
+        self.robot_1.set_joint_velocity_target(targets_1, joint_ids=self.robot_1_joint_ids)
+        self.robot_2.set_joint_velocity_target(targets_2, joint_ids=self.robot_2_joint_ids)
+
+    def _get_observations(self) -> dict:
+        """GNN 파이프라인에 필요한 모든 원본 텐서를 수집합니다."""
+        
+        # ---------------------------------------------------------
+        # 1. 데이터 계산
+        # ---------------------------------------------------------
+        ee_state_1 = self.robot_1.data.body_state_w[:, self.ee_body_idx_1, :] 
+        ee_state_2 = self.robot_2.data.body_state_w[:, self.ee_body_idx_2, :] 
+        
+        # 로봇 노드: [Joint Pos(7), Joint Vel(7)]
+        robot_1_data = torch.cat([
+            self.robot_1.data.joint_pos[:, self.robot_1_joint_ids], 
+            self.robot_1.data.joint_vel[:, self.robot_1_joint_ids]
+        ], dim=-1)
+        robot_2_data = torch.cat([
+            self.robot_2.data.joint_pos[:, self.robot_2_joint_ids],
+            self.robot_2.data.joint_vel[:, self.robot_2_joint_ids]
+        ], dim=-1)
+        
+        # Stack Robots [B, 2, 14]
+        robot_state = torch.stack([robot_1_data, robot_2_data], dim=1)
+
+        # 목표 포즈 [B, 2, 7]
+        goal_pose_1 = self.goal_marker_ee1.data.root_state_w[:, :7] 
+        goal_pose_2 = self.goal_marker_ee2.data.root_state_w[:, :7]
+        task_state = torch.stack([goal_pose_1, goal_pose_2], dim=1) 
+        
+        # 현재 EE 포즈 (Edge 계산용) [B, 2, 7]
+        current_ee_poses = torch.stack([ee_state_1[:, :7], ee_state_2[:, :7]], dim=1)
+
+        # 베이스 포즈 (Edge 계산용) [B, 2, 7]
+        base_pose_1 = self.robot_1.data.root_state_w[:, :7]
+        base_pose_2 = self.robot_2.data.root_state_w[:, :7]
+        base_poses = torch.stack([base_pose_1, base_pose_2], dim=1)
+        
+        # 글로벌 (Relative Pose)
+        # 1. ee_1의 역회전(inverse rotation) 계산
+        ee_state_1_inv_quat = math_utils.quat_conjugate(ee_state_1[:, 3:7])
+        # 2. rel_pos 변환
+        pos_diff = ee_state_2[:, :3] - ee_state_1[:, :3]
+        current_rel_pos = math_utils.quat_apply(ee_state_1_inv_quat, pos_diff)
+        # 3. rel_rot 변환
+        current_rel_rot = math_utils.quat_mul(ee_state_1_inv_quat, ee_state_2[:, 3:7])
+        
+        current_rel_pose = torch.cat([current_rel_pos, current_rel_rot], dim=-1)
+        target_rel_poses_batch = self.target_ee_rel_poses 
+
+        normalized_time = self.episode_length_buf / self.max_episode_length
+        normalized_time = normalized_time.unsqueeze(-1) # [B, 1]
+
+        # global_state = torch.cat([
+        #     current_rel_pose,      # [B, 7]
+        #     target_rel_poses_batch # [B, 7]
+        # ], dim=-1) # [B, 14]
+        global_state = torch.cat([
+        current_rel_pose,       # [B, 7] (제약조건 정보 - 유지!)
+        target_rel_poses_batch, # [B, 7] (제약조건 목표 - 유지!)
+        normalized_time         # [B, 1] (시간 정보 - 추가!)
+        ], dim=-1) # 최종 [B, 15]
+        
+        # ---------------------------------------------------------
+        # 2. 딕셔너리 조립 (키 이름 중요!)
+        # ---------------------------------------------------------
+        # graph_converter.py가 이 키 이름들을 찾습니다.
+        raw_state_dict = {
+            "robot_nodes": robot_state,           # [KeyError 원인 해결]
+            "current_ee_poses": current_ee_poses, # Edge 계산용
+            "goal_poses": task_state,             # Task Node용
+            "base_poses": base_poses,             # Edge 계산용
+            "target_rel_pose": self.target_ee_rel_poses, # Global용
+            "target_joint_pos": self.target_joint_pos,   # [추가] Joint Space Target
+            "globals": global_state               # (Legacy, 참고용)
+        }
+
+        return {"policy": raw_state_dict}
+
+    def _calc_rot_error(self, current_quat, target_quat):
+        """
+        Calculate rotation error (angle difference) between two quaternions.
+        Returns angle in radians.
+        """
+        current_inv = math_utils.quat_conjugate(current_quat)
+        q_diff = math_utils.quat_mul(current_inv, target_quat)
+        q_diff_v = q_diff[:, 1:4]
+        q_diff_w = q_diff[:, 0]
+        # Angle = 2 * atan2(norm(v), abs(w))
+        rot_error = 2.0 * torch.atan2(torch.norm(q_diff_v, dim=-1), torch.abs(q_diff_w))
+        return rot_error
+
+    def _get_rewards(self) -> torch.Tensor:
+        # ---------------------------------------------------------
+        # 1. Threshold Definitions
+        # ---------------------------------------------------------
+        curr_pos_thresh = 0.3
+        curr_rot_thresh = 0.3
+        
+        # ---------------------------------------------------------
+        # 2. 데이터 수집 & 오차 계산
+        # ---------------------------------------------------------
+        ee1_pos = self.robot_1.data.body_state_w[:, self.ee_body_idx_1, 0:3]
+        ee2_pos = self.robot_2.data.body_state_w[:, self.ee_body_idx_2, 0:3]
+        ee1_quat = self.robot_1.data.body_state_w[:, self.ee_body_idx_1, 3:7]
+        ee2_quat = self.robot_2.data.body_state_w[:, self.ee_body_idx_2, 3:7]
+        
+        goal1_pos = self.goal_marker_ee1.data.root_state_w[:, 0:3]
+        goal2_pos = self.goal_marker_ee2.data.root_state_w[:, 0:3]
+        
+        # [NEW] Goal Quaternions for Angle Check
+        goal1_quat = self.goal_marker_ee1.data.root_state_w[:, 3:7]
+        goal2_quat = self.goal_marker_ee2.data.root_state_w[:, 3:7]
+
+        target_rel_pos = self.target_ee_rel_poses[:, 0:3]
+        target_rel_rot = self.target_ee_rel_poses[:, 3:7]
+
+        # (A) Constraint Error Calculation
+        ee1_inv_quat = math_utils.quat_conjugate(ee1_quat)
+        curr_rel_pos_local = math_utils.quat_apply(ee1_inv_quat, ee2_pos - ee1_pos)
+        pos_error = torch.norm(curr_rel_pos_local - target_rel_pos, dim=-1)
+
+        curr_rel_rot = math_utils.quat_mul(ee1_inv_quat, ee2_quat)
+        target_rel_rot_inv = math_utils.quat_conjugate(target_rel_rot)
+        q_diff = math_utils.quat_mul(curr_rel_rot, target_rel_rot_inv)
+        q_diff_v = q_diff[:, 1:4]
+        q_diff_w = q_diff[:, 0]
+        rot_error = 2.0 * torch.atan2(torch.norm(q_diff_v, dim=-1), torch.abs(q_diff_w))
+
+        # ---------------------------------------------------------
+        # 3. [NEW] Potential-based Reward (Joint Space)
+        # ---------------------------------------------------------
+        # 현재 관절 각도 (Arm only)
+        q1 = self.robot_1.data.joint_pos[:, self.robot_1_joint_ids]
+        q2 = self.robot_2.data.joint_pos[:, self.robot_2_joint_ids]
+        q_curr = torch.cat([q1, q2], dim=1)
+        
+        # Joint 거리 계산 (L2 Norm)
+        current_joint_dist = torch.norm(q_curr - self.target_joint_pos, dim=-1)
+        
+        # 리셋 직후 처리
+        is_first_step = torch.isinf(self.prev_joint_dist)
+        self.prev_joint_dist = torch.where(is_first_step, current_joint_dist, self.prev_joint_dist)
+
+        # Progress: (이전 거리 - 현재 거리) * Gain
+        # 관절 각도는 값이 작으므로 Gain을 500.0 정도로 높게 잡음
+        progress = (self.prev_joint_dist - current_joint_dist) * 200.0
+        
+        r_potential = progress 
+
+        # 상태 업데이트
+        self.prev_joint_dist = current_joint_dist.clone()
+
+        # EE Distance (Logging용)
+        dist_1 = torch.norm(ee1_pos - goal1_pos, dim=-1)
+        dist_2 = torch.norm(ee2_pos - goal2_pos, dim=-1)
+
+        # ---------------------------------------------------------
+        # 4. [NEW] Time Penalty (Existence Penalty)
+        # ---------------------------------------------------------
+        r_time = -0.1
+
+        # ---------------------------------------------------------
+        # 5. Constraint Reward (기존 로직 유지)
+        # ---------------------------------------------------------
+        pos_violation = torch.clamp(pos_error - curr_pos_thresh, min=0.0)
+        rot_violation = torch.clamp(rot_error - curr_rot_thresh, min=0.0)
+        is_currently_violated = (pos_violation > 1e-4) | (rot_violation > 1e-4)
+        
+        self.extras["log/is_currently_violated"] = is_currently_violated
+        self.violation_occurred = self.violation_occurred | is_currently_violated
+
+        is_violated = (pos_violation > 1e-4) | (rot_violation > 1e-4)
+
+        ct_offset_val = 3.0 
+        r_step = torch.where(is_violated, -ct_offset_val, 0.0)
+
+        w_slope = 2.0
+        r_slope = -1.0 * w_slope * (pos_violation + rot_violation)
+
+        r_constraint = r_step + r_slope
+
+        self.episode_max_pos_error = torch.max(self.episode_max_pos_error, pos_error)
+        self.episode_max_rot_error = torch.max(self.episode_max_rot_error, rot_error)
+
+        # ---------------------------------------------------------
+        # 6. Action Penalty
+        # ---------------------------------------------------------
+        action_norm = torch.norm(self.actions, p=2, dim=-1)
+        w_action = 0.0 #0.05였음
+        r_action = -1.0 * w_action * action_norm
+
+        # ---------------------------------------------------------
+        # 7. Total Reward & Success Bonus
+        # ---------------------------------------------------------
+        # [수정] Joint Space 기반 도달 판정
+        # 모든 관절(14개)의 오차가 임계값(0.05 rad ≈ 2.8도) 이내여야 함
+        joint_error_abs = torch.abs(q_curr - self.target_joint_pos)
+        is_reached = torch.all(joint_error_abs < 0.05, dim=-1)
+        
+        # 최종 성공 판정 (Reached AND Safe)
+        is_truly_success = is_reached & (~self.violation_occurred)
+
+        r_success = torch.where(is_truly_success, 200.0, 0.0) 
+
+        total_reward = r_potential + r_time + r_constraint + r_action + r_success
+
+        # ---------------------------------------------------------
+        # 8. Logging
+        # ---------------------------------------------------------
+        self.extras["log/curr_pos_threshold"] = torch.tensor(curr_pos_thresh, device=self.device)
+        self.extras["log/curr_rot_threshold"] = torch.tensor(curr_rot_thresh, device=self.device)
+        self.extras["log/r_action"] = torch.mean(r_action)
+        self.extras["log/r_potential"] = torch.mean(r_potential) 
+        self.extras["log/r_constraint"] = torch.mean(r_constraint)
+        self.extras["log/r_success"] = torch.mean(r_success)
+        self.extras["log/total_reward"] = torch.mean(total_reward)
+        self.extras["log/err_pos"] = torch.mean(pos_error) 
+        self.extras["log/err_rot"] = torch.mean(rot_error) 
+        
+        # [수정] MEAN 대신 MAX를 사용하여 "단 한 대의 위반도 없는지" 감시함
+        self.extras["log/max_err_pos"] = torch.max(self.episode_max_pos_error)
+        self.extras["log/max_err_rot"] = torch.max(self.episode_max_rot_error)
+        # - Violation Ratio: 현재 스텝에서 위반한 환경의 비율 (0.0 ~ 1.0)
+        self.extras["log/violation_ratio"] = torch.mean(is_violated.float())
+
+        return total_reward
+
+
+    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        # ---------------------------------------------------------
+        # 2. 데이터 수집
+        # ---------------------------------------------------------
+        q1 = self.robot_1.data.joint_pos[:, self.robot_1_joint_ids]
+        q2 = self.robot_2.data.joint_pos[:, self.robot_2_joint_ids]
+        q_curr = torch.cat([q1, q2], dim=1)
+
+        # ---------------------------------------------------------
+        # 3. Done Conditions
+        # ---------------------------------------------------------
+        # [수정] Reward 함수와 동일하게 Joint Space 기반 도달 판정 적용
+        # 모든 관절(14개)의 오차가 임계값(0.05 rad ≈ 2.8도) 이내여야 함
+        joint_error_abs = torch.abs(q_curr - self.target_joint_pos)
+        is_reached = torch.all(joint_error_abs < 0.05, dim=-1)
+        
+        is_success = is_reached & (~self.violation_occurred)
+        
+        time_out = self.episode_length_buf >= self.max_episode_length - 1
+
+        terminated = is_success 
+
+        # 로그
+        self.extras["log/success"] = is_success.float()
+        self.extras["log/is_reached"] = is_reached.float()
+        self.extras["log/violation"] = self.violation_occurred.float()
+        
+        return terminated, time_out
+
+
+    def _reset_idx(self, env_ids: Sequence[int] | None):
+        if env_ids is None:
+            env_ids = self.robot_1._ALL_INDICES
+        
+        super()._reset_idx(env_ids)
+        num_resets = len(env_ids)
+
+        # ---------------------------------------------------------
+        # 1. Sampling Loop (GPU)
+        # ---------------------------------------------------------
+        if self.external_samples is not None:
+            # [Fixed] 외부 주입 샘플 사용 시 해당 env_ids에 맞는 데이터만 슬라이싱
+             samples = {}
+             for k, v in self.external_samples.items():
+                 samples[k] = v[env_ids]
+        else:
+             # 기존 방식: 샘플러로부터 Base, Joint, Goal EE Pose를 모두 받아옵니다.
+             samples = self.pose_sampler.sample_episodes(num_resets)
+        
+        base_pose_1 = samples["base_pose_1"]
+        base_pose_2 = samples["base_pose_2"]
+        q_start_1 = samples["q_start_1"]
+        q_start_2 = samples["q_start_2"]
+        q_goal_1 = samples["q_goal_1"]
+        q_goal_2 = samples["q_goal_2"]
+        goal_ee1_pose = samples["goal_ee1_pose"]
+        goal_ee2_pose = samples["goal_ee2_pose"]
+
+        # Store target joint positions for reward calculation
+        self.target_joint_pos[env_ids] = torch.cat([q_goal_1, q_goal_2], dim=1)
+        self.prev_joint_dist[env_ids] = float('inf')
+
+        # ---------------------------------------------------------
+        # 3. Applying to Sim (Robot)
+        # ---------------------------------------------------------
+        env_origins = self.scene.env_origins[env_ids]
+        zeros_vel = torch.zeros(num_resets, 6, device=self.device)
+        zeros_joint_vel = torch.zeros_like(q_start_1)
+
+        # A. Robot 1 (Base + Joint)
+        # 샘플러 좌표(0,0,0 기준)에 환경 원점(env_origins)을 더해줍니다.
+        r1_world_pose = base_pose_1.clone()
+        r1_world_pose[:, :3] += env_origins
+        
+        self.robot_1.write_root_pose_to_sim(r1_world_pose, env_ids)
+        self.robot_1.write_root_velocity_to_sim(zeros_vel, env_ids)
+        self.robot_1.write_joint_state_to_sim(q_start_1, zeros_joint_vel, self.robot_1_joint_ids, env_ids)
+
+        # B. Robot 2 (Base + Joint)
+        r2_world_pose = base_pose_2.clone()
+        r2_world_pose[:, :3] += env_origins
+        
+        self.robot_2.write_root_pose_to_sim(r2_world_pose, env_ids)
+        self.robot_2.write_root_velocity_to_sim(zeros_vel, env_ids)
+        self.robot_2.write_joint_state_to_sim(q_start_2, zeros_joint_vel, self.robot_2_joint_ids, env_ids)
+        
+        # ---------------------------------------------------------
+        # 4. Applying to Sim (Markers) - 여기가 시각화 핵심
+        # ---------------------------------------------------------
+        # 각 로봇 손이 가야 할 목표 위치에 5cm 박스를 배치합니다.
+        
+        # Goal Marker 1 (EE1 목표 - 빨간 박스 예상)
+        marker_pose_1 = goal_ee1_pose.clone()
+        marker_pose_1[:, :3] += env_origins
+        self.goal_marker_ee1.write_root_pose_to_sim(marker_pose_1, env_ids)
+
+        # Goal Marker 2 (EE2 목표 - 파란 박스 예상)
+        marker_pose_2 = goal_ee2_pose.clone()
+        marker_pose_2[:, :3] += env_origins
+        self.goal_marker_ee2.write_root_pose_to_sim(marker_pose_2, env_ids)
+
+        # 공유 강체 (rod) - sampler가 반환하는 start_obj_pose 위치에 배치
+        # Phase 2: rod는 dynamic body이므로 velocity도 reset (residual motion 제거)
+        # IK 정합 + grasp_roll=0이라 fixed joint 제약은 자동 만족됨
+        if "start_obj_pose" in samples:
+            rod_pose = samples["start_obj_pose"].clone()
+            rod_pose[:, :3] += env_origins
+            self.rod.write_root_pose_to_sim(rod_pose, env_ids)
+            self.rod.write_root_velocity_to_sim(zeros_vel, env_ids)
+
+        # goal_rod_marker는 kinematic 유지 (시각 표시용) — pose만 write
+        if "goal_obj_pose" in samples:
+            goal_rod_pose = samples["goal_obj_pose"].clone()
+            goal_rod_pose[:, :3] += env_origins
+            self.goal_rod_marker.write_root_pose_to_sim(goal_rod_pose, env_ids)
+
+        # ---------------------------------------------------------
+        # 5. Relative Pose Update (Target Calculation)
+        # ---------------------------------------------------------
+        # EE1을 기준으로 EE2가 어디에 있어야 하는지(상대 포즈) 계산하여 버퍼에 저장
+        
+        p1 = goal_ee1_pose[:, 0:3]
+        q1 = goal_ee1_pose[:, 3:7] # [w, x, y, z]
+        p2 = goal_ee2_pose[:, 0:3]
+        q2 = goal_ee2_pose[:, 3:7]
+
+        # Relative Position: q1_inv * (p2 - p1)
+        q1_inv = math_utils.quat_conjugate(q1)
+        p_diff = p2 - p1
+        rel_pos = math_utils.quat_apply(q1_inv, p_diff)
+
+        # Relative Rotation: q1_inv * q2
+        rel_rot = math_utils.quat_mul(q1_inv, q2)
+
+        self.target_ee_rel_poses[env_ids] = torch.cat([rel_pos, rel_rot], dim=-1)
+        self.violation_occurred[env_ids] = False
+        
+        # [NEW] 리셋 시 최대 오차 초기화
+        self.episode_max_pos_error[env_ids] = 0.0
+        self.episode_max_rot_error[env_ids] = 0.0
+
+        # [NEW] 리셋 시 이전 거리도 초기화 (무한대로)
+        self.prev_dist[env_ids] = float('inf')
+
+if __name__ == "__main__":
+
+    # add argparse arguments
+    parser = argparse.ArgumentParser(
+        description="This script demonstrates adding a custom robot to an Isaac Lab environment."
+    )
+    parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to spawn.")
+    # append AppLauncher cli args
+    AppLauncher.add_app_launcher_args(parser)
+    # parse the arguments
+    args_cli = parser.parse_args()
+    # Config 및 환경 생성
+    env_cfg = DualrobotCfg()
+    # args_cli는 위에서 이미 파싱됨
+    env_cfg.scene.num_envs = args_cli.num_envs
+    
+    env = DualrobotEnv(cfg=env_cfg, render_mode="human")
+    env.reset()
+    
+    # 시뮬레이션 루프
+    while simulation_app.is_running():
+        # 랜덤 액션 테스트
+        actions = 2 * torch.rand(env.num_envs, env.cfg.action_space, device=env.device) - 1
+        obs, rew, terminated, truncated, info = env.step(actions)
+        
+        if truncated.any() or terminated.any():
+            print(f"[Info] Reset triggered")
+            
+    env.close()
+    simulation_app.close()
+

@@ -1,0 +1,13 @@
+python -u train_phase3_sac.py \                                                               
+    --num_envs 1 \                                                                              
+    --total_steps 10000000 \                                        
+    --no-auto_alpha --fixed_alpha 0.1 \                                                         
+    --use_her --k_future 1
+    
+    
+python -u train_phase3_sac.py \
+    --num_envs 1024 \
+    --total_steps 10000000 \
+    --no-auto_alpha --fixed_alpha 0.1 \
+    --use_her --k_future 1 \
+    --headless

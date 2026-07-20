@@ -1,0 +1,17 @@
+# 학습 산출물 / 대용량 / 재생성 가능 — 깃 추적 제외
+logs/
+__pycache__/
+*.pyc
+
+# pose cache·체크포인트 (재생성: make_bestfit_cache.py) / 진단 산출물
+*.pt
+
+# 논문 PDF (저작권 + 용량)
+paper/
+
+# 기타 산출물
+*.mp4
+*.bak
+
+# 도구 마커
+.codex
