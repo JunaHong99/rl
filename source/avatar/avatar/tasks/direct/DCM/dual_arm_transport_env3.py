@@ -71,15 +71,18 @@ class DualrobotEnv(DirectRLEnv):
         # 파일 저장. 매 reset은 cache에서 O(1) random pick → PoseSampler 호출 폭주 회피.
         # 파지 변이 시: 버킷별(d,θ) grasp-정합 캐시 (용접/컨트롤러 오프셋과 일치하는 IK).
         _cache_size = int(getattr(self.cfg, "pose_cache_size", 100_000))   # 뷰어 등 빠른 확인 시 축소
+        _same_side = bool(getattr(self.cfg, "grasp_same_side", False))      # 두 파지점 베이스축 같은 편
         if getattr(self.cfg, "vary_grasp", False):
             self.pose_sampler = CachedPoseSampler(
                 device=self.device, cache_size=_cache_size, fixed_grasp_roll=True,
                 bucket_grasp_offs=self._grasp_bucket_grasp_offs(),
                 cache_tag=getattr(self, "_grasp_cache_tag", f"graspvar_{self.cfg.grasp_n_buckets}b"),
+                same_side=_same_side,
             )
         else:
             self.pose_sampler = CachedPoseSampler(
-                device=self.device, cache_size=_cache_size, fixed_grasp_roll=True
+                device=self.device, cache_size=_cache_size, fixed_grasp_roll=True,
+                same_side=_same_side,
             )
         self.external_samples = None # 외부 샘플 저장용 (테스트용)
 

@@ -16,9 +16,11 @@ class CachedPoseSampler:
     def __init__(self, device='cuda:0', cache_size: int = 100_000,
                  cache_path: str | None = None,
                  fixed_grasp_roll: bool = True,
-                 bucket_vals=None, bucket_grasp_offs=None, cache_tag=None):
+                 bucket_vals=None, bucket_grasp_offs=None, cache_tag=None,
+                 same_side: bool = False):
         self.device = device
         self.cache_size = cache_size
+        self.same_side = same_side       # 두 파지점이 베이스축 같은 편(straddle 샘플 배제)
         # 버킷: None=고정(기존). bucket_vals=버킷별 half_len(크기변이). bucket_grasp_offs=버킷별
         #   grasp_off dict(형태/파지 변이). 둘 다 버킷 pool + env 버킷별 draw는 동일, 생성만 다름.
         self.bucket_vals = None if bucket_vals is None else [float(v) for v in bucket_vals]
@@ -38,6 +40,8 @@ class CachedPoseSampler:
             else:
                 cache_path = os.path.join(
                     script_dir, f"pose_cache_{cache_tag or 'chain'}_{cache_size}_{self.n_buckets}.pt")
+        if same_side and cache_path.endswith(".pt"):
+            cache_path = cache_path[:-3] + "_ss.pt"     # same_side 캐시는 별도 파일(비-ss와 충돌 X)
         self.cache_path = cache_path
         self.cache: dict | None = None
 
@@ -83,7 +87,7 @@ class CachedPoseSampler:
             print(f"  Loaded {actual_size:,} samples ✓")
         elif not self._bucketed:
             print(f"[CachedPoseSampler] Generating {self.cache_size:,} samples (one-time)…")
-            raw = self._base.sample_episodes(self.cache_size)
+            raw = self._base.sample_episodes(self.cache_size, same_side=self.same_side)
             # tensor만 cache 저장, scalar는 별도 보관
             self.cache = {k: v for k, v in raw.items() if torch.is_tensor(v)}
             self.scalar_extras = {k: v for k, v in raw.items() if not torch.is_tensor(v)}
@@ -98,9 +102,9 @@ class CachedPoseSampler:
             merged, tags = {}, []
             for b in range(self.n_buckets):
                 if grasp:
-                    raw = self._base.sample_episodes(per, grasp_off=self.bucket_grasp_offs[b])
+                    raw = self._base.sample_episodes(per, grasp_off=self.bucket_grasp_offs[b], same_side=self.same_side)
                 else:
-                    raw = self._base.sample_episodes(per, half_len=self.bucket_vals[b])
+                    raw = self._base.sample_episodes(per, half_len=self.bucket_vals[b], same_side=self.same_side)
                 for k, v in raw.items():
                     if torch.is_tensor(v):
                         merged.setdefault(k, []).append(v)
@@ -257,7 +261,7 @@ class VectorizedPoseSampler:
         z = w1*z2 + x1*y2 - y1*x2 + z1*w2
         return torch.stack([w, x, y, z], dim=1)
 
-    def sample_episodes(self, num_envs, half_len: float = 0.4, grasp_off=None):
+    def sample_episodes(self, num_envs, half_len: float = 0.4, grasp_off=None, same_side: bool = False):
         """
         Generates 'num_envs' valid episodes using vectorized operations.
         Ensures IK feasibility for both Start and Goal poses.
@@ -482,6 +486,19 @@ class VectorizedPoseSampler:
                              (q_diff_1 < Q_DIST_THR) & (q_diff_2 < Q_DIST_THR) & \
                              (margin_s1 > JOINT_MARGIN_THR) & (margin_s2 > JOINT_MARGIN_THR) & \
                              (margin_g1 > JOINT_MARGIN_THR) & (margin_g2 > JOINT_MARGIN_THR)
+
+                # ★ same_side (2026-07-20): 두 파지점이 베이스축(b1-b2 잇는 선)의 *같은 편*에
+                #   오도록. 한 파지점은 왼편·다른 파지점은 오른편(straddle)인 샘플 배제.
+                #   부호: n=베이스축 XY 법선, s_i=n·(gp_i - b1). s1*s2>0 = 같은 편. start·goal 둘 다.
+                if same_side:
+                    def _same_side_mask(gp1, gp2):
+                        u = b2_p[:, :2] - b1_p[:, :2]                       # 베이스축 방향(XY)
+                        n = torch.stack([-u[:, 1], u[:, 0]], dim=1)         # 법선(XY)
+                        s1 = (n * (gp1[:, :2] - b1_p[:, :2])).sum(dim=1)
+                        s2 = (n * (gp2[:, :2] - b1_p[:, :2])).sum(dim=1)
+                        return (s1 * s2) > 0
+                    valid_mask = valid_mask & _same_side_mask(ee1_w_p, ee2_w_p) \
+                                            & _same_side_mask(g_ee1_w_p, g_ee2_w_p)
                              
                 valid_indices = torch.nonzero(valid_mask).flatten()
                 num_found = valid_indices.numel()

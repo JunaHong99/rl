@@ -86,6 +86,8 @@ parser.add_argument("--max_active_obstacles", type=int, default=None,
                          "None이면 cfg 기본(n_obstacles=무제한).")
 parser.add_argument("--vary_grasp", action="store_true",
                     help="파지 변이 학습(S2): per-env grasp 위치 d + 각도 θ(a1·a2>0). replicate_physics=False 강제.")
+parser.add_argument("--same_side", action="store_true",
+                    help="두 파지점이 베이스축 같은 편에 오도록 pose 샘플 필터(straddle 배제). 별도 _ss 캐시.")
 parser.add_argument("--use_hard_safety", action="store_true",
                     help="팔 hard 안전 필터 ON으로 학습 (충돌 0 지향). RoboBallet velocity-zeroing 근사(제동토크).")
 parser.add_argument("--use_swivel_nullspace", action="store_true",
@@ -161,6 +163,9 @@ def main():
     if args.vary_grasp:
         env_cfg.vary_grasp = True
         print("✋ 파지 변이 ON (S2): per-env grasp 위치+각도 (a1·a2>0), replicate_physics=False")
+    if args.same_side:
+        env_cfg.grasp_same_side = True
+        print("↔️ same_side ON: 두 파지점 베이스축 같은 편(straddle 배제), 별도 _ss 캐시")
     if args.use_hard_safety:
         env_cfg.use_hard_safety = True
         print("🛡️  hard safety filter ON (팔 충돌 0 지향)")

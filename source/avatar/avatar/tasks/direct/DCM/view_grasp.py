@@ -20,6 +20,7 @@ parser.add_argument("--load", type=str, default=None, help="gen_grasp.py로 저�
 parser.add_argument("--num_envs", type=int, default=8, help="띄울 env 수(=파지 샘플 수). --load 없을 때만 사용. 기본 8=버킷당 1개.")
 parser.add_argument("--env_spacing", type=float, default=3.0, help="env 간 간격[m] (넓힐수록 안 겹침).")
 parser.add_argument("--cache_size", type=int, default=2000, help="초기포즈 캐시 크기(뷰어는 작게=빠름). 학습은 100k.")
+parser.add_argument("--same_side", action="store_true", help="두 파지점이 베이스축 같은 편에 오도록(straddle 배제).")
 parser.add_argument("--max_steps", type=int, default=0, help="0이면 무한 렌더(수동 종료).")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -43,6 +44,7 @@ cfg.scene.env_spacing = args.env_spacing
 cfg.vary_grasp = True                 # ★ 파지 변이 ON
 cfg.n_obstacles = 0                   # 장애물 없이 파지만
 cfg.pose_cache_size = args.cache_size # 뷰어는 작게 → 캐시 생성 몇 초
+cfg.grasp_same_side = args.same_side   # 두 파지점 베이스축 같은 편(straddle 배제)
 if args.load:
     cfg.grasp_preset_path = args.load  # 랜덤 대신 저장된 (d,θ) 로드
 env = DualrobotEnv(cfg, render_mode=None)
