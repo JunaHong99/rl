@@ -395,9 +395,12 @@ class VectorizedPoseSampler:
                 if count == 0:
                     continue
 
-                # Limit candidates for IK to avoid overkill (needed * multiple for safety)
-                if count > needed * 5:
-                    cand_indices = cand_indices[:needed * 5]
+                # Limit candidates for IK to avoid overkill (needed * multiple for safety).
+                # ★ 바닥(floor) 4000: needed가 작아진 막판에도 후보를 충분히 IK 풀어 꼬리 제거.
+                #   (same_side/파지변이로 수율 낮을 때 마지막 몇백 개가 loop당 0~2씩 긁히던 문제 해결.)
+                cap = max(needed * 5, 4000)
+                if count > cap:
+                    cand_indices = cand_indices[:cap]
                     count = cand_indices.numel()
                     
                 # Filter Candidates
