@@ -70,15 +70,16 @@ class DualrobotEnv(DirectRLEnv):
         # Phase A (2026-05-26): CachedPoseSampler 사용. 학습 시작 시 100k samples 사전 생성 +
         # 파일 저장. 매 reset은 cache에서 O(1) random pick → PoseSampler 호출 폭주 회피.
         # 파지 변이 시: 버킷별(d,θ) grasp-정합 캐시 (용접/컨트롤러 오프셋과 일치하는 IK).
+        _cache_size = int(getattr(self.cfg, "pose_cache_size", 100_000))   # 뷰어 등 빠른 확인 시 축소
         if getattr(self.cfg, "vary_grasp", False):
             self.pose_sampler = CachedPoseSampler(
-                device=self.device, cache_size=100_000, fixed_grasp_roll=True,
+                device=self.device, cache_size=_cache_size, fixed_grasp_roll=True,
                 bucket_grasp_offs=self._grasp_bucket_grasp_offs(),
                 cache_tag=getattr(self, "_grasp_cache_tag", f"graspvar_{self.cfg.grasp_n_buckets}b"),
             )
         else:
             self.pose_sampler = CachedPoseSampler(
-                device=self.device, cache_size=100_000, fixed_grasp_roll=True
+                device=self.device, cache_size=_cache_size, fixed_grasp_roll=True
             )
         self.external_samples = None # 외부 샘플 저장용 (테스트용)
 
