@@ -20,8 +20,8 @@ parser.add_argument("--grasp_preset", type=str, default=None, help="볼 파지 �
 parser.add_argument("--out", type=str, default="grasp_replay.mp4")
 parser.add_argument("--steps_per_env", type=int, default=45, help="파지당 녹화 스텝(에피소드 1~2개 = ~9s sim).")
 parser.add_argument("--fps", type=int, default=10, help="출력 영상 fps(콘텐츠는 5Hz제어라 10이면 약 2x).")
-parser.add_argument("--width", type=int, default=1280)
-parser.add_argument("--height", type=int, default=720)
+parser.add_argument("--res_w", type=int, default=1280, help="녹화 해상도 가로(AppLauncher --width와 충돌 회피).")
+parser.add_argument("--res_h", type=int, default=720, help="녹화 해상도 세로.")
 parser.add_argument("--env_spacing", type=float, default=4.0)
 parser.add_argument("--action_scale_pos", type=float, default=0.02, help="★ 이 모델은 0.02.")
 parser.add_argument("--action_scale_rot", type=float, default=0.05)
@@ -48,7 +48,7 @@ else:
 cfg = DualrobotCfg()
 cfg.scene.num_envs = N
 cfg.scene.env_spacing = args.env_spacing
-cfg.viewer.resolution = (args.width, args.height)
+cfg.viewer.resolution = (args.res_w, args.res_h)
 cfg.vary_grasp = True
 cfg.grasp_same_side = args.same_side
 cfg.pose_cache_size = args.cache_size
@@ -84,7 +84,7 @@ agent.load_state_dict(sd); agent.eval()
 src = os.path.basename(args.grasp_preset) if args.grasp_preset else "학습 8버킷"
 print(f"▶ 녹화: {os.path.basename(args.model_path)}  파지={src}  envs={N}  → {args.out}")
 
-writer = cv2.VideoWriter(args.out, cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (args.width, args.height))
+writer = cv2.VideoWriter(args.out, cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (args.res_w, args.res_h))
 
 
 def look_at(i):
