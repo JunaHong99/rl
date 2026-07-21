@@ -246,6 +246,17 @@ class DualrobotCfg(DirectRLEnvCfg):
     # 두 파지점이 베이스축(두 base 잇는 선)의 *같은 편*에 오도록 샘플 필터(straddle 배제).
     #   True면 pose 캐시 생성 시 한 파지점 왼편·다른 파지점 오른편인 샘플 제거(별도 _ss 캐시).
     grasp_same_side: bool = False
+
+    # === 8. Joint-velocity 액션 (Phase 1 A: 네트워크가 관절 협응 소유, 2026-07-21) ===
+    # object-centric 폐기 → per-joint 속도 출력. τ = joint_kd·(dq_des − dq_cur) + G(q), effort clamp.
+    #   set_joint_velocity_target 대신 기존 set_joint_effort_target 경로 재사용(velocity servo).
+    #   켤 때 action_space=14로 함께 설정할 것. False면 object-centric 무손상.
+    joint_action: bool = False
+    joint_vel_scale: float = 1.5      # action∈[-1,1] → dq_des [rad/s]
+    joint_kd: float = 30.0            # velocity servo gain
+    joint_effort_limit: float = 50.0  # τ clamp [Nm] (actuator effort_limit_sim과 일치)
+    w_internal: float = 0.0           # antagonistic 내력 페널티 가중치(협응 학습). 0=off. Phase1서 >0.
+    f_int_safe: float = 0.0           # 내력 데드존 [N] (이 위만 벌).
     # 저장된 파지 세트 로드(육안 확인/재현용). 경로 지정 시 랜덤 버킷 샘플링 대신 파일의 (d,θ)를
     #   버킷으로 사용(grasp_n_buckets는 파일 길이로 덮어씀). gen_grasp.py로 생성. None이면 랜덤.
     grasp_preset_path: str = None

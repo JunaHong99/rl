@@ -426,6 +426,11 @@ class DualrobotEnv(DirectRLEnv):
             self._settle_remaining = (self._settle_remaining - 1).clamp_min(0)
 
         self.actions = actions.clone()
+        # ── Joint-velocity 액션 (Phase 1 A): object 누적 대신 dq_des 저장 후 조기 반환 ──
+        if getattr(self.cfg, "joint_action", False):
+            # action (B,14) → dq_des [rad/s]. settle 중엔 위에서 actions=0 → dq_des=0(hold).
+            self._dq_des = self.cfg.joint_vel_scale * self.actions[:, :14]
+            return
         pos_disp = self.actions[:, 0:3]
         rot_aa = self.actions[:, 3:6]
         # ── Action-level CBF stop: rod 변위 명령을 장애물 barrier 반평면 밖으로 최소 투영 ──
@@ -555,8 +560,34 @@ class DualrobotEnv(DirectRLEnv):
         self._cbf_stop_rate = (active & (surf < margin)).any(dim=1).float().mean()
         return dp
 
+    def _gravity_comp(self, robot, joint_ids):
+        """G(q) 중력보상 토크 (컨트롤러와 동일 API). τ에 +로 더해 중력 상쇄(grav_sign=+1 검증됨)."""
+        gview = robot.root_physx_view
+        if hasattr(gview, "get_gravity_compensation_forces"):
+            g = gview.get_gravity_compensation_forces()
+        else:
+            g = gview.get_generalized_gravity_forces()
+        return g[:, joint_ids]
+
+    def _apply_joint_velocity(self) -> None:
+        """Phase1 A: dq_des → τ = kd·(dq_des − dq_cur) + G(q), effort clamp → 양 arm 인가."""
+        dq = getattr(self, "_dq_des", None)
+        if dq is None:
+            return
+        kd = float(self.cfg.joint_kd); elim = float(self.cfg.joint_effort_limit)
+        dq1, dq2 = dq[:, :7], dq[:, 7:14]
+        qd1 = self.robot_1.data.joint_vel[:, self.robot_1_joint_ids]
+        qd2 = self.robot_2.data.joint_vel[:, self.robot_2_joint_ids]
+        tau_1 = torch.clamp(kd * (dq1 - qd1) + self._gravity_comp(self.robot_1, self.robot_1_joint_ids), -elim, elim)
+        tau_2 = torch.clamp(kd * (dq2 - qd2) + self._gravity_comp(self.robot_2, self.robot_2_joint_ids), -elim, elim)
+        self.robot_1.set_joint_effort_target(tau_1, joint_ids=self.robot_1_joint_ids)
+        self.robot_2.set_joint_effort_target(tau_2, joint_ids=self.robot_2_joint_ids)
+
     def _apply_action(self) -> None:
         """target_obj_pos/quat를 controller로 joint torque에 매핑해 양 arm에 인가."""
+        if getattr(self.cfg, "joint_action", False):
+            self._apply_joint_velocity()
+            return
         tau_1, tau_2, info = self.controller.compute_torques(
             self.target_obj_pos, self.target_obj_quat, self.target_x_rel,
             K_arm1=getattr(self, "K_arm1", None), K_arm2=getattr(self, "K_arm2", None),
