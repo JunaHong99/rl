@@ -255,8 +255,8 @@ class DualrobotCfg(DirectRLEnvCfg):
     #   켤 때 action_space=14로 함께 설정. False면 object-centric 무손상(액추에이터 stiffness=0 유지).
     joint_action: bool = False
     joint_dq_scale: float = 0.05      # action∈[-1,1] → per-step Δq [rad] (max 0.05rad/step)
-    joint_kp: float = 800.0           # 액추에이터 stiffness [Nm/rad] (포지션 PD, 중력 버팀)
-    joint_kd: float = 150.0           # 액추에이터 damping [Nm·s/rad] (어깨 임계감쇠≈100 → 과감쇠로 진동 억제)
+    joint_kp: float = 400.0           # 액추에이터 stiffness [Nm/rad] (중력 버팀 충분 + 고주파 chatter 완화)
+    joint_kd: float = 150.0           # 액추에이터 damping [Nm·s/rad] (과감쇠로 진동 억제)
     joint_effort_limit: float = 87.0  # 액추에이터 effort clamp [Nm] (Franka 대관절 실제치, 포화 완화)
     w_internal: float = 0.0           # antagonistic 내력 페널티 가중치(협응 학습). 0=off. Phase1서 >0.
     f_int_safe: float = 0.0           # 내력 데드존 [N] (이 위만 벌).

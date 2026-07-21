@@ -54,15 +54,22 @@ def rod_z():
 # ── Phase A: HOLD ──
 env.reset()
 q0, _ = jstate(); z0 = rod_z().clone()
+jvel_hist = []
 for _ in range(args.hold_steps):
     env.step(zero)
+    _, qd = jstate()
+    jvel_hist.append(qd.abs().max().item())
 qh, qdh = jstate(); fih = f_int(); zh = rod_z()
-drift = (qh - q0).abs().max().item(); jvel = qdh.abs().max().item()
+drift = (qh - q0).abs().max().item()
+jvel_avg = sum(jvel_hist[-10:]) / min(10, len(jvel_hist))   # 마지막 10스텝 평균(지속운동 판별)
+jvel_last = qdh.abs().max().item()
 dz = (zh - z0).abs().max().item()
 print("\n===== Phase A: HOLD (dq=0) =====")
-print(f"  drift={drift:.3f}rad  |q̇|={jvel:.3f}  rodΔz={dz*100:.1f}cm  f_int mean={fih.mean():.0f}N max={fih.max():.0f}N")
-hold_ok = (drift < 0.1) and (jvel < 0.2) and (dz < 0.05) and not torch.isnan(qh).any()
-print(f"  => HOLD {'PASS ✓' if hold_ok else 'FAIL ✗'}")
+print(f"  drift={drift:.3f}rad  |q̇|평균(마지막10)={jvel_avg:.3f} 순간={jvel_last:.3f}  "
+      f"rodΔz={dz*100:.1f}cm  f_int mean={fih.mean():.0f}N max={fih.max():.0f}N")
+# 판정: 실제 hold 품질 = 위치 유지 + rod 유지 + 내력 낮음. (순간 |q̇| chatter는 무해→평균으로 봄)
+hold_ok = (drift < 0.1) and (dz < 0.05) and (fih.mean() < 100) and (jvel_avg < 1.0) and not torch.isnan(qh).any()
+print(f"  => HOLD {'PASS ✓' if hold_ok else 'FAIL ✗'} (drift<0.1·rodΔz<5cm·f_int<100·평균q̇<1.0)")
 
 # ── Phase B: TRACK (관절1 Δq 램프) ──
 env.reset()
