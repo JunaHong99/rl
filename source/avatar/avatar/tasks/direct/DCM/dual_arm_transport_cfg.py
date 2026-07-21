@@ -260,6 +260,12 @@ class DualrobotCfg(DirectRLEnvCfg):
     joint_effort_limit: float = 87.0  # 액추에이터 effort clamp [Nm] (Franka 대관절 실제치, 포화 완화)
     w_internal: float = 0.0           # antagonistic 내력 페널티 가중치(협응 학습). 0=off. Phase1서 >0.
     f_int_safe: float = 0.0           # 내력 데드존 [N] (이 위만 벌).
+    # === 9. 리더-팔로워 (Hong2025식 협응 구조적 보장, 2026-07-21) ===
+    # 리더(arm1)=네트워크 7 Δq(포지션제어), 팔로워(arm2)=rod grasp점 추종 IK(포지션제어).
+    #   두 팔 항상 일관 → 내력 낮음, 협응 학습 불필요(freeze 회피). action_space=7로 설정.
+    #   joint_action과 동일하게 포지션 액추에이터(joint_kp/kd) 사용.
+    leader_follower: bool = False
+    lf_ik_iters: int = 12             # 팔로워 IK warm-start 반복(작게=빠름, 스텝간 모션 작아 수렴).
     # 저장된 파지 세트 로드(육안 확인/재현용). 경로 지정 시 랜덤 버킷 샘플링 대신 파일의 (d,θ)를
     #   버킷으로 사용(grasp_n_buckets는 파일 길이로 덮어씀). gen_grasp.py로 생성. None이면 랜덤.
     grasp_preset_path: str = None

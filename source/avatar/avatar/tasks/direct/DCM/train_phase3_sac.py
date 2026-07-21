@@ -93,6 +93,8 @@ parser.add_argument("--joint_action", action="store_true",
                          "+ MLP(관절각 sin/cos·f_int는 global feature). 네트워크가 관절 협응 소유.")
 parser.add_argument("--w_internal", type=float, default=0.002,
                     help="antagonistic 내력 페널티 가중치(협응 학습 신호). f_int[N] 스케일이라 작게(예 0.002).")
+parser.add_argument("--leader_follower", action="store_true",
+                    help="리더-팔로워: 리더(arm1) 7 Δq(학습) + 팔로워(arm2) 추종 IK. 협응 구조적 보장(freeze 회피). action_space=7.")
 parser.add_argument("--use_hard_safety", action="store_true",
                     help="팔 hard 안전 필터 ON으로 학습 (충돌 0 지향). RoboBallet velocity-zeroing 근사(제동토크).")
 parser.add_argument("--use_swivel_nullspace", action="store_true",
@@ -177,6 +179,11 @@ def main():
         env_cfg.w_internal = args.w_internal
         args.use_mlp = True                # MLP-first (그래프는 다음 단계)
         print(f"🦿 joint_action ON (Phase1 A): 14D Δq + 내력 리워드 w={args.w_internal} + MLP(관절각/f_int=global)")
+    if args.leader_follower:
+        env_cfg.leader_follower = True
+        env_cfg.action_space = 7           # 리더 7 관절 Δq (팔로워는 IK)
+        args.use_mlp = True
+        print("🤝 leader_follower ON: 리더(arm1) 7 Δq + 팔로워(arm2) 추종 IK, 협응 구조적 보장 + MLP")
     if args.use_hard_safety:
         env_cfg.use_hard_safety = True
         print("🛡️  hard safety filter ON (팔 충돌 0 지향)")
@@ -208,8 +215,8 @@ def main():
     # pos(3)+rot(3) + per-arm K dim(env.cfg.action_space-6, scale 1.0 = raw tanh ∈ [-1,1])
     n_k_dims = max(0, env.cfg.action_space - 6)
     action_scale_vec = [args.action_scale_pos] * 3 + [args.action_scale_rot] * 3 + [1.0] * n_k_dims
-    if getattr(env.cfg, "joint_action", False):
-        # 관절 Δq 액션: 전 14차원 동일 스케일(dq_scale). global에 관절각(sin/cos 28)+f_int(1) → GLOBAL_DIM 갱신.
+    if getattr(env.cfg, "joint_action", False) or getattr(env.cfg, "leader_follower", False):
+        # 관절 Δq 액션: 전 차원 동일 스케일(dq_scale). global에 관절각(sin/cos 28)+f_int(1) → GLOBAL_DIM 갱신.
         import graph_converter as _gc
         _gc.GLOBAL_FEATURE_DIM = 1 + 28 + 1              # time + sin/cos(14×2) + f_int
         action_scale_vec = [float(env_cfg.joint_dq_scale)] * env.cfg.action_space

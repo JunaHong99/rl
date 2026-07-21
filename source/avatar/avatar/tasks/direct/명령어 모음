@@ -64,3 +64,11 @@ python3 -c "import torch; print(f'인식된 GPU 개수: {torch.cuda.device_count
    gemini resume last
 
 
+CUDA_VISIBLE_DEVICES=0 python -u train_phase3_sac.py \
+    --headless --num_envs 8192 --total_steps 30000000 \
+    --warmup_steps 700000 --buffer_size 3000000 \
+    --batch_size 2048 --updates_per_step 24 \
+    --no-auto_alpha --fixed_alpha 0.1 \
+    --use_her --k_future 1 --her_progress_weight 100 \
+    --no_rod_filter --max_active_obstacles 0 \
+    --joint_action --w_internal 0.002

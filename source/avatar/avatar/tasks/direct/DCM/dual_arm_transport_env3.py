@@ -68,7 +68,7 @@ class DualrobotEnv(DirectRLEnv):
         # Joint 액션(Phase1 A): ImplicitActuator를 포지션 모드로. explicit 토크 PD는 닫힌사슬
         #   용접 반력에 압도당해 붕괴(hold FAIL) → PhysX가 제어+제약 암시적 co-solve = 안정.
         #   stiffness=kp/damping=kd를 액추에이터에 주입(super().__init__ 전 = 씬 빌드에 반영).
-        if getattr(cfg, "joint_action", False):
+        if getattr(cfg, "joint_action", False) or getattr(cfg, "leader_follower", False):
             for _rcfg in (cfg.robot_1, cfg.robot_2):
                 _act = _rcfg.actuators["all_joints"]
                 _act.stiffness = float(cfg.joint_kp)
@@ -99,6 +99,11 @@ class DualrobotEnv(DirectRLEnv):
         if getattr(self.cfg, "joint_action", False):
             self._internal_w = float(getattr(self.cfg, "w_internal", 0.0))
             self._f_safe = float(getattr(self.cfg, "f_int_safe", 0.0))
+        # 리더-팔로워: 팔로워 grasp offset(고정파지) 캐시. off_pos2=(+0.4,0,TCP), off_quat2=Rx(π).
+        if getattr(self.cfg, "leader_follower", False):
+            TCP = VectorizedPoseSampler.TCP_OFFSET; RH = 0.4
+            self._lf_off_pos2 = torch.tensor([RH, 0.0, TCP], device=self.device).expand(self.num_envs, 3).contiguous()
+            self._lf_off_quat2 = torch.tensor([0.0, 1.0, 0.0, 0.0], device=self.device).expand(self.num_envs, 4).contiguous()
 
         # (관절 인덱스 등은 나중에 필요시 여기에 추가)
         self.robot_1_joint_ids = self.robot_1.actuators["all_joints"].joint_indices
@@ -449,6 +454,13 @@ class DualrobotEnv(DirectRLEnv):
                     self.robot_2.data.joint_pos[:, self.robot_2_joint_ids]], dim=1).clone()
             self._q_des = self._q_des + self.cfg.joint_dq_scale * self.actions[:, :14]
             return
+        # ── 리더-팔로워: 리더(arm1) 7 Δq 누적, 팔로워(arm2)는 rod 추종 IK ──
+        if getattr(self.cfg, "leader_follower", False):
+            if getattr(self, "_lf_q1_des", None) is None:
+                self._lf_q1_des = self.robot_1.data.joint_pos[:, self.robot_1_joint_ids].clone()
+            self._lf_q1_des = self._lf_q1_des + self.cfg.joint_dq_scale * self.actions[:, :7]
+            self._lf_q2_des = self._follower_ik()      # 팔로워 추종 (control rate 1회)
+            return
         pos_disp = self.actions[:, 0:3]
         rot_aa = self.actions[:, 3:6]
         # ── Action-level CBF stop: rod 변위 명령을 장애물 barrier 반평면 밖으로 최소 투영 ──
@@ -596,10 +608,31 @@ class DualrobotEnv(DirectRLEnv):
         self.robot_1.set_joint_position_target(q[:, :7], joint_ids=self.robot_1_joint_ids)
         self.robot_2.set_joint_position_target(q[:, 7:14], joint_ids=self.robot_2_joint_ids)
 
+    def _follower_ik(self):
+        """팔로워(arm2) 관절 목표: rod 현재 pose → 팔로워 grasp점 EE 목표 → 팔로워 base frame IK.
+        pose_sampler의 검증된 _get_ee_pose_world + solve_ik_gradient(warm-start) 재사용."""
+        sampler = self.pose_sampler._base
+        ik = sampler.ik_solver
+        rod_p = self.rod.data.root_pos_w                       # world
+        rod_q = self.rod.data.root_quat_w
+        p_ee, R_ee = sampler._get_ee_pose_world(rod_p, rod_q, self._lf_off_pos2, self._lf_off_quat2)
+        b2_p = self.robot_2.data.root_pos_w
+        b2_q = self.robot_2.data.root_quat_w
+        R_b2_T = sampler._quat_to_matrix(b2_q).transpose(1, 2)
+        ee_loc_p = torch.bmm(R_b2_T, (p_ee - b2_p).unsqueeze(2)).squeeze(2)
+        ee_loc_R = torch.bmm(R_b2_T, R_ee)
+        q2_cur = self.robot_2.data.joint_pos[:, self.robot_2_joint_ids]
+        return ik.solve_ik_gradient(ee_loc_p, ee_loc_R, q_init=q2_cur, max_iter=int(self.cfg.lf_ik_iters))
+
     def _apply_action(self) -> None:
         """target_obj_pos/quat를 controller로 joint torque에 매핑해 양 arm에 인가."""
         if getattr(self.cfg, "joint_action", False):
             self._apply_joint_velocity()
+            return
+        if getattr(self.cfg, "leader_follower", False):
+            self.robot_1.set_joint_position_target(self._lf_q1_des, joint_ids=self.robot_1_joint_ids)
+            if getattr(self, "_lf_q2_des", None) is not None:
+                self.robot_2.set_joint_position_target(self._lf_q2_des, joint_ids=self.robot_2_joint_ids)
             return
         tau_1, tau_2, info = self.controller.compute_torques(
             self.target_obj_pos, self.target_obj_quat, self.target_x_rel,
@@ -1137,7 +1170,7 @@ class DualrobotEnv(DirectRLEnv):
         # Joint 액션(Phase1 A): 관절각(sin/cos, 28) + antagonistic 내력 f_int(1)을 global에 실어
         #   MLP/그래프가 관절 proprioception+협응 상태를 관측(joint 제어에 필수).
         global_extra = None
-        if getattr(self.cfg, "joint_action", False):
+        if getattr(self.cfg, "joint_action", False) or getattr(self.cfg, "leader_follower", False):
             q = torch.cat([self.robot_1.data.joint_pos[:, self.robot_1_joint_ids],
                            self.robot_2.data.joint_pos[:, self.robot_2_joint_ids]], dim=1)  # (B,14)
             w1, w2 = self._get_grasp_wrenches()
@@ -1275,6 +1308,13 @@ class DualrobotEnv(DirectRLEnv):
             if getattr(self, "_q_des", None) is None:
                 self._q_des = torch.zeros(self.num_envs, 14, device=self.device)
             self._q_des[env_ids] = torch.cat([q_start_1, q_start_2], dim=1)
+        # 리더-팔로워: 리더/팔로워 setpoint를 q_start로 초기화.
+        if getattr(self.cfg, "leader_follower", False):
+            if getattr(self, "_lf_q1_des", None) is None:
+                self._lf_q1_des = torch.zeros(self.num_envs, 7, device=self.device)
+                self._lf_q2_des = torch.zeros(self.num_envs, 7, device=self.device)
+            self._lf_q1_des[env_ids] = q_start_1
+            self._lf_q2_des[env_ids] = q_start_2
 
         # ---------------------------------------------------------
         # 3. Applying to Sim (Robot)
