@@ -259,6 +259,7 @@ class DualrobotCfg(DirectRLEnvCfg):
     joint_kp: float = 200.0           # joint 위치 stiffness [Nm/rad] (복원력=hold 안정)
     joint_kd: float = 10.0            # joint 속도 damping [Nm·s/rad]
     joint_effort_limit: float = 50.0  # τ clamp [Nm] (actuator effort_limit_sim과 일치)
+    joint_grav_sign: float = 1.0      # 중력보상 부호. PhysX/method별로 ±1 다를 수 있음(스모크로 확정).
     w_internal: float = 0.0           # antagonistic 내력 페널티 가중치(협응 학습). 0=off. Phase1서 >0.
     f_int_safe: float = 0.0           # 내력 데드존 [N] (이 위만 벌).
     # 저장된 파지 세트 로드(육안 확인/재현용). 경로 지정 시 랜덤 버킷 샘플링 대신 파일의 (d,θ)를

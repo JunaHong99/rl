@@ -571,7 +571,7 @@ class DualrobotEnv(DirectRLEnv):
             g = gview.get_gravity_compensation_forces()
         else:
             g = gview.get_generalized_gravity_forces()
-        return g[:, joint_ids]
+        return float(getattr(self.cfg, "joint_grav_sign", 1.0)) * g[:, joint_ids]
 
     def _apply_joint_velocity(self) -> None:
         """Phase1 A: 위치 setpoint PD. τ = kp·(q_des − q) + kd·(−q̇) + G(q), effort clamp → 양 arm.

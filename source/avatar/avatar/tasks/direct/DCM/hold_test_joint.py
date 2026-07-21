@@ -1,15 +1,12 @@
-"""Phase1 A 제어 substrate 스모크 (Isaac 필요) — joint-velocity servo 안정성 검증(RL 없이).
+"""Phase1 A 제어 substrate 스모크 — joint 위치-PD servo 안정성 + 중력보상 부호 확정(RL 없이).
 
-joint_action=True로 env를 띄우고:
-  Phase A (hold): dq_des=0 → 팔이 중력 버티고 정지 유지하나 (중력보상 sign/servo 안정).
-  Phase B (track): 작은 dq_des 명령 → servo가 추종하고 시스템이 *발산 안 하나*(bounded).
-                   (양팔 독립 dq는 용접이 저항해 내력↑ = 예상 — 여기선 '터지지 않음'이 핵심.)
-목적: 그래프/RL 대공사 전에 관절속도 제어가 닫힌사슬에서 안정한지 값싸게 확인.
+HOLD 실패의 원인은 대개 중력보상 G. q_des=q_start면 위치오차=0 → τ=G뿐이라, HOLD가 곧
+'G가 중력을 상쇄하나' 테스트. 그래서 **grav_sign ±1 둘 다 자동 비교** → 무너지지 않는 쪽 확정.
 
 사용:
   export LD_LIBRARY_PATH=/home/hjh/anaconda3/envs/env-isaaclab/lib:$LD_LIBRARY_PATH
   python -u hold_test_joint.py --num_envs 64 --headless
-합격: hold 시 관절 drift<0.1rad·|q̇|<0.1·rod z 유지, track 시 |q̇|<10(발산X)·NaN 없음.
+합격: 한 부호에서 HOLD drift<0.1·rod z 유지 → 그 부호로 joint_grav_sign 확정. TRACK 발산X.
 """
 import argparse, math
 from isaaclab.app import AppLauncher
@@ -18,7 +15,6 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--num_envs", type=int, default=64)
 parser.add_argument("--hold_steps", type=int, default=40)
 parser.add_argument("--track_steps", type=int, default=40)
-parser.add_argument("--dq_test", type=float, default=0.15, help="track 단계 명령 dq [rad/s] (관절1 both arm).")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 app = AppLauncher(args); sim_app = app.app
@@ -29,67 +25,82 @@ from dual_arm_transport_env3 import DualrobotEnv, DualrobotCfg
 dev = "cuda" if torch.cuda.is_available() else "cpu"
 cfg = DualrobotCfg()
 cfg.scene.num_envs = args.num_envs
-cfg.joint_action = True              # ★ joint-velocity 액션
-cfg.action_space = 14                # 팔당 7
+cfg.joint_action = True
+cfg.action_space = 14
 cfg.n_obstacles = 0
 env = DualrobotEnv(cfg, render_mode=None)
 B = args.num_envs
 J1, J2 = env.robot_1_joint_ids, env.robot_2_joint_ids
+zero = torch.zeros(B, 14, device=dev)
 
 
 def jstate():
-    q1 = env.robot_1.data.joint_pos[:, J1]; q2 = env.robot_2.data.joint_pos[:, J2]
-    qd1 = env.robot_1.data.joint_vel[:, J1]; qd2 = env.robot_2.data.joint_vel[:, J2]
-    return torch.cat([q1, q2], 1), torch.cat([qd1, qd2], 1)
+    q = torch.cat([env.robot_1.data.joint_pos[:, J1], env.robot_2.data.joint_pos[:, J2]], 1)
+    qd = torch.cat([env.robot_1.data.joint_vel[:, J1], env.robot_2.data.joint_vel[:, J2]], 1)
+    return q, qd
 
 
 def f_int():
     w1, w2 = env._get_grasp_wrenches()
-    return (0.5 * (w1[:, :3] - w2[:, :3])).norm(dim=-1)   # (B,) N
+    return (0.5 * (w1[:, :3] - w2[:, :3])).norm(dim=-1)
 
 
 def rod_z():
     return env.rod.data.root_pos_w[:, 2]
 
 
+def grav_mag():
+    g1 = env._gravity_comp(env.robot_1, J1); g2 = env._gravity_comp(env.robot_2, J2)
+    return torch.cat([g1, g2], 1).abs().mean().item()
+
+
+def run_hold(sign):
+    cfg.joint_grav_sign = float(sign)
+    env.reset()
+    q0, _ = jstate(); z0 = rod_z().clone()
+    gm = grav_mag()
+    for _ in range(args.hold_steps):
+        env.step(zero)
+    qh, qdh = jstate(); fih = f_int(); zh = rod_z()
+    return {
+        "drift": (qh - q0).abs().max().item(), "jvel": qdh.abs().max().item(),
+        "dz": (zh - z0).abs().max().item(), "fint": fih.mean().item(),
+        "gmag": gm, "nan": bool(torch.isnan(qh).any()),
+    }
+
+
+print("\n===== 중력보상 부호 자동 비교 (HOLD) =====")
+res = {}
+for s in (+1.0, -1.0):
+    r = run_hold(s); res[s] = r
+    ok = (r["drift"] < 0.1) and (r["dz"] < 0.05) and not r["nan"]
+    print(f"  grav_sign={s:+.0f}: |G|평균={r['gmag']:.1f}Nm  drift={r['drift']:.3f}rad  "
+          f"rodΔz={r['dz']*100:.1f}cm  |q̇|={r['jvel']:.2f}  f_int={r['fint']:.0f}N  "
+          f"=> {'HOLD ✓' if ok else 'FAIL ✗'}")
+
+best = min(res, key=lambda s: res[s]["drift"])
+best_ok = (res[best]["drift"] < 0.1) and (res[best]["dz"] < 0.05)
+print(f"\n  → 더 나은 부호: grav_sign={best:+.0f}  ({'안정 ✓' if best_ok else '둘 다 불안정 — kp/clamp/method 재검토 ✗'})")
+
+# ── TRACK: 좋은 부호로 관절1 Δq 램프 ──
+cfg.joint_grav_sign = float(best)
 env.reset()
-q0, _ = jstate(); z0 = rod_z().clone()
-
-# ── Phase A: hold (dq=0) ──
-zero = torch.zeros(B, 14, device=dev)
-for _ in range(args.hold_steps):
-    env.step(zero)
-qh, qdh = jstate(); fih = f_int(); zh = rod_z()
-drift = (qh - q0).abs().max().item()
-jvel = qdh.abs().max().item()
-dz = (zh - z0).abs().max().item()
-print("\n===== Phase A: HOLD (dq_des=0) =====")
-print(f"  관절 drift max={drift:.3f} rad   |q̇| max={jvel:.3f} rad/s")
-print(f"  rod z 변화 max={dz*100:.1f} cm   f_int mean={fih.mean():.1f}N max={fih.max():.1f}N")
-hold_ok = (drift < 0.1) and (jvel < 0.1) and (dz < 0.05) and not torch.isnan(qh).any()
-print(f"  => HOLD {'PASS ✓' if hold_ok else 'FAIL ✗'} (drift<0.1, q̇<0.1, dz<5cm)")
-
-# ── Phase B: track (관절1 both arm에 +Δq 방향 명령 → setpoint 램프) ──
 q_before, _ = jstate()
-act = torch.zeros(B, 14, device=dev)
-act[:, 0] = 1.0     # q_des += joint_dq_scale·1.0 per step (양 arm 관절1)
-act[:, 7] = 1.0
-fi_max = 0.0; jv_max = 0.0; nan = False
+act = torch.zeros(B, 14, device=dev); act[:, 0] = 1.0; act[:, 7] = 1.0
+jv_max = 0.0; fi_max = 0.0; nan = False
 for _ in range(args.track_steps):
     env.step(act)
     _, qd = jstate()
-    jv_max = max(jv_max, qd.abs().max().item())
-    fi_max = max(fi_max, f_int().max().item())
+    jv_max = max(jv_max, qd.abs().max().item()); fi_max = max(fi_max, f_int().max().item())
     if torch.isnan(qd).any():
         nan = True; break
 q_after, _ = jstate()
-moved_j1 = (q_after[:, 0] - q_before[:, 0]).mean().item()
-exp_move = cfg.joint_dq_scale * args.track_steps       # 이상적 setpoint 이동량
-print("\n===== Phase B: TRACK (관절1 Δq 램프, 스텝당 %.3frad) =====" % cfg.joint_dq_scale)
-print(f"  관절1 실제 이동={moved_j1:.2f}rad (setpoint 목표 ~{exp_move:.2f})")
-print(f"  |q̇| max={jv_max:.2f} rad/s   f_int max={fi_max:.1f}N   NaN={nan}")
-track_ok = (jv_max < 10.0) and (not nan) and (abs(moved_j1) > 0.1)
-print(f"  => TRACK {'PASS ✓' if track_ok else 'FAIL ✗'} (움직임 있음+발산X: |q̇|<10, NaN 없음)")
+moved = (q_after[:, 0] - q_before[:, 0]).mean().item()
+print(f"\n===== TRACK (grav_sign={best:+.0f}, 관절1 Δq 램프 {cfg.joint_dq_scale}/step) =====")
+print(f"  관절1 이동={moved:.2f}rad (목표~{cfg.joint_dq_scale*args.track_steps:.2f})  "
+      f"|q̇|max={jv_max:.2f}  f_int max={fi_max:.0f}N  NaN={nan}")
+track_ok = (jv_max < 10.0) and (not nan) and (abs(moved) > 0.1)
+print(f"  => TRACK {'PASS ✓' if track_ok else 'FAIL ✗'}")
 
-print(f"\n판정: 제어 substrate {'안정 — 조각2(RL) 진행 가능 ✓' if (hold_ok and track_ok) else '불안정 — kd/scale/중력sign 조정 필요 ✗'}")
+print(f"\n판정: {'grav_sign=%+.0f로 substrate 안정 → cfg 반영 후 조각2(RL) ✓' % best if (best_ok and track_ok) else '추가 조정 필요 (아래 출력 공유) ✗'}")
 env.close(); sim_app.close()
