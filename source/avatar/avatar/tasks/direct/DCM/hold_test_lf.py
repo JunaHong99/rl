@@ -84,6 +84,6 @@ move_ok = (rod_moved > 0.02) and (fi_move_mean < 300) and (not nan)
 print(f"  => MOVE {'PASS ✓' if move_ok else 'FAIL ✗'} (rod 이동>2cm + mean f_int<300N + NaN없음)")
 
 print(f"\n판정: 리더-팔로워 {'추종 정상 → RL 배선 진행 ✓' if (hold_ok and move_ok) else 'IK iters/Δq/게인 조정 필요 (출력 공유) ✗'}")
-if fi_move >= 500:
-    print("  (f_int 높으면 → 팔로워 추종 lag: lf_ik_iters↑ 또는 joint_dq_scale↓)")
+if fi_move_mean >= 300:
+    print("  (mean f_int 높으면 → 팔로워 추종: lf_ik_iters↑ 또는 joint_dq_scale↓)")
 env.close(); sim_app.close()
