@@ -256,7 +256,8 @@ class DualrobotCfg(DirectRLEnvCfg):
     joint_action: bool = False
     joint_dq_scale: float = 0.05      # action∈[-1,1] → per-step Δq [rad] (max 0.05rad/step)
     joint_kp: float = 800.0           # 액추에이터 stiffness [Nm/rad] (포지션 PD, 중력 버팀)
-    joint_kd: float = 80.0            # 액추에이터 damping [Nm·s/rad]
+    joint_kd: float = 150.0           # 액추에이터 damping [Nm·s/rad] (어깨 임계감쇠≈100 → 과감쇠로 진동 억제)
+    joint_effort_limit: float = 87.0  # 액추에이터 effort clamp [Nm] (Franka 대관절 실제치, 포화 완화)
     w_internal: float = 0.0           # antagonistic 내력 페널티 가중치(협응 학습). 0=off. Phase1서 >0.
     f_int_safe: float = 0.0           # 내력 데드존 [N] (이 위만 벌).
     # 저장된 파지 세트 로드(육안 확인/재현용). 경로 지정 시 랜덤 버킷 샘플링 대신 파일의 (d,θ)를

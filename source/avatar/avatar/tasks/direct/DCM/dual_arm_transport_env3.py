@@ -73,6 +73,7 @@ class DualrobotEnv(DirectRLEnv):
                 _act = _rcfg.actuators["all_joints"]
                 _act.stiffness = float(cfg.joint_kp)
                 _act.damping = float(cfg.joint_kd)
+                _act.effort_limit_sim = float(getattr(cfg, "joint_effort_limit", 87.0))
         super().__init__(cfg, render_mode, **kwargs)
 
         # Phase A (2026-05-26): CachedPoseSampler 사용. 학습 시작 시 100k samples 사전 생성 +
