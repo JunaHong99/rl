@@ -99,11 +99,9 @@ class DualrobotEnv(DirectRLEnv):
         if getattr(self.cfg, "joint_action", False):
             self._internal_w = float(getattr(self.cfg, "w_internal", 0.0))
             self._f_safe = float(getattr(self.cfg, "f_int_safe", 0.0))
-        # 리더-팔로워: 팔로워 grasp offset(고정파지) 캐시. off_pos2=(+0.4,0,TCP), off_quat2=Rx(π).
+        # 리더-팔로워(feedforward): 두 grasp가 rod 양끝(±0.4)에 고정 → 팔로워 EE = 리더 EE + 0.8m·(리더 EE x축).
         if getattr(self.cfg, "leader_follower", False):
-            TCP = VectorizedPoseSampler.TCP_OFFSET; RH = 0.4
-            self._lf_off_pos2 = torch.tensor([RH, 0.0, TCP], device=self.device).expand(self.num_envs, 3).contiguous()
-            self._lf_off_quat2 = torch.tensor([0.0, 1.0, 0.0, 0.0], device=self.device).expand(self.num_envs, 4).contiguous()
+            self._lf_sep = 2.0 * 0.4    # rod 길이 = 두 grasp 간 거리 [m]
 
         # (관절 인덱스 등은 나중에 필요시 여기에 추가)
         self.robot_1_joint_ids = self.robot_1.actuators["all_joints"].joint_indices
@@ -609,18 +607,25 @@ class DualrobotEnv(DirectRLEnv):
         self.robot_2.set_joint_position_target(q[:, 7:14], joint_ids=self.robot_2_joint_ids)
 
     def _follower_ik(self):
-        """팔로워(arm2) 관절 목표: rod 현재 pose → 팔로워 grasp점 EE 목표 → 팔로워 base frame IK.
-        pose_sampler의 검증된 _get_ee_pose_world + solve_ik_gradient(warm-start) 재사용."""
+        """팔로워(arm2) 관절 목표 (★feedforward = Hong2025식): 실제 rod가 아니라 **리더 *명령* config의
+        FK**로 팔로워 EE 목표를 예측 → 되먹임 고리 제거(feedback은 발산). 두 grasp는 rod에 고정이라
+        팔로워 EE = 리더 EE + (rod길이 0.8m)·(리더 EE x축), 자세 동일. → 팔로워 base frame IK."""
         sampler = self.pose_sampler._base
         ik = sampler.ik_solver
-        rod_p = self.rod.data.root_pos_w                       # world
-        rod_q = self.rod.data.root_quat_w
-        p_ee, R_ee = sampler._get_ee_pose_world(rod_p, rod_q, self._lf_off_pos2, self._lf_off_quat2)
-        b2_p = self.robot_2.data.root_pos_w
-        b2_q = self.robot_2.data.root_quat_w
+        # 1. 리더 EE (리더 base frame) = FK(리더 명령 q1_des) → world
+        fk_p, fk_R = ik.forward_kinematics(self._lf_q1_des)
+        b1_p = self.robot_1.data.root_pos_w; b1_q = self.robot_1.data.root_quat_w
+        R_b1 = sampler._quat_to_matrix(b1_q)
+        lead_p = torch.bmm(R_b1, fk_p.unsqueeze(2)).squeeze(2) + b1_p          # world
+        lead_R = torch.bmm(R_b1, fk_R)
+        # 2. 팔로워 EE = 리더 EE + 0.8·(리더 EE x축), 자세 동일 (두 grasp가 rod 양끝 고정)
+        fol_p = lead_p + self._lf_sep * lead_R[:, :, 0]
+        fol_R = lead_R
+        # 3. 팔로워 base frame → IK (warm-start = 현재 q2)
+        b2_p = self.robot_2.data.root_pos_w; b2_q = self.robot_2.data.root_quat_w
         R_b2_T = sampler._quat_to_matrix(b2_q).transpose(1, 2)
-        ee_loc_p = torch.bmm(R_b2_T, (p_ee - b2_p).unsqueeze(2)).squeeze(2)
-        ee_loc_R = torch.bmm(R_b2_T, R_ee)
+        ee_loc_p = torch.bmm(R_b2_T, (fol_p - b2_p).unsqueeze(2)).squeeze(2)
+        ee_loc_R = torch.bmm(R_b2_T, fol_R)
         q2_cur = self.robot_2.data.joint_pos[:, self.robot_2_joint_ids]
         return ik.solve_ik_gradient(ee_loc_p, ee_loc_R, q_init=q2_cur, max_iter=int(self.cfg.lf_ik_iters))
 
