@@ -426,10 +426,14 @@ class DualrobotEnv(DirectRLEnv):
             self._settle_remaining = (self._settle_remaining - 1).clamp_min(0)
 
         self.actions = actions.clone()
-        # ── Joint-velocity 액션 (Phase 1 A): object 누적 대신 dq_des 저장 후 조기 반환 ──
+        # ── Joint 액션 (Phase 1 A): action=Δq → 위치 setpoint 누적 후 조기 반환 ──
         if getattr(self.cfg, "joint_action", False):
-            # action (B,14) → dq_des [rad/s]. settle 중엔 위에서 actions=0 → dq_des=0(hold).
-            self._dq_des = self.cfg.joint_vel_scale * self.actions[:, :14]
+            # settle 중엔 위에서 actions=0 → q_des 동결(=q_start hold). 이후 Δq 누적.
+            if getattr(self, "_q_des", None) is None:
+                self._q_des = torch.cat([
+                    self.robot_1.data.joint_pos[:, self.robot_1_joint_ids],
+                    self.robot_2.data.joint_pos[:, self.robot_2_joint_ids]], dim=1).clone()
+            self._q_des = self._q_des + self.cfg.joint_dq_scale * self.actions[:, :14]
             return
         pos_disp = self.actions[:, 0:3]
         rot_aa = self.actions[:, 3:6]
@@ -570,16 +574,19 @@ class DualrobotEnv(DirectRLEnv):
         return g[:, joint_ids]
 
     def _apply_joint_velocity(self) -> None:
-        """Phase1 A: dq_des → τ = kd·(dq_des − dq_cur) + G(q), effort clamp → 양 arm 인가."""
-        dq = getattr(self, "_dq_des", None)
-        if dq is None:
+        """Phase1 A: 위치 setpoint PD. τ = kp·(q_des − q) + kd·(−q̇) + G(q), effort clamp → 양 arm.
+        kp 복원력이 hold/닫힌사슬 안정화(순수 velocity servo는 위치복원 없어 붕괴 → 이 방식으로 교체)."""
+        qd_ = getattr(self, "_q_des", None)
+        if qd_ is None:
             return
-        kd = float(self.cfg.joint_kd); elim = float(self.cfg.joint_effort_limit)
-        dq1, dq2 = dq[:, :7], dq[:, 7:14]
-        qd1 = self.robot_1.data.joint_vel[:, self.robot_1_joint_ids]
-        qd2 = self.robot_2.data.joint_vel[:, self.robot_2_joint_ids]
-        tau_1 = torch.clamp(kd * (dq1 - qd1) + self._gravity_comp(self.robot_1, self.robot_1_joint_ids), -elim, elim)
-        tau_2 = torch.clamp(kd * (dq2 - qd2) + self._gravity_comp(self.robot_2, self.robot_2_joint_ids), -elim, elim)
+        kp = float(self.cfg.joint_kp); kd = float(self.cfg.joint_kd); elim = float(self.cfg.joint_effort_limit)
+        qd1_des, qd2_des = qd_[:, :7], qd_[:, 7:14]
+        q1 = self.robot_1.data.joint_pos[:, self.robot_1_joint_ids]
+        q2 = self.robot_2.data.joint_pos[:, self.robot_2_joint_ids]
+        v1 = self.robot_1.data.joint_vel[:, self.robot_1_joint_ids]
+        v2 = self.robot_2.data.joint_vel[:, self.robot_2_joint_ids]
+        tau_1 = torch.clamp(kp * (qd1_des - q1) - kd * v1 + self._gravity_comp(self.robot_1, self.robot_1_joint_ids), -elim, elim)
+        tau_2 = torch.clamp(kp * (qd2_des - q2) - kd * v2 + self._gravity_comp(self.robot_2, self.robot_2_joint_ids), -elim, elim)
         self.robot_1.set_joint_effort_target(tau_1, joint_ids=self.robot_1_joint_ids)
         self.robot_2.set_joint_effort_target(tau_2, joint_ids=self.robot_2_joint_ids)
 
@@ -1245,6 +1252,12 @@ class DualrobotEnv(DirectRLEnv):
         # Store target joint positions for reward calculation
         self.target_joint_pos[env_ids] = torch.cat([q_goal_1, q_goal_2], dim=1)
         self.prev_joint_dist[env_ids] = float('inf')
+
+        # Joint 액션(Phase1 A): 위치 setpoint를 reset 시작 자세(q_start)로 초기화 → settle 중 hold.
+        if getattr(self.cfg, "joint_action", False):
+            if getattr(self, "_q_des", None) is None:
+                self._q_des = torch.zeros(self.num_envs, 14, device=self.device)
+            self._q_des[env_ids] = torch.cat([q_start_1, q_start_2], dim=1)
 
         # ---------------------------------------------------------
         # 3. Applying to Sim (Robot)

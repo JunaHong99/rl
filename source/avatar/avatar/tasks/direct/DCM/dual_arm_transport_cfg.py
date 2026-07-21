@@ -247,13 +247,17 @@ class DualrobotCfg(DirectRLEnvCfg):
     #   True면 pose 캐시 생성 시 한 파지점 왼편·다른 파지점 오른편인 샘플 제거(별도 _ss 캐시).
     grasp_same_side: bool = False
 
-    # === 8. Joint-velocity 액션 (Phase 1 A: 네트워크가 관절 협응 소유, 2026-07-21) ===
-    # object-centric 폐기 → per-joint 속도 출력. τ = joint_kd·(dq_des − dq_cur) + G(q), effort clamp.
-    #   set_joint_velocity_target 대신 기존 set_joint_effort_target 경로 재사용(velocity servo).
-    #   켤 때 action_space=14로 함께 설정할 것. False면 object-centric 무손상.
+    # === 8. Joint 액션 (Phase 1 A: 네트워크가 관절 협응 소유, 2026-07-21) ===
+    # object-centric 폐기 → per-joint 출력. ★ 순수 velocity servo는 위치 stiffness가 없어 닫힌사슬
+    #   에서 표류·붕괴(hold_test_joint FAIL) → **위치 setpoint + joint PD**(컨트롤러의 관절공간판):
+    #     action = per-step Δq → q_des += joint_dq_scale·action (settle 중 동결=q_start hold)
+    #     τ = joint_kp·(q_des − q) + joint_kd·(−q̇) + G(q),  effort clamp.
+    #   kp 복원력이 hold/협응 안정화. 기존 set_joint_effort_target·중력보상 그대로 재사용.
+    #   켤 때 action_space=14로 함께 설정. False면 object-centric 무손상.
     joint_action: bool = False
-    joint_vel_scale: float = 1.5      # action∈[-1,1] → dq_des [rad/s]
-    joint_kd: float = 30.0            # velocity servo gain
+    joint_dq_scale: float = 0.05      # action∈[-1,1] → per-step Δq [rad] (max 0.05rad/step)
+    joint_kp: float = 200.0           # joint 위치 stiffness [Nm/rad] (복원력=hold 안정)
+    joint_kd: float = 10.0            # joint 속도 damping [Nm·s/rad]
     joint_effort_limit: float = 50.0  # τ clamp [Nm] (actuator effort_limit_sim과 일치)
     w_internal: float = 0.0           # antagonistic 내력 페널티 가중치(협응 학습). 0=off. Phase1서 >0.
     f_int_safe: float = 0.0           # 내력 데드존 [N] (이 위만 벌).

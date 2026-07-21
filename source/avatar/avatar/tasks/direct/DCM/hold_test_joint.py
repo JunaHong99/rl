@@ -69,10 +69,11 @@ print(f"  rod z 변화 max={dz*100:.1f} cm   f_int mean={fih.mean():.1f}N max={f
 hold_ok = (drift < 0.1) and (jvel < 0.1) and (dz < 0.05) and not torch.isnan(qh).any()
 print(f"  => HOLD {'PASS ✓' if hold_ok else 'FAIL ✗'} (drift<0.1, q̇<0.1, dz<5cm)")
 
-# ── Phase B: track (관절1 both arm에 +dq_test) ──
+# ── Phase B: track (관절1 both arm에 +Δq 방향 명령 → setpoint 램프) ──
+q_before, _ = jstate()
 act = torch.zeros(B, 14, device=dev)
-act[:, 0] = args.dq_test / cfg.joint_vel_scale     # dq_des = scale*action = dq_test
-act[:, 7] = args.dq_test / cfg.joint_vel_scale
+act[:, 0] = 1.0     # q_des += joint_dq_scale·1.0 per step (양 arm 관절1)
+act[:, 7] = 1.0
 fi_max = 0.0; jv_max = 0.0; nan = False
 for _ in range(args.track_steps):
     env.step(act)
@@ -81,14 +82,14 @@ for _ in range(args.track_steps):
     fi_max = max(fi_max, f_int().max().item())
     if torch.isnan(qd).any():
         nan = True; break
-# 관절1 실제 속도 vs 명령
-_, qd = jstate()
-track_j1 = qd[:, 0].mean().item()
-print("\n===== Phase B: TRACK (관절1 dq_des=%.2f) =====" % args.dq_test)
-print(f"  관절1 실제 q̇ mean={track_j1:.3f} (명령 {args.dq_test:.3f})")
+q_after, _ = jstate()
+moved_j1 = (q_after[:, 0] - q_before[:, 0]).mean().item()
+exp_move = cfg.joint_dq_scale * args.track_steps       # 이상적 setpoint 이동량
+print("\n===== Phase B: TRACK (관절1 Δq 램프, 스텝당 %.3frad) =====" % cfg.joint_dq_scale)
+print(f"  관절1 실제 이동={moved_j1:.2f}rad (setpoint 목표 ~{exp_move:.2f})")
 print(f"  |q̇| max={jv_max:.2f} rad/s   f_int max={fi_max:.1f}N   NaN={nan}")
-track_ok = (jv_max < 10.0) and (not nan)
-print(f"  => TRACK {'PASS ✓' if track_ok else 'FAIL ✗'} (발산X: |q̇|<10, NaN 없음)")
+track_ok = (jv_max < 10.0) and (not nan) and (abs(moved_j1) > 0.1)
+print(f"  => TRACK {'PASS ✓' if track_ok else 'FAIL ✗'} (움직임 있음+발산X: |q̇|<10, NaN 없음)")
 
 print(f"\n판정: 제어 substrate {'안정 — 조각2(RL) 진행 가능 ✓' if (hold_ok and track_ok) else '불안정 — kd/scale/중력sign 조정 필요 ✗'}")
 env.close(); sim_app.close()
