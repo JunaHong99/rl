@@ -248,18 +248,15 @@ class DualrobotCfg(DirectRLEnvCfg):
     grasp_same_side: bool = False
 
     # === 8. Joint 액션 (Phase 1 A: 네트워크가 관절 협응 소유, 2026-07-21) ===
-    # object-centric 폐기 → per-joint 출력. ★ 순수 velocity servo는 위치 stiffness가 없어 닫힌사슬
-    #   에서 표류·붕괴(hold_test_joint FAIL) → **위치 setpoint + joint PD**(컨트롤러의 관절공간판):
-    #     action = per-step Δq → q_des += joint_dq_scale·action (settle 중 동결=q_start hold)
-    #     τ = joint_kp·(q_des − q) + joint_kd·(−q̇) + G(q),  effort clamp.
-    #   kp 복원력이 hold/협응 안정화. 기존 set_joint_effort_target·중력보상 그대로 재사용.
-    #   켤 때 action_space=14로 함께 설정. False면 object-centric 무손상.
+    # object-centric 폐기 → per-joint 출력. action = per-step Δq → q_des += joint_dq_scale·action
+    #   (settle 중 동결=q_start hold). ★ explicit 토크 PD는 닫힌사슬 용접 반력에 압도당해 붕괴 →
+    #   **ImplicitActuator 포지션 모드**(stiffness=joint_kp/damping=joint_kd) + set_joint_position_target.
+    #   PhysX가 PD+용접제약을 암시적 co-solve = 안정, 중력은 stiff PD가 흡수(별도 중력보상 불필요).
+    #   켤 때 action_space=14로 함께 설정. False면 object-centric 무손상(액추에이터 stiffness=0 유지).
     joint_action: bool = False
     joint_dq_scale: float = 0.05      # action∈[-1,1] → per-step Δq [rad] (max 0.05rad/step)
-    joint_kp: float = 200.0           # joint 위치 stiffness [Nm/rad] (복원력=hold 안정)
-    joint_kd: float = 10.0            # joint 속도 damping [Nm·s/rad]
-    joint_effort_limit: float = 50.0  # τ clamp [Nm] (actuator effort_limit_sim과 일치)
-    joint_grav_sign: float = 1.0      # 중력보상 부호. PhysX/method별로 ±1 다를 수 있음(스모크로 확정).
+    joint_kp: float = 800.0           # 액추에이터 stiffness [Nm/rad] (포지션 PD, 중력 버팀)
+    joint_kd: float = 80.0            # 액추에이터 damping [Nm·s/rad]
     w_internal: float = 0.0           # antagonistic 내력 페널티 가중치(협응 학습). 0=off. Phase1서 >0.
     f_int_safe: float = 0.0           # 내력 데드존 [N] (이 위만 벌).
     # 저장된 파지 세트 로드(육안 확인/재현용). 경로 지정 시 랜덤 버킷 샘플링 대신 파일의 (d,θ)를

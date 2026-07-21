@@ -65,6 +65,14 @@ class DualrobotEnv(DirectRLEnv):
         #   (per-env rod_joint LocalPos1/Rot1 override가 물리에 반영되려면 replicate_physics=False.)
         if getattr(cfg, "vary_grasp", False):
             cfg.scene.replicate_physics = False
+        # Joint 액션(Phase1 A): ImplicitActuator를 포지션 모드로. explicit 토크 PD는 닫힌사슬
+        #   용접 반력에 압도당해 붕괴(hold FAIL) → PhysX가 제어+제약 암시적 co-solve = 안정.
+        #   stiffness=kp/damping=kd를 액추에이터에 주입(super().__init__ 전 = 씬 빌드에 반영).
+        if getattr(cfg, "joint_action", False):
+            for _rcfg in (cfg.robot_1, cfg.robot_2):
+                _act = _rcfg.actuators["all_joints"]
+                _act.stiffness = float(cfg.joint_kp)
+                _act.damping = float(cfg.joint_kd)
         super().__init__(cfg, render_mode, **kwargs)
 
         # Phase A (2026-05-26): CachedPoseSampler 사용. 학습 시작 시 100k samples 사전 생성 +
@@ -574,21 +582,13 @@ class DualrobotEnv(DirectRLEnv):
         return float(getattr(self.cfg, "joint_grav_sign", 1.0)) * g[:, joint_ids]
 
     def _apply_joint_velocity(self) -> None:
-        """Phase1 A: 위치 setpoint PD. τ = kp·(q_des − q) + kd·(−q̇) + G(q), effort clamp → 양 arm.
-        kp 복원력이 hold/닫힌사슬 안정화(순수 velocity servo는 위치복원 없어 붕괴 → 이 방식으로 교체)."""
-        qd_ = getattr(self, "_q_des", None)
-        if qd_ is None:
+        """Phase1 A: q_des를 ImplicitActuator 포지션 타깃으로. PhysX가 PD(kp/kd)+용접제약을
+        암시적 co-solve → 닫힌사슬 안정(explicit 토크는 용접 반력에 붕괴). 중력은 stiff PD가 흡수."""
+        q = getattr(self, "_q_des", None)
+        if q is None:
             return
-        kp = float(self.cfg.joint_kp); kd = float(self.cfg.joint_kd); elim = float(self.cfg.joint_effort_limit)
-        qd1_des, qd2_des = qd_[:, :7], qd_[:, 7:14]
-        q1 = self.robot_1.data.joint_pos[:, self.robot_1_joint_ids]
-        q2 = self.robot_2.data.joint_pos[:, self.robot_2_joint_ids]
-        v1 = self.robot_1.data.joint_vel[:, self.robot_1_joint_ids]
-        v2 = self.robot_2.data.joint_vel[:, self.robot_2_joint_ids]
-        tau_1 = torch.clamp(kp * (qd1_des - q1) - kd * v1 + self._gravity_comp(self.robot_1, self.robot_1_joint_ids), -elim, elim)
-        tau_2 = torch.clamp(kp * (qd2_des - q2) - kd * v2 + self._gravity_comp(self.robot_2, self.robot_2_joint_ids), -elim, elim)
-        self.robot_1.set_joint_effort_target(tau_1, joint_ids=self.robot_1_joint_ids)
-        self.robot_2.set_joint_effort_target(tau_2, joint_ids=self.robot_2_joint_ids)
+        self.robot_1.set_joint_position_target(q[:, :7], joint_ids=self.robot_1_joint_ids)
+        self.robot_2.set_joint_position_target(q[:, 7:14], joint_ids=self.robot_2_joint_ids)
 
     def _apply_action(self) -> None:
         """target_obj_pos/quat를 controller로 joint torque에 매핑해 양 arm에 인가."""
