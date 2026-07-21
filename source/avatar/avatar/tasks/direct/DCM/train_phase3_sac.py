@@ -88,6 +88,11 @@ parser.add_argument("--vary_grasp", action="store_true",
                     help="파지 변이 학습(S2): per-env grasp 위치 d + 각도 θ(a1·a2>0). replicate_physics=False 강제.")
 parser.add_argument("--same_side", action="store_true",
                     help="두 파지점이 베이스축 같은 편에 오도록 pose 샘플 필터(straddle 배제). 별도 _ss 캐시.")
+parser.add_argument("--joint_action", action="store_true",
+                    help="Phase1 A: object-centric 폐기, per-joint Δq(14) 액션 + antagonistic 내력 리워드 "
+                         "+ MLP(관절각 sin/cos·f_int는 global feature). 네트워크가 관절 협응 소유.")
+parser.add_argument("--w_internal", type=float, default=0.002,
+                    help="antagonistic 내력 페널티 가중치(협응 학습 신호). f_int[N] 스케일이라 작게(예 0.002).")
 parser.add_argument("--use_hard_safety", action="store_true",
                     help="팔 hard 안전 필터 ON으로 학습 (충돌 0 지향). RoboBallet velocity-zeroing 근사(제동토크).")
 parser.add_argument("--use_swivel_nullspace", action="store_true",
@@ -166,6 +171,12 @@ def main():
     if args.same_side:
         env_cfg.grasp_same_side = True
         print("↔️ same_side ON: 두 파지점 베이스축 같은 편(straddle 배제), 별도 _ss 캐시")
+    if args.joint_action:
+        env_cfg.joint_action = True
+        env_cfg.action_space = 14          # 팔당 7 관절 Δq
+        env_cfg.w_internal = args.w_internal
+        args.use_mlp = True                # MLP-first (그래프는 다음 단계)
+        print(f"🦿 joint_action ON (Phase1 A): 14D Δq + 내력 리워드 w={args.w_internal} + MLP(관절각/f_int=global)")
     if args.use_hard_safety:
         env_cfg.use_hard_safety = True
         print("🛡️  hard safety filter ON (팔 충돌 0 지향)")
@@ -197,6 +208,12 @@ def main():
     # pos(3)+rot(3) + per-arm K dim(env.cfg.action_space-6, scale 1.0 = raw tanh ∈ [-1,1])
     n_k_dims = max(0, env.cfg.action_space - 6)
     action_scale_vec = [args.action_scale_pos] * 3 + [args.action_scale_rot] * 3 + [1.0] * n_k_dims
+    if getattr(env.cfg, "joint_action", False):
+        # 관절 Δq 액션: 전 14차원 동일 스케일(dq_scale). global에 관절각(sin/cos 28)+f_int(1) → GLOBAL_DIM 갱신.
+        import graph_converter as _gc
+        _gc.GLOBAL_FEATURE_DIM = 1 + 28 + 1              # time + sin/cos(14×2) + f_int
+        action_scale_vec = [float(env_cfg.joint_dq_scale)] * env.cfg.action_space
+        print(f"🦿 joint MLP: state=rod+global(dim {_gc.GLOBAL_FEATURE_DIM}), action_scale={env_cfg.joint_dq_scale}×{env.cfg.action_space}")
     if args.use_mlp:
         agent = mlp_policy.MLPSACAgent(
             action_dim=env.cfg.action_space,

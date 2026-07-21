@@ -237,6 +237,7 @@ def convert_batch_state_to_graph(
     goal_pos: torch.Tensor,
     goal_quat: torch.Tensor,
     normalized_time: torch.Tensor,
+    global_extra: torch.Tensor | None = None,
 ) -> Batch:
     """
     Raw observation dict + control state → PyG Batch (LEAN 3-node).
@@ -301,8 +302,11 @@ def convert_batch_state_to_graph(
     onehot.scatter_(2, etype_local.view(1, E, 1).expand(B, E, 1), 1.0)
     edge_attr = torch.cat([onehot, geom], dim=-1).reshape(B * E, EDGE_FEATURE_DIM)
 
-    # ── Global features (normalized_time only) ──
+    # ── Global features (normalized_time + 선택적 global_extra) ──
+    # joint 액션(Phase1 A)이면 관절각(sin/cos)+내력 f_int를 global_extra로 붙임(MLP가 global에서 읽음).
     u = normalized_time.reshape(B, 1)                          # (B, 1)
+    if global_extra is not None:
+        u = torch.cat([u, global_extra], dim=-1)              # (B, 1 + extra)
 
     # ── Assemble Batch ──
     x = x_per_env.reshape(B * nodes_per_env, NODE_FEATURE_DIM)

@@ -95,6 +95,11 @@ class DualrobotEnv(DirectRLEnv):
             )
         self.external_samples = None # 외부 샘플 저장용 (테스트용)
 
+        # Joint 액션(Phase1 A): antagonistic 내력 페널티 활성화(협응 학습 신호). r_internal 블록이 사용.
+        if getattr(self.cfg, "joint_action", False):
+            self._internal_w = float(getattr(self.cfg, "w_internal", 0.0))
+            self._f_safe = float(getattr(self.cfg, "f_int_safe", 0.0))
+
         # (관절 인덱스 등은 나중에 필요시 여기에 추가)
         self.robot_1_joint_ids = self.robot_1.actuators["all_joints"].joint_indices
         self.robot_2_joint_ids = self.robot_2.actuators["all_joints"].joint_indices
@@ -1129,12 +1134,23 @@ class DualrobotEnv(DirectRLEnv):
         goal_pos = self.goal_rod_marker.data.root_pos_w - env_origins  # (B, 3) env-local
         goal_quat = self.goal_rod_marker.data.root_quat_w              # (B, 4)
 
+        # Joint 액션(Phase1 A): 관절각(sin/cos, 28) + antagonistic 내력 f_int(1)을 global에 실어
+        #   MLP/그래프가 관절 proprioception+협응 상태를 관측(joint 제어에 필수).
+        global_extra = None
+        if getattr(self.cfg, "joint_action", False):
+            q = torch.cat([self.robot_1.data.joint_pos[:, self.robot_1_joint_ids],
+                           self.robot_2.data.joint_pos[:, self.robot_2_joint_ids]], dim=1)  # (B,14)
+            w1, w2 = self._get_grasp_wrenches()
+            f_int = (0.5 * (w1[:, :3] - w2[:, :3])).norm(dim=-1, keepdim=True)               # (B,1) N
+            global_extra = torch.cat([torch.sin(q), torch.cos(q), 0.01 * f_int], dim=-1)     # (B,29)
+
         return gc.convert_batch_state_to_graph(
             raw_state=raw_state,
             num_envs=self.num_envs,
             goal_pos=goal_pos,
             goal_quat=goal_quat,
             normalized_time=normalized_time,
+            global_extra=global_extra,
         )
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
