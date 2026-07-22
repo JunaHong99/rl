@@ -1180,7 +1180,18 @@ class DualrobotEnv(DirectRLEnv):
                            self.robot_2.data.joint_pos[:, self.robot_2_joint_ids]], dim=1)  # (B,14)
             w1, w2 = self._get_grasp_wrenches()
             f_int = (0.5 * (w1[:, :3] - w2[:, :3])).norm(dim=-1, keepdim=True)               # (B,1) N
-            global_extra = torch.cat([torch.sin(q), torch.cos(q), 0.01 * f_int], dim=-1)     # (B,29)
+            # ★ goal-rod 오차를 리더 base frame으로 (액션=리더 base 관절과 좌표계 정렬 → 사상 학습 쉬움).
+            #   월드 goal오차만 주면 정책이 월드→base 변환을 스스로 배워야 해 학습 어려움(정체 원인).
+            R_b1_inv = math_utils.quat_conjugate(self.robot_1.data.root_quat_w)              # (B,4)
+            goal_w = self.goal_rod_marker.data.root_pos_w
+            rod_w = self.rod.data.root_pos_w
+            perr_base = math_utils.quat_apply(R_b1_inv, goal_w - rod_w)                       # (B,3) base frame 위치오차
+            rerr_base = math_utils.quat_apply(R_b1_inv, math_utils.quat_apply(
+                math_utils.quat_mul(self.goal_rod_marker.data.root_quat_w,
+                                    math_utils.quat_conjugate(self.rod.data.root_quat_w)),
+                torch.tensor([1.0, 0.0, 0.0], device=self.device).expand(self.num_envs, 3)))  # (B,3) base frame 자세오차축
+            global_extra = torch.cat([torch.sin(q), torch.cos(q), 0.01 * f_int,
+                                      perr_base, rerr_base], dim=-1)                           # (B,35)
 
         return gc.convert_batch_state_to_graph(
             raw_state=raw_state,
