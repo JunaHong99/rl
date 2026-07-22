@@ -218,7 +218,10 @@ def main():
     if getattr(env.cfg, "joint_action", False) or getattr(env.cfg, "leader_follower", False):
         # 관절 Δq 액션: 전 차원 동일 스케일(dq_scale). global에 관절각(sin/cos 28)+f_int(1) → GLOBAL_DIM 갱신.
         import graph_converter as _gc
-        _gc.GLOBAL_FEATURE_DIM = 1 + 28 + 1 + 6          # time + sin/cos(14×2) + f_int + base-frame goal오차(pos3+rot3)
+        if getattr(env.cfg, "leader_follower", False):
+            _gc.GLOBAL_FEATURE_DIM = 1 + 14 + 1 + 3 + 6   # time + 리더 sin/cos(7×2) + f_int + base pos오차(3) + rot6d(6)
+        else:
+            _gc.GLOBAL_FEATURE_DIM = 1 + 28 + 1           # time + sin/cos(14×2) + f_int
         action_scale_vec = [float(env_cfg.joint_dq_scale)] * env.cfg.action_space
         print(f"🦿 joint MLP: state=rod+global(dim {_gc.GLOBAL_FEATURE_DIM}), action_scale={env_cfg.joint_dq_scale}×{env.cfg.action_space}")
     if args.use_mlp:

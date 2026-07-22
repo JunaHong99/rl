@@ -34,8 +34,11 @@ if args.leader_follower:
     cfg.leader_follower = True; cfg.action_space = 7
 if args.joint_action:
     cfg.joint_action = True; cfg.action_space = 14
-# train과 동일: global에 관절각(28)+f_int(1)+base-frame goal오차(6)
-gc.GLOBAL_FEATURE_DIM = 1 + 28 + 1 + 6
+# train과 동일: leader_follower=time+리더sin/cos(14)+f_int+base pos(3)+rot6d(6)=25, joint=time+28+1=30
+if args.leader_follower:
+    gc.GLOBAL_FEATURE_DIM = 1 + 14 + 1 + 3 + 6
+else:
+    gc.GLOBAL_FEATURE_DIM = 1 + 28 + 1
 env = DualrobotEnv(cfg, render_mode=None)
 A = env.cfg.action_space
 B = args.num_envs

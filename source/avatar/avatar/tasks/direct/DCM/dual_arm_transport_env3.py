@@ -1175,23 +1175,30 @@ class DualrobotEnv(DirectRLEnv):
         # Joint 액션(Phase1 A): 관절각(sin/cos, 28) + antagonistic 내력 f_int(1)을 global에 실어
         #   MLP/그래프가 관절 proprioception+협응 상태를 관측(joint 제어에 필수).
         global_extra = None
-        if getattr(self.cfg, "joint_action", False) or getattr(self.cfg, "leader_follower", False):
-            q = torch.cat([self.robot_1.data.joint_pos[:, self.robot_1_joint_ids],
-                           self.robot_2.data.joint_pos[:, self.robot_2_joint_ids]], dim=1)  # (B,14)
+        if getattr(self.cfg, "leader_follower", False):
+            # ── 리더-팔로워 관측 (전부 리더 base frame = 액션과 좌표계 정렬) ──
+            # (2) 리더 관절각만(팔로워는 IK로 결정 → 무관). (1) rod 노드 월드오차 제거(아래 goal=rod).
+            ql = self.robot_1.data.joint_pos[:, self.robot_1_joint_ids]                       # (B,7) 리더만
             w1, w2 = self._get_grasp_wrenches()
-            f_int = (0.5 * (w1[:, :3] - w2[:, :3])).norm(dim=-1, keepdim=True)               # (B,1) N
-            # ★ goal-rod 오차를 리더 base frame으로 (액션=리더 base 관절과 좌표계 정렬 → 사상 학습 쉬움).
-            #   월드 goal오차만 주면 정책이 월드→base 변환을 스스로 배워야 해 학습 어려움(정체 원인).
-            R_b1_inv = math_utils.quat_conjugate(self.robot_1.data.root_quat_w)              # (B,4)
-            goal_w = self.goal_rod_marker.data.root_pos_w
-            rod_w = self.rod.data.root_pos_w
-            perr_base = math_utils.quat_apply(R_b1_inv, goal_w - rod_w)                       # (B,3) base frame 위치오차
-            rerr_base = math_utils.quat_apply(R_b1_inv, math_utils.quat_apply(
-                math_utils.quat_mul(self.goal_rod_marker.data.root_quat_w,
-                                    math_utils.quat_conjugate(self.rod.data.root_quat_w)),
-                torch.tensor([1.0, 0.0, 0.0], device=self.device).expand(self.num_envs, 3)))  # (B,3) base frame 자세오차축
-            global_extra = torch.cat([torch.sin(q), torch.cos(q), 0.01 * f_int,
-                                      perr_base, rerr_base], dim=-1)                           # (B,35)
+            f_int = (0.5 * (w1[:, :3] - w2[:, :3])).norm(dim=-1, keepdim=True)                # (B,1) N
+            R_b1_inv = math_utils.quat_conjugate(self.robot_1.data.root_quat_w)               # (B,4)
+            goal_w = self.goal_rod_marker.data.root_pos_w; rod_w = self.rod.data.root_pos_w
+            perr_base = math_utils.quat_apply(R_b1_inv, goal_w - rod_w)                        # (B,3) base frame 위치오차
+            # (3) 자세오차 정밀화: base frame으로 rotate한 오차 회전의 6D(특이점 없음, Zhou et al).
+            q_err = math_utils.quat_mul(self.goal_rod_marker.data.root_quat_w,
+                                        math_utils.quat_conjugate(self.rod.data.root_quat_w)) # (B,4) 월드 오차회전
+            q_err_base = math_utils.quat_mul(R_b1_inv, q_err)                                 # base frame으로
+            rerr_6d = gc._quat_to_6d(q_err_base)                                              # (B,6)
+            global_extra = torch.cat([torch.sin(ql), torch.cos(ql), 0.01 * f_int,
+                                      perr_base, rerr_6d], dim=-1)                             # (B, 14+1+3+6=24)
+            # (1) rod 노드 월드 오차 제거: goal=rod로 넘겨 rod 노드 raw=0(identity). task 신호는 전부 base global.
+            goal_pos = raw_state['rod_pos']; goal_quat = raw_state['rod_quat']
+        elif getattr(self.cfg, "joint_action", False):
+            q = torch.cat([self.robot_1.data.joint_pos[:, self.robot_1_joint_ids],
+                           self.robot_2.data.joint_pos[:, self.robot_2_joint_ids]], dim=1)    # (B,14)
+            w1, w2 = self._get_grasp_wrenches()
+            f_int = (0.5 * (w1[:, :3] - w2[:, :3])).norm(dim=-1, keepdim=True)
+            global_extra = torch.cat([torch.sin(q), torch.cos(q), 0.01 * f_int], dim=-1)      # (B,29)
 
         return gc.convert_batch_state_to_graph(
             raw_state=raw_state,
