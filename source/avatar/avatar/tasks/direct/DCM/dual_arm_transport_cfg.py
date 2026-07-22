@@ -254,7 +254,8 @@ class DualrobotCfg(DirectRLEnvCfg):
     #   PhysX가 PD+용접제약을 암시적 co-solve = 안정, 중력은 stiff PD가 흡수(별도 중력보상 불필요).
     #   켤 때 action_space=14로 함께 설정. False면 object-centric 무손상(액추에이터 stiffness=0 유지).
     joint_action: bool = False
-    joint_dq_scale: float = 0.03      # action∈[-1,1] → per-step Δq [rad] (닫힌사슬 과도내력 완화 위해 0.05→0.03)
+    joint_dq_scale: float = 0.15      # action∈[-1,1] → per-step Δq [rad]. ★0.03은 rod를 거의 못 움직여
+                                      #   freeze 붕괴(리더관절이 목표까지 rod 못 옮김) → 0.15로 상향(30step×0.15=4.5rad 가동).
     joint_kp: float = 400.0           # 액추에이터 stiffness [Nm/rad] (중력 버팀 충분 + 고주파 chatter 완화)
     joint_kd: float = 150.0           # 액추에이터 damping [Nm·s/rad] (과감쇠로 진동 억제)
     joint_effort_limit: float = 87.0  # 액추에이터 effort clamp [Nm] (Franka 대관절 실제치, 포화 완화)
