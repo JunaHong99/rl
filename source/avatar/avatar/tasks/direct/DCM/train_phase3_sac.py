@@ -95,6 +95,8 @@ parser.add_argument("--w_internal", type=float, default=0.002,
                     help="antagonistic 내력 페널티 가중치(협응 학습 신호). f_int[N] 스케일이라 작게(예 0.002).")
 parser.add_argument("--leader_follower", action="store_true",
                     help="리더-팔로워: 리더(arm1) 7 Δq(학습) + 팔로워(arm2) 추종 IK. 협응 구조적 보장(freeze 회피). action_space=7.")
+parser.add_argument("--lf_dense_progress", action="store_true",
+                    help="dense progress 보상(Cartesian rod 접근량). sparse+HER가 리더관절 액션엔 약해 학습 굶는 것 보강.")
 parser.add_argument("--use_hard_safety", action="store_true",
                     help="팔 hard 안전 필터 ON으로 학습 (충돌 0 지향). RoboBallet velocity-zeroing 근사(제동토크).")
 parser.add_argument("--use_swivel_nullspace", action="store_true",
@@ -184,6 +186,9 @@ def main():
         env_cfg.action_space = 7           # 리더 7 관절 Δq (팔로워는 IK)
         args.use_mlp = True
         print("🤝 leader_follower ON: 리더(arm1) 7 Δq + 팔로워(arm2) 추종 IK, 협응 구조적 보장 + MLP")
+    if args.lf_dense_progress:
+        env_cfg.lf_dense_progress = True
+        print(f"📈 dense progress ON: r_progress = {env_cfg.lf_dense_w}·(rod 목표 접근량) — sparse 보강")
     if args.use_hard_safety:
         env_cfg.use_hard_safety = True
         print("🛡️  hard safety filter ON (팔 충돌 0 지향)")

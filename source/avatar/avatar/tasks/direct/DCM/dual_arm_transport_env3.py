@@ -927,9 +927,14 @@ class DualrobotEnv(DirectRLEnv):
         # is_first는 success threshold gate(첫 step bug 패치)에 여전히 사용.
         current_dist = pos_err + 0.1 * rot_err
         is_first = torch.isinf(self.prev_dist)
-        self.prev_dist = current_dist  # update only — used by is_first detection only
         r_progress = torch.zeros_like(pos_err)
         r_joint_pbr = torch.zeros_like(r_progress)
+        # 리더-팔로워 dense progress: rod가 목표에 가까워진 만큼 보상(Cartesian). sparse+HER가 리더관절
+        #   액션엔 약해(relabel trivial) 학습 굶음 → dense로 신호 강화. 첫 step(prev=inf)은 0.
+        if getattr(self.cfg, "lf_dense_progress", False):
+            step_prog = torch.where(is_first, torch.zeros_like(pos_err), self.prev_dist - current_dist)
+            r_progress = float(self.cfg.lf_dense_w) * step_prog
+        self.prev_dist = current_dist  # update
 
         # ── Tracking diagnostic: controller가 target_obj_pos를 얼마나 잘 추종하는지 ──
         # 큰 값 → controller 미추종 (RL 학습에 noise) / 작은 값 → 신뢰 가능
