@@ -45,6 +45,7 @@ import graph_converter as gc
 # ──────────────────────────────────────────────────────────────────────
 @dataclass
 class SACConfig:
+    use_kin_graph: bool = False           # True면 buffer가 kinematic 그래프(17노드) 차원 사용
     buffer_size: int = 1_000_000          # 1M (5-node 모델 작아져 메모리 여유)
     batch_size: int = 512                 # 256 → 512 (gradient 안정)
     gamma: float = 0.99
@@ -84,15 +85,16 @@ class ReplayBuffer:
         ≈ 1.7KB / transition (float32 기준)
       1M buffer도 GPU에서 현실적인 범위다.
     """
-    def __init__(self, capacity: int, num_envs: int, action_dim: int, device: torch.device):
+    def __init__(self, capacity: int, num_envs: int, action_dim: int, device: torch.device, graph_mod=None):
         self.capacity = capacity
         self.num_envs = num_envs
         self.action_dim = action_dim
         self.device = device
+        self._gm = graph_mod if graph_mod is not None else gc   # lean(gc) 또는 kin(gk) 차원 소스
 
-        N, F_node = gc.NODES_PER_ENV, gc.NODE_FEATURE_DIM
-        E, F_edge = gc.N_EDGES_PER_ENV, gc.EDGE_FEATURE_DIM
-        F_global = gc.GLOBAL_FEATURE_DIM
+        N, F_node = self._gm.NODES_PER_ENV, self._gm.NODE_FEATURE_DIM
+        E, F_edge = self._gm.N_EDGES_PER_ENV, self._gm.EDGE_FEATURE_DIM
+        F_global = self._gm.GLOBAL_FEATURE_DIM
 
         # State
         self.x = torch.zeros(capacity, N, F_node, device=device)
@@ -108,8 +110,8 @@ class ReplayBuffer:
         self.dones = torch.zeros(capacity, device=device)
 
         # Static edge indices (env-local)
-        self._src = torch.tensor(gc._EDGE_SRC, device=device, dtype=torch.long)
-        self._dst = torch.tensor(gc._EDGE_DST, device=device, dtype=torch.long)
+        self._src = torch.tensor(self._gm._EDGE_SRC, device=device, dtype=torch.long)
+        self._dst = torch.tensor(self._gm._EDGE_DST, device=device, dtype=torch.long)
 
         self.ptr = 0
         self.size = 0
@@ -117,7 +119,7 @@ class ReplayBuffer:
     def add_batch(self, batch_state: Batch, action, reward, next_batch_state: Batch, done, valid_mask=None):
         """매 env.step마다 num_envs개 transition 추가.
         valid_mask: (B,) bool. 주어지면 True인 env만 저장 (settle transition 제외용)."""
-        N, E = gc.NODES_PER_ENV, gc.N_EDGES_PER_ENV
+        N, E = self._gm.NODES_PER_ENV, self._gm.N_EDGES_PER_ENV
         B = self.num_envs
 
         # Unflatten current state
@@ -156,7 +158,7 @@ class ReplayBuffer:
     def sample(self, batch_size: int):
         """Sample minibatch and assemble PyG Batches for state, next_state."""
         idxs = torch.randint(0, self.size, (batch_size,), device=self.device)
-        N, E = gc.NODES_PER_ENV, gc.N_EDGES_PER_ENV
+        N, E = self._gm.NODES_PER_ENV, self._gm.N_EDGES_PER_ENV
         M = batch_size
 
         # Current batch
@@ -213,12 +215,16 @@ class SACTrainer:
             self.log_alpha = torch.tensor(math.log(cfg.fixed_alpha), device=device)
             self.alpha_opt = None
 
-        # Replay buffer
+        # Replay buffer (kin이면 gk 차원)
+        _gm = None
+        if getattr(cfg, "use_kin_graph", False):
+            import graph_converter_kin as _gm
         self.buffer = ReplayBuffer(
             capacity=cfg.buffer_size,
             num_envs=None,  # set when first added
             action_dim=6,
             device=device,
+            graph_mod=_gm,
         )
 
     @property

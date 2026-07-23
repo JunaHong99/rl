@@ -281,9 +281,14 @@ def main():
         fixed_alpha=args.fixed_alpha,
         warmup_steps=args.warmup_steps,
         updates_per_step=args.updates_per_step,
+        use_kin_graph=getattr(env.cfg, "use_kin_graph", False),
     )
     trainer = sac_trainer.SACTrainer(agent, sac_cfg, device)
     trainer.buffer.num_envs = args.num_envs  # set lazily
+    # action_dim 재설정 (buffer 기본 6 → 실제 action_space). actions 텐서 재할당.
+    if env.cfg.action_space != trainer.buffer.action_dim:
+        trainer.buffer.action_dim = env.cfg.action_space
+        trainer.buffer.actions = torch.zeros(args.buffer_size, env.cfg.action_space, device=device)
 
     # ★ HER buffer 교체 (옵션)
     if args.use_her:
