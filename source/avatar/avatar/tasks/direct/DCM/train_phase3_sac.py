@@ -97,6 +97,8 @@ parser.add_argument("--leader_follower", action="store_true",
                     help="리더-팔로워: 리더(arm1) 7 Δq(학습) + 팔로워(arm2) 추종 IK. 협응 구조적 보장(freeze 회피). action_space=7.")
 parser.add_argument("--lf_dense_progress", action="store_true",
                     help="dense progress 보상(Cartesian rod 접근량). sparse+HER가 리더관절 액션엔 약해 학습 굶는 것 보강.")
+parser.add_argument("--use_kin_graph", action="store_true",
+                    help="kinematic 그래프 관측(17노드) + KinGNN 정책(리더 joint 출력). leader_follower와 함께. morphology 일반화.")
 parser.add_argument("--use_hard_safety", action="store_true",
                     help="팔 hard 안전 필터 ON으로 학습 (충돌 0 지향). RoboBallet velocity-zeroing 근사(제동토크).")
 parser.add_argument("--use_swivel_nullspace", action="store_true",
@@ -189,6 +191,9 @@ def main():
     if args.lf_dense_progress:
         env_cfg.lf_dense_progress = True
         print(f"📈 dense progress ON: r_progress = {env_cfg.lf_dense_w}·(rod 목표 접근량) — sparse 보강")
+    if args.use_kin_graph:
+        env_cfg.use_kin_graph = True
+        print("🕸️ kinematic 그래프 관측 ON (17노드 base+joint+rod). KinGNN 정책.")
     if args.use_hard_safety:
         env_cfg.use_hard_safety = True
         print("🛡️  hard safety filter ON (팔 충돌 0 지향)")
@@ -229,7 +234,14 @@ def main():
             _gc.GLOBAL_FEATURE_DIM = 1 + 28 + 1           # time + sin/cos(14×2) + f_int
         action_scale_vec = [float(env_cfg.joint_dq_scale)] * env.cfg.action_space
         print(f"🦿 joint MLP: state=rod+global(dim {_gc.GLOBAL_FEATURE_DIM}), action_scale={env_cfg.joint_dq_scale}×{env.cfg.action_space}")
-    if args.use_mlp:
+    if getattr(env.cfg, "use_kin_graph", False):
+        import gnn_policy_kin
+        agent = gnn_policy_kin.KinSACAgent(
+            num_rounds=args.num_rounds,
+            action_scale=[float(env_cfg.joint_dq_scale)] * env.cfg.action_space,
+        ).to(device)
+        print(f"🕸️ Kinematic GNN SAC (17노드, 리더 joint 출력): action_dim={env.cfg.action_space} rounds={args.num_rounds}")
+    elif args.use_mlp:
         agent = mlp_policy.MLPSACAgent(
             action_dim=env.cfg.action_space,
             num_rounds=args.num_rounds,

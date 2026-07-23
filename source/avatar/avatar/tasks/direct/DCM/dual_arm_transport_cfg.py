@@ -270,6 +270,9 @@ class DualrobotCfg(DirectRLEnvCfg):
     #   joint_action과 동일하게 포지션 액추에이터(joint_kp/kd) 사용.
     leader_follower: bool = False
     lf_ik_iters: int = 12             # 팔로워 IK warm-start 반복(작게=빠름, 스텝간 모션 작아 수렴).
+    # kinematic 그래프 관측(17노드 base+joint+rod). leader_follower와 함께 씀. GNN 정책(gnn_policy_kin).
+    #   파지 폭/각도=grasp 엣지, base 간격=base-rel 엣지, 관절 feasibility=joint 노드 → morphology 일반화.
+    use_kin_graph: bool = False
     # 저장된 파지 세트 로드(육안 확인/재현용). 경로 지정 시 랜덤 버킷 샘플링 대신 파일의 (d,θ)를
     #   버킷으로 사용(grasp_n_buckets는 파일 길이로 덮어씀). gen_grasp.py로 생성. None이면 랜덤.
     grasp_preset_path: str = None

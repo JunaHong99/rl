@@ -1160,7 +1160,76 @@ class DualrobotEnv(DirectRLEnv):
             "clearance_all": clr_masked,
         }
 
+    def _build_kin_raw(self):
+        """kinematic 그래프(graph_converter_kin)용 raw dict 생성. 17노드 공간 pose + joint feature.
+        노드 순서: [base_L, joint_L×7, rod, base_F, joint_F×7]. 공간 pose는 sim body(panda_link)에서."""
+        import graph_converter_kin as gk
+        B = self.num_envs; dev = self.device
+        env_origins = self.scene.env_origins
+
+        # panda_link 인덱스 캐시 (joint_i 공간 pose = panda_link_i)
+        if not hasattr(self, "_kin_link_ids"):
+            names = [f"panda_link{i}" for i in range(1, 8)]     # link1..7 = joint1..7 위치
+            self._kin_link_ids = [self.robot_1.body_names.index(n) for n in names]
+            # 관절축(부모링크 z축이 회전축, Franka revolute) — DH로 근사 대신 world z at link
+            # 간단화: 각 링크 body의 z축을 관절축으로 (revolute joint = link z). 정밀 축은 추후.
+        lids = self._kin_link_ids
+
+        def _links(robot):
+            p = robot.data.body_pos_w[:, lids] - env_origins.unsqueeze(1)   # (B,7,3) env-local
+            q = robot.data.body_quat_w[:, lids]                            # (B,7,4)
+            return p, q
+
+        pL, qL = _links(self.robot_1); pF, qF = _links(self.robot_2)
+        baseL_p = self.robot_1.data.root_pos_w - env_origins; baseL_q = self.robot_1.data.root_quat_w
+        baseF_p = self.robot_2.data.root_pos_w - env_origins; baseF_q = self.robot_2.data.root_quat_w
+        rod_p = self.rod.data.root_pos_w - env_origins; rod_q = self.rod.data.root_quat_w
+
+        # 노드 공간 pose 조립 (순서 = gk 인덱스)
+        node_pos = torch.zeros(B, 17, 3, device=dev); node_quat = torch.zeros(B, 17, 4, device=dev)
+        node_pos[:, gk.BASE_L_IDX] = baseL_p; node_quat[:, gk.BASE_L_IDX] = baseL_q
+        node_pos[:, gk.JOINT_L_IDX] = pL;     node_quat[:, gk.JOINT_L_IDX] = qL
+        node_pos[:, gk.ROD_IDX] = rod_p;      node_quat[:, gk.ROD_IDX] = rod_q
+        node_pos[:, gk.BASE_F_IDX] = baseF_p; node_quat[:, gk.BASE_F_IDX] = baseF_q
+        node_pos[:, gk.JOINT_F_IDX] = pF;     node_quat[:, gk.JOINT_F_IDX] = qF
+
+        # joint feature: 축(3, world z of link) + 값 + margin
+        axisL = math_utils.quat_apply(qL, torch.tensor([0., 0., 1.], device=dev).expand(B, 7, 3))
+        axisF = math_utils.quat_apply(qF, torch.tensor([0., 0., 1.], device=dev).expand(B, 7, 3))
+        joint_axis = torch.cat([axisL, axisF], dim=1)                       # (B,14,3)
+        qvalL = self.robot_1.data.joint_pos[:, self.robot_1_joint_ids]
+        qvalF = self.robot_2.data.joint_pos[:, self.robot_2_joint_ids]
+        joint_val = torch.cat([qvalL, qvalF], dim=1)                       # (B,14)
+        # margin: (q-q_min)/range, (q_max-q)/range ∈[0,1]  (IK solver 한계 재사용)
+        ik = self.pose_sampler._base.ik_solver
+        qmin, qmax = ik.q_min.to(dev), ik.q_max.to(dev); rng = (qmax - qmin).clamp_min(1e-3)
+        def _margin(qv):
+            return torch.stack([((qv - qmin) / rng).clamp(0, 1), ((qmax - qv) / rng).clamp(0, 1)], dim=-1)
+        joint_margin = torch.cat([_margin(qvalL), _margin(qvalF)], dim=1)   # (B,14,2)
+
+        # object goal오차 (리더 base frame): pos(3) + rot6d(6)
+        R_b1_inv = math_utils.quat_conjugate(baseL_q)
+        goal_w = self.goal_rod_marker.data.root_pos_w; rodw = self.rod.data.root_pos_w
+        perr = math_utils.quat_apply(R_b1_inv, goal_w - rodw)
+        q_err = math_utils.quat_mul(self.goal_rod_marker.data.root_quat_w,
+                                    math_utils.quat_conjugate(self.rod.data.root_quat_w))
+        rerr6d = gk._quat_to_6d(math_utils.quat_mul(R_b1_inv, q_err))
+        obj_goal = torch.cat([perr, rerr6d], dim=-1)                        # (B,9)
+
+        w1, w2 = self._get_grasp_wrenches()
+        f_int = (0.5 * (w1[:, :3] - w2[:, :3])).norm(dim=-1)               # (B,)
+        ntime = (self.episode_length_buf.float() / self.max_episode_length).clamp(0, 1)
+        return {
+            'node_pos': node_pos, 'node_quat': node_quat,
+            'joint_axis': joint_axis, 'joint_val': joint_val, 'joint_margin': joint_margin,
+            'obj_goal_pos6d': obj_goal, 'time': ntime, 'f_int': f_int,
+        }
+
     def _build_policy_batch(self):
+        # kinematic 그래프 모드: 17노드 그래프 반환 (리더-팔로워 morphology용).
+        if getattr(self.cfg, "use_kin_graph", False):
+            import graph_converter_kin as gk
+            return gk.convert_kin_graph(self._build_kin_raw(), self.num_envs)
         """
         현재 env 상태를 PyG Batch로 변환 (graph_converter 호출 wrapper).
         joint_limits는 한 번만 cache.
