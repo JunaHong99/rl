@@ -16,6 +16,8 @@ parser.add_argument("--num_envs", type=int, default=256)
 parser.add_argument("--num_steps", type=int, default=300)
 parser.add_argument("--leader_follower", action="store_true")
 parser.add_argument("--joint_action", action="store_true")
+parser.add_argument("--use_kin_graph", action="store_true", help="kinematic 그래프 + KinGNN 정책 로드.")
+parser.add_argument("--num_rounds", type=int, default=8, help="KinGNN message-passing rounds(학습과 일치).")
 parser.add_argument("--stochastic", action="store_true", help="탐험 확인용(기본 deterministic).")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -34,10 +36,12 @@ if args.leader_follower:
     cfg.leader_follower = True; cfg.action_space = 7
 if args.joint_action:
     cfg.joint_action = True; cfg.action_space = 14
+if args.use_kin_graph:
+    cfg.use_kin_graph = True    # leader_follower와 함께
 # train과 동일: leader_follower=time+리더sin/cos(14)+f_int+base pos(3)+rot6d(6)=25, joint=time+28+1=30
-if args.leader_follower:
+if args.leader_follower and not args.use_kin_graph:
     gc.GLOBAL_FEATURE_DIM = 1 + 14 + 1 + 3 + 6
-else:
+elif not args.use_kin_graph:
     gc.GLOBAL_FEATURE_DIM = 1 + 28 + 1
 env = DualrobotEnv(cfg, render_mode=None)
 A = env.cfg.action_space
@@ -47,9 +51,15 @@ settle = getattr(env, "SETTLE_STEPS_AT_RESET", 0)
 scale = [float(cfg.joint_dq_scale)] * A
 
 sd = torch.load(os.path.abspath(args.model_path), map_location=dev, weights_only=False)["model"]
-agent = mlp_policy.MLPSACAgent(action_dim=A, action_scale=scale, hidden_dim=256,
-                               num_hidden_layers=2, use_full_state=False, use_lean_obstacle=False).to(dev)
-agent.load_state_dict(sd); agent.eval()
+if args.use_kin_graph:
+    import gnn_policy_kin
+    agent = gnn_policy_kin.KinSACAgent(num_rounds=args.num_rounds, action_scale=scale).to(dev)
+    agent.load_state_dict(sd); agent.eval()
+    print(f"🕸️ KinGNN 로드 (rounds={args.num_rounds})")
+else:
+    agent = mlp_policy.MLPSACAgent(action_dim=A, action_scale=scale, hidden_dim=256,
+                                   num_hidden_layers=2, use_full_state=False, use_lean_obstacle=False).to(dev)
+    agent.load_state_dict(sd); agent.eval()
 print("=" * 70)
 print(f"✅ {os.path.basename(args.model_path)}  action_dim={A}  global_dim={gc.GLOBAL_FEATURE_DIM}  "
       f"{'stochastic' if args.stochastic else 'deterministic'}")
