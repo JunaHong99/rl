@@ -1193,9 +1193,16 @@ class DualrobotEnv(DirectRLEnv):
         node_pos[:, gk.BASE_F_IDX] = baseF_p; node_quat[:, gk.BASE_F_IDX] = baseF_q
         node_pos[:, gk.JOINT_F_IDX] = pF;     node_quat[:, gk.JOINT_F_IDX] = qF
 
-        # joint feature: 축(3, world z of link) + 값 + margin
-        axisL = math_utils.quat_apply(qL, torch.tensor([0., 0., 1.], device=dev).expand(B, 7, 3))
-        axisF = math_utils.quat_apply(qF, torch.tensor([0., 0., 1.], device=dev).expand(B, 7, 3))
+        # joint feature: 축(3) + 값 + margin.
+        # ★ 관절 회전축(=링크 local z를 world로)을 다시 **리더 base frame**으로 변환.
+        #   world 축은 base 배치 의존(팔로워 yaw=π면 반대방향) → base 변이·두 팔 일관성 깨짐.
+        #   리더 base frame이면 base 이동 무관 + 팔로워도 리더 기준 정렬 + obj_goal과 좌표계 일관.
+        zc = torch.tensor([0., 0., 1.], device=dev).expand(B, 7, 3)
+        R_b1_inv = math_utils.quat_conjugate(baseL_q)                       # (B,4) 리더 base frame 변환
+        b1_inv_e = R_b1_inv.unsqueeze(1).expand(B, 7, 4)
+        # 링크 quat을 리더 base frame으로: q_base_link = conj(baseL_q) ⊗ q_link_world → z축 적용
+        axisL = math_utils.quat_apply(math_utils.quat_mul(b1_inv_e, qL), zc)   # (B,7,3) 리더 base frame
+        axisF = math_utils.quat_apply(math_utils.quat_mul(b1_inv_e, qF), zc)   # (B,7,3) 리더 base frame
         joint_axis = torch.cat([axisL, axisF], dim=1)                       # (B,14,3)
         qvalL = self.robot_1.data.joint_pos[:, self.robot_1_joint_ids]
         qvalF = self.robot_2.data.joint_pos[:, self.robot_2_joint_ids]
@@ -1207,8 +1214,7 @@ class DualrobotEnv(DirectRLEnv):
             return torch.stack([((qv - qmin) / rng).clamp(0, 1), ((qmax - qv) / rng).clamp(0, 1)], dim=-1)
         joint_margin = torch.cat([_margin(qvalL), _margin(qvalF)], dim=1)   # (B,14,2)
 
-        # object goal오차 (리더 base frame): pos(3) + rot6d(6)
-        R_b1_inv = math_utils.quat_conjugate(baseL_q)
+        # object goal오차 (리더 base frame): pos(3) + rot6d(6). R_b1_inv은 위 joint_axis에서 정의됨.
         goal_w = self.goal_rod_marker.data.root_pos_w; rodw = self.rod.data.root_pos_w
         perr = math_utils.quat_apply(R_b1_inv, goal_w - rodw)
         q_err = math_utils.quat_mul(self.goal_rod_marker.data.root_quat_w,
