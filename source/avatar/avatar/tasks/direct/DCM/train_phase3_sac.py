@@ -306,6 +306,9 @@ def main():
         print(f"  HER random_task offset pool: {offset_pos_pool.shape[0]:,} entries "
               f"(pos range [{offset_pos_pool.norm(dim=-1).min():.3f}, {offset_pos_pool.norm(dim=-1).max():.3f}] m)")
 
+        _her_gm = None
+        if getattr(env.cfg, "use_kin_graph", False):
+            import graph_converter_kin as _her_gm
         trainer.buffer = her_buffer.HERReplayBuffer(
             capacity=args.buffer_size,
             num_envs=args.num_envs,
@@ -317,6 +320,7 @@ def main():
             goal_offset_pos_pool=offset_pos_pool,
             goal_offset_quat_pool=offset_quat_pool,
             progress_weight=args.her_progress_weight,
+            graph_mod=_her_gm,
         )
         print(f"🎯 HER enabled: strategy={args.her_strategy}, k_future={args.k_future}, "
               f"progress_weight={args.her_progress_weight}, max_ep_len={max_ep_len}")
@@ -461,6 +465,7 @@ def main():
                 valid_mask=valid_mask,
                 goal_indep_reward=getattr(env, "_goal_indep_reward", None),
                 collision_mask=getattr(env, "_collision_now", None),
+                base_quat=env.robot_1.data.root_quat_w.clone(),   # 리더 base quat (kin HER relabel용)
             )
         else:
             # add_batch는 valid_mask 미지원 — 전체 settle 중일 때만 skip (보수적)

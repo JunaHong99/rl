@@ -97,6 +97,31 @@ def replace_goal_in_node_features(x_per_env, rod_pos, rod_quat, new_goal_pos, ne
     return x_modified
 
 
+def replace_goal_in_kin_object(x_per_env, rod_pos, rod_quat, base_quat, new_goal_pos, new_goal_quat):
+    """kinematic 그래프(17노드) object 노드의 base-frame goal오차를 새 goal로 교체(HER B).
+
+    kin object 노드(idx gk.ROD_IDX) raw = base-frame pos오차(3) + rot6d(6). env._build_kin_raw와 동일 계산.
+    base_quat = 그 시점 리더 base quat (base frame 변환용). one-hot(뒤 3)은 안 건드림.
+    """
+    import graph_converter_kin as gk
+    x = x_per_env.clone()
+    R_inv = _quat_conj(base_quat)                                       # (M,4)
+    perr = _quat_apply_vec(R_inv, new_goal_pos - rod_pos)               # (M,3) base frame 위치오차
+    q_err = _quat_mul(new_goal_quat, _quat_conj(rod_quat))             # (M,4) 월드 오차회전
+    q_err_base = _quat_mul(R_inv, q_err)                               # base frame
+    rerr6d = gk._quat_to_6d(q_err_base)                               # (M,6)
+    obj = torch.cat([perr, rerr6d], dim=-1)                           # (M,9)
+    x[:, gk.ROD_IDX, :gk.OBJECT_RAW_DIM] = obj.clamp(-FEAT_CLIP, FEAT_CLIP)
+    return x
+
+
+def _quat_apply_vec(q, v):
+    """rotate v(...,3) by quat q(...,4) wxyz."""
+    qw = q[..., 0:1]; qv = q[..., 1:4]
+    t = 2.0 * torch.cross(qv, v, dim=-1)
+    return v + qw * t + torch.cross(qv, t, dim=-1)
+
+
 def recompute_reward(rod_pos, rod_quat, new_goal_pos, new_goal_quat,
                      prev_dist, is_first,
                      pos_thresh=0.02, rot_thresh=0.1745,
@@ -152,13 +177,15 @@ class HERReplayBuffer:
                  strategy: str = "random_task",
                  goal_offset_pos_pool: torch.Tensor | None = None,
                  goal_offset_quat_pool: torch.Tensor | None = None,
-                 progress_weight: float = 50.0):
+                 progress_weight: float = 50.0, graph_mod=None):
         self.capacity = capacity
         self.num_envs = num_envs
         self.action_dim = action_dim
         self.device = device
         self.k_future = k_future
         self.max_episode_len = max_episode_len
+        self._gm = graph_mod if graph_mod is not None else gc   # lean(gc) 또는 kin(gk)
+        self._is_kin = graph_mod is not None and graph_mod is not gc
         # dense 진행 보상 가중치 — original·virtual 모두 동일 적용 (일관성). (prev_dist−cur_dist)*w.
         self.progress_weight = progress_weight
         assert strategy in ("future", "random_task"), f"unknown HER strategy: {strategy}"
@@ -170,9 +197,9 @@ class HERReplayBuffer:
             assert self.goal_offset_pos_pool is not None and self.goal_offset_quat_pool is not None, \
                 "random_task strategy requires goal_offset_*_pool"
 
-        N, F_node = gc.NODES_PER_ENV, gc.NODE_FEATURE_DIM
-        E, F_edge = gc.N_EDGES_PER_ENV, gc.EDGE_FEATURE_DIM
-        F_global = gc.GLOBAL_FEATURE_DIM
+        N, F_node = self._gm.NODES_PER_ENV, self._gm.NODE_FEATURE_DIM
+        E, F_edge = self._gm.N_EDGES_PER_ENV, self._gm.EDGE_FEATURE_DIM
+        F_global = self._gm.GLOBAL_FEATURE_DIM
         self.N, self.F_node = N, F_node
         self.E, self.F_edge = E, F_edge
 
@@ -188,8 +215,8 @@ class HERReplayBuffer:
         self.dones = torch.zeros(capacity, device=device)
 
         # Static edge indices
-        self._src = torch.tensor(gc._EDGE_SRC, device=device, dtype=torch.long)
-        self._dst = torch.tensor(gc._EDGE_DST, device=device, dtype=torch.long)
+        self._src = torch.tensor(self._gm._EDGE_SRC, device=device, dtype=torch.long)
+        self._dst = torch.tensor(self._gm._EDGE_DST, device=device, dtype=torch.long)
 
         self.ptr = 0
         self.size = 0
@@ -210,13 +237,15 @@ class HERReplayBuffer:
 
         self.ep_x = torch.zeros(L, B, N, F_node, device=d)
         self.ep_edge = torch.zeros(L, B, E, F_edge, device=d)
-        self.ep_u = torch.zeros(L, B, gc.GLOBAL_FEATURE_DIM, device=d)
+        self.ep_u = torch.zeros(L, B, self._gm.GLOBAL_FEATURE_DIM, device=d)
         self.ep_action = torch.zeros(L, B, self.action_dim, device=d)
         self.ep_next_x = torch.zeros(L, B, N, F_node, device=d)
         self.ep_next_edge = torch.zeros(L, B, E, F_edge, device=d)
-        self.ep_next_u = torch.zeros(L, B, gc.GLOBAL_FEATURE_DIM, device=d)
+        self.ep_next_u = torch.zeros(L, B, self._gm.GLOBAL_FEATURE_DIM, device=d)
         self.ep_rod_pos = torch.zeros(L, B, 3, device=d)
         self.ep_rod_quat = torch.zeros(L, B, 4, device=d)
+        # 리더 base quat (kin HER의 base-frame goal relabel용). 고정로봇=상수, base변이 대비 저장.
+        self.ep_base_quat = torch.zeros(L, B, 4, device=d)
         self.ep_next_rod_pos = torch.zeros(L, B, 3, device=d)
         self.ep_next_rod_quat = torch.zeros(L, B, 4, device=d)
         self.ep_goal_pos = torch.zeros(L, B, 3, device=d)
@@ -248,7 +277,7 @@ class HERReplayBuffer:
     def add_step(self, batch_state: Batch, action, reward, next_batch_state: Batch, done,
                  rod_pos, rod_quat, next_rod_pos, next_rod_quat,
                  goal_pos, goal_quat, valid_mask=None, goal_indep_reward=None,
-                 collision_mask=None):
+                 collision_mask=None, base_quat=None):
         """매 env.step마다 호출. Episode buffer에 임시 저장 + done env들 HER 처리.
 
         Args:
@@ -291,6 +320,8 @@ class HERReplayBuffer:
         self.ep_next_rod_quat[s_v, valid_idx] = next_rod_quat[valid_idx]
         self.ep_goal_pos[s_v, valid_idx] = goal_pos[valid_idx]
         self.ep_goal_quat[s_v, valid_idx] = goal_quat[valid_idx]
+        if base_quat is not None:
+            self.ep_base_quat[s_v, valid_idx] = base_quat[valid_idx]
         if goal_indep_reward is not None:
             self.ep_goal_indep[s_v, valid_idx] = goal_indep_reward[valid_idx]
         if collision_mask is not None:
@@ -429,8 +460,14 @@ class HERReplayBuffer:
             n_rod_p_h = self.ep_next_rod_pos[t_her, env_her]
             n_rod_q_h = self.ep_next_rod_quat[t_her, env_her]
 
-            vx_h = replace_goal_in_node_features(x_h, rod_p_h, rod_q_h, vg_pos, vg_quat)
-            vnx_h = replace_goal_in_node_features(nx_h, n_rod_p_h, n_rod_q_h, vg_pos, vg_quat)
+            if self._is_kin:
+                # kin: object 노드의 base-frame goal오차 교체 (그 시점 리더 base quat 사용).
+                bq_h = self.ep_base_quat[t_her, env_her]
+                vx_h = replace_goal_in_kin_object(x_h, rod_p_h, rod_q_h, bq_h, vg_pos, vg_quat)
+                vnx_h = replace_goal_in_kin_object(nx_h, n_rod_p_h, n_rod_q_h, bq_h, vg_pos, vg_quat)
+            else:
+                vx_h = replace_goal_in_node_features(x_h, rod_p_h, rod_q_h, vg_pos, vg_quat)
+                vnx_h = replace_goal_in_node_features(nx_h, n_rod_p_h, n_rod_q_h, vg_pos, vg_quat)
 
             # Virtual reward: prev_dist 정확히 (rod_p at t, virtual goal) 기준
             prev_pos_h = torch.norm(vg_pos - rod_p_h, dim=-1)
