@@ -1194,16 +1194,14 @@ class DualrobotEnv(DirectRLEnv):
         node_pos[:, gk.JOINT_F_IDX] = pF;     node_quat[:, gk.JOINT_F_IDX] = qF
 
         # joint feature: 축(3) + 값 + margin.
-        # ★ 관절 회전축(=링크 local z를 world로)을 다시 **리더 base frame**으로 변환.
-        #   world 축은 base 배치 의존(팔로워 yaw=π면 반대방향) → base 변이·두 팔 일관성 깨짐.
-        #   리더 base frame이면 base 이동 무관 + 팔로워도 리더 기준 정렬 + obj_goal과 좌표계 일관.
-        zc = torch.tensor([0., 0., 1.], device=dev).expand(B, 7, 3)
-        R_b1_inv = math_utils.quat_conjugate(baseL_q)                       # (B,4) 리더 base frame 변환
-        b1_inv_e = R_b1_inv.unsqueeze(1).expand(B, 7, 4)
-        # 링크 quat을 리더 base frame으로: q_base_link = conj(baseL_q) ⊗ q_link_world → z축 적용
-        axisL = math_utils.quat_apply(math_utils.quat_mul(b1_inv_e, qL), zc)   # (B,7,3) 리더 base frame
-        axisF = math_utils.quat_apply(math_utils.quat_mul(b1_inv_e, qF), zc)   # (B,7,3) 리더 base frame
-        joint_axis = torch.cat([axisL, axisF], dim=1)                       # (B,14,3)
+        # ★ (B) 관절축 = **부모링크 frame 기준 상수**(DH 도출, gk.PARENT_FRAME_JOINT_AXES).
+        #   NerveNet식: 노드는 국소(부모기준)로 로봇 구조만 담고, 공간관계는 엣지(joint↔joint 상대pose).
+        #   base/자세/배치 완전 불변 → 전이 최강 + GNN 국소 학습 쉬움. (양팔 동일 로봇이라 축도 동일.)
+        if not hasattr(self, "_kin_axes"):
+            ax = torch.tensor(gk.PARENT_FRAME_JOINT_AXES, device=dev)       # (7,3)
+            self._kin_axes = torch.cat([ax, ax], dim=0)                     # (14,3) 리더+팔로워 동일
+        joint_axis = self._kin_axes.unsqueeze(0).expand(B, 14, 3)          # (B,14,3) 상수
+        R_b1_inv = math_utils.quat_conjugate(baseL_q)                       # (B,4) obj_goal용(아래)
         qvalL = self.robot_1.data.joint_pos[:, self.robot_1_joint_ids]
         qvalF = self.robot_2.data.joint_pos[:, self.robot_2_joint_ids]
         joint_val = torch.cat([qvalL, qvalF], dim=1)                       # (B,14)

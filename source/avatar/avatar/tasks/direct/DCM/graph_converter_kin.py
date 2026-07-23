@@ -35,6 +35,20 @@ FEAT_CLIP = 5.0
 
 N_ARM_JOINTS = 7
 NODES_PER_ENV = 17
+
+# ★ 관절 회전축 = **부모링크 frame 기준 상수**(DH alpha 도출). NerveNet식: 노드는 국소(부모기준),
+#   공간관계는 엣지. base/자세/로봇배치 완전 불변 → morphology 전이 최강. GNN 학습도 국소라 쉬움.
+#   Modified DH: 부모frame 기준 joint_i 축 = Rx(alpha_i)·[0,0,1] = [0, -sin α, cos α].
+#   alpha = [0, -π/2, π/2, π/2, -π/2, π/2, π/2] (franka_tensor_ik DH).
+PARENT_FRAME_JOINT_AXES = [
+    [0.0,  0.0, 1.0],   # j1
+    [0.0,  1.0, 0.0],   # j2
+    [0.0, -1.0, 0.0],   # j3
+    [0.0, -1.0, 0.0],   # j4
+    [0.0,  1.0, 0.0],   # j5
+    [0.0, -1.0, 0.0],   # j6
+    [0.0, -1.0, 0.0],   # j7
+]
 # 고정 인덱스
 BASE_L_IDX = 0
 JOINT_L_IDX = list(range(1, 8))      # 1..7  ← 출력 head 대상
