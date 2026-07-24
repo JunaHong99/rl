@@ -86,19 +86,22 @@ def rollout_record(record_env):
     env.reset(); batch = env._build_policy_batch()
     bp = np.full(NP, 9.9); br = np.full(NP, 999.0)
     reached_once = np.zeros(NP, dtype=bool); buf = []
+    start_perr = None
     ci = 0 if record_env is None else record_env
     for s in range(total_steps):
         if not sim_app.is_running():
             break
         with torch.no_grad():
             action, _, _ = agent.actor.get_action_and_log_prob(batch, deterministic=True)
-            env.step(action)
+            _, _, term, trunc, _ = env.step(action)
         rod = env.rod.data.root_pos_w; goal = env.goal_rod_marker.data.root_pos_w
         perr = (goal - rod).norm(dim=-1).cpu().numpy()
         qd = math_utils.quat_mul(env.goal_rod_marker.data.root_quat_w,
                                  math_utils.quat_conjugate(env.rod.data.root_quat_w))
         rerr = np.degrees(2.0 * np.arctan2(qd[:, 1:4].norm(dim=-1).cpu().numpy(), qd[:, 0].abs().cpu().numpy()))
         if s >= settle:                        # settle 스킵
+            if start_perr is None:             # 첫 유효스텝 시작 위치오차 기록
+                start_perr = perr.copy()
             bp = np.minimum(bp, perr); br = np.minimum(br, rerr)
             reached_once |= (perr < POS_T) & (rerr < ROT_T_DEG)   # ★ 이 스텝에 동시 만족
             if record_env is not None:
@@ -112,6 +115,10 @@ def rollout_record(record_env):
                     cv2.putText(img, f"pos={perr[ci]*100:.1f}cm(<2)  rot={rerr[ci]:.0f}deg(<10)  {'REACHED' if now else '...'}",
                                 (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, col, 2, cv2.LINE_AA)
                     buf.append(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+            # ★ env 0이 이번 스텝에 done(성공종료/timeout)이면 여기까지가 한 에피소드 → 중단.
+            #   (다음 스텝부터 env 0은 자동 리셋된 새 에피소드라 녹화하면 안 됨.)
+            if bool(term[0].item()) or bool(trunc[0].item()):
+                break
         batch = env._build_policy_batch()
     return buf, bp, br, reached_once
 
