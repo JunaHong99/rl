@@ -36,7 +36,7 @@ import isaaclab.utils.math as math_utils
 dev = "cuda" if torch.cuda.is_available() else "cpu"
 N = args.n_clips
 cfg = DualrobotCfg()
-cfg.scene.num_envs = N
+cfg.scene.num_envs = 4              # env 0만 녹화(카메라 고정), 나머지는 무시. 시도마다 reset=새 에피소드.
 cfg.scene.env_spacing = args.env_spacing
 cfg.viewer.resolution = (args.res_w, args.res_h)
 cfg.leader_follower = True
@@ -71,43 +71,53 @@ def look_at(i):
     env.sim.set_camera_view(eye=(o[0]+1.8, o[1]+1.8, o[2]+1.4), target=(o[0], o[1], o[2]+0.4))
 
 
-env.reset(); batch = env._build_policy_batch()
+ROT_T_DEG = math.degrees(ROT_T)
+settle = getattr(env, "SETTLE_STEPS_AT_RESET", 0)
+total_steps = settle + args.steps_per_env
+look_at(0)                                   # 카메라 env 0 고정
+writer = cv2.VideoWriter(args.out, cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (args.res_w, args.res_h))
 t0 = time.time()
-for i in range(N):
-    look_at(i)
-    best_p = 9.9; best_r = 999.0; reached = False
-    for s in range(args.steps_per_env):
+
+# 시도마다 reset(새 에피소드) → env 0을 rollout하며 프레임 버퍼링(settle 스킵) → 성공하면 영상에 추가.
+collected = 0; attempt = 0; max_attempts = N * 6
+while collected < N and attempt < max_attempts and sim_app.is_running():
+    attempt += 1
+    env.reset(); batch = env._build_policy_batch()
+    buf = []; bp = 9.9; br = 999.0
+    for s in range(total_steps):
         if not sim_app.is_running():
             break
         with torch.no_grad():
             action, _, _ = agent.actor.get_action_and_log_prob(batch, deterministic=True)
-            _, _, term, trunc, _ = env.step(action)
-        rod = env.rod.data.root_pos_w; goal = env.goal_rod_marker.data.root_pos_w
-        perr = (goal[i] - rod[i]).norm().item()
-        qd = math_utils.quat_mul(env.goal_rod_marker.data.root_quat_w[i:i+1],
-                                 math_utils.quat_conjugate(env.rod.data.root_quat_w[i:i+1]))
-        rerr = math.degrees(2.0 * math.atan2(qd[:, 1:4].norm().item(), abs(qd[0, 0].item())))
-        best_p = min(best_p, perr); best_r = min(best_r, rerr)
-        # 성공 판정 = eval_lf와 동일: 위치·자세 각각 독립 min이 임계 미만(동시 아님).
-        reached = (best_p < POS_T) and (best_r < math.degrees(ROT_T))
+            env.step(action)
+        if s < settle:                       # settle 스킵(머뭇거림 컷 — 녹화 안 함)
+            batch = env._build_policy_batch(); continue
+        rod = env.rod.data.root_pos_w[0]; goal = env.goal_rod_marker.data.root_pos_w[0]
+        bp = min(bp, (goal - rod).norm().item())
+        qd = math_utils.quat_mul(env.goal_rod_marker.data.root_quat_w[0:1],
+                                 math_utils.quat_conjugate(env.rod.data.root_quat_w[0:1]))
+        br = min(br, math.degrees(2.0 * math.atan2(qd[:, 1:4].norm().item(), abs(qd[0, 0].item()))))
+        reached = (bp < POS_T) and (br < ROT_T_DEG)
         frame = env.render()
         if frame is None or frame.size == 0:
             batch = env._build_policy_batch(); continue
         img = np.ascontiguousarray(frame[:, :, :3])
         col = (0, 220, 0) if reached else (255, 210, 0)
-        cv2.putText(img, f"clip {i+1}/{N}  kin leader-follower", (20, 40),
+        cv2.putText(img, f"success clip {collected+1}/{N}  kin leader-follower", (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(img, f"pos={best_p*100:.1f}cm(<2)  rot={best_r:.0f}deg(<10)  {'REACHED' if reached else '...'}",
+        cv2.putText(img, f"pos={bp*100:.1f}cm(<2)  rot={br:.0f}deg(<10)  {'REACHED' if reached else '...'}",
                     (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, col, 2, cv2.LINE_AA)
-        writer.write(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        buf.append(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
         batch = env._build_policy_batch()
-    # 실패 원인 진단: 위치는 됐는데 자세 때문인지
-    cause = ""
-    if not reached:
-        cause = " (자세 미달)" if best_p < POS_T else (" (위치 미달)" if best_r < math.degrees(ROT_T) else " (둘다)")
-    print(f"  [{i+1}/{N}] {'✅REACHED' if reached else '❌미도달'+cause}  "
-          f"min pos={best_p*100:.1f}cm  min rot={best_r:.0f}deg")
+    # 성공한 에피소드만 영상에 write
+    if (bp < POS_T) and (br < ROT_T_DEG):
+        for f in buf:
+            writer.write(f)
+        collected += 1
+        print(f"  ✅ clip {collected}/{N} (시도 {attempt})  min pos={bp*100:.1f}cm  rot={br:.0f}deg")
+    else:
+        print(f"  ✗ 실패 버림 (시도 {attempt})  min pos={bp*100:.1f}cm  rot={br:.0f}deg")
 
 writer.release()
-print(f"✅ 저장: {args.out}  ({time.time()-t0:.0f}s)")
+print(f"✅ 저장: {args.out}  성공 {collected}/{N}개 ({attempt}회 시도, {time.time()-t0:.0f}s)")
 env.close(); sim_app.close()
