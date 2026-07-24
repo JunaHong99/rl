@@ -21,6 +21,8 @@ parser.add_argument("--fps", type=int, default=10)
 parser.add_argument("--res_w", type=int, default=1280)
 parser.add_argument("--res_h", type=int, default=720)
 parser.add_argument("--env_spacing", type=float, default=4.0)
+parser.add_argument("--use_kin_graph", action="store_true", help="kinematic 그래프 + KinGNN 로드.")
+parser.add_argument("--num_rounds", type=int, default=8)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.enable_cameras = True
@@ -40,7 +42,10 @@ cfg.viewer.resolution = (args.res_w, args.res_h)
 cfg.leader_follower = True
 cfg.action_space = 7
 cfg.n_obstacles = 0
-gc.GLOBAL_FEATURE_DIM = 1 + 14 + 1 + 3 + 6
+if args.use_kin_graph:
+    cfg.use_kin_graph = True
+else:
+    gc.GLOBAL_FEATURE_DIM = 1 + 14 + 1 + 3 + 6
 env = DualrobotEnv(cfg, render_mode="rgb_array")
 A = env.cfg.action_space
 POS_T, ROT_T = 0.02, math.radians(10)
@@ -48,8 +53,13 @@ origins = env.scene.env_origins
 
 sd = torch.load(os.path.abspath(args.model_path), map_location=dev, weights_only=False)["model"]
 scale = [float(cfg.joint_dq_scale)] * A
-agent = mlp_policy.MLPSACAgent(action_dim=A, action_scale=scale, hidden_dim=256,
-                               num_hidden_layers=2, use_full_state=False, use_lean_obstacle=False).to(dev)
+if args.use_kin_graph:
+    import gnn_policy_kin
+    agent = gnn_policy_kin.KinSACAgent(num_rounds=args.num_rounds, action_scale=scale).to(dev)
+    print(f"🕸️ KinGNN 로드 (rounds={args.num_rounds})")
+else:
+    agent = mlp_policy.MLPSACAgent(action_dim=A, action_scale=scale, hidden_dim=256,
+                                   num_hidden_layers=2, use_full_state=False, use_lean_obstacle=False).to(dev)
 agent.load_state_dict(sd); agent.eval()
 print(f"▶ 녹화: {os.path.basename(args.model_path)}  clips={N}  → {args.out}")
 
