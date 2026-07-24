@@ -74,50 +74,63 @@ def look_at(i):
 ROT_T_DEG = math.degrees(ROT_T)
 settle = getattr(env, "SETTLE_STEPS_AT_RESET", 0)
 total_steps = settle + args.steps_per_env
-look_at(0)                                   # 카메라 env 0 고정
+NP = env.num_envs                             # 병렬 env 수(=4)
+look_at(0)
 writer = cv2.VideoWriter(args.out, cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (args.res_w, args.res_h))
 t0 = time.time()
 
-# 시도마다 reset(새 에피소드) → env 0을 rollout하며 프레임 버퍼링(settle 스킵) → 성공하면 영상에 추가.
-collected = 0; attempt = 0; max_attempts = N * 6
-while collected < N and attempt < max_attempts and sim_app.is_running():
-    attempt += 1
+
+def rollout_record(record_env):
+    """한 batch rollout. record_env가 None이면 렌더 없이 성공판정만(빠름).
+       int면 그 env의 프레임을 오버레이해 buf 반환. 반환: (buf, best_p(NP,), best_r(NP,))."""
     env.reset(); batch = env._build_policy_batch()
-    buf = []; bp = 9.9; br = 999.0
+    bp = np.full(NP, 9.9); br = np.full(NP, 999.0); buf = []
+    ci = 0 if record_env is None else record_env
     for s in range(total_steps):
         if not sim_app.is_running():
             break
         with torch.no_grad():
             action, _, _ = agent.actor.get_action_and_log_prob(batch, deterministic=True)
             env.step(action)
-        if s < settle:                       # settle 스킵(머뭇거림 컷 — 녹화 안 함)
-            batch = env._build_policy_batch(); continue
-        rod = env.rod.data.root_pos_w[0]; goal = env.goal_rod_marker.data.root_pos_w[0]
-        bp = min(bp, (goal - rod).norm().item())
-        qd = math_utils.quat_mul(env.goal_rod_marker.data.root_quat_w[0:1],
-                                 math_utils.quat_conjugate(env.rod.data.root_quat_w[0:1]))
-        br = min(br, math.degrees(2.0 * math.atan2(qd[:, 1:4].norm().item(), abs(qd[0, 0].item()))))
-        reached = (bp < POS_T) and (br < ROT_T_DEG)
-        frame = env.render()
-        if frame is None or frame.size == 0:
-            batch = env._build_policy_batch(); continue
-        img = np.ascontiguousarray(frame[:, :, :3])
-        col = (0, 220, 0) if reached else (255, 210, 0)
-        cv2.putText(img, f"success clip {collected+1}/{N}  kin leader-follower", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(img, f"pos={bp*100:.1f}cm(<2)  rot={br:.0f}deg(<10)  {'REACHED' if reached else '...'}",
-                    (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, col, 2, cv2.LINE_AA)
-        buf.append(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        rod = env.rod.data.root_pos_w; goal = env.goal_rod_marker.data.root_pos_w
+        perr = (goal - rod).norm(dim=-1).cpu().numpy()
+        qd = math_utils.quat_mul(env.goal_rod_marker.data.root_quat_w,
+                                 math_utils.quat_conjugate(env.rod.data.root_quat_w))
+        rerr = np.degrees(2.0 * np.arctan2(qd[:, 1:4].norm(dim=-1).cpu().numpy(), qd[:, 0].abs().cpu().numpy()))
+        if s >= settle:                        # settle 스킵
+            bp = np.minimum(bp, perr); br = np.minimum(br, rerr)
+            if record_env is not None:
+                frame = env.render()
+                if frame is not None and frame.size > 0:
+                    img = np.ascontiguousarray(frame[:, :, :3])
+                    reached = (bp[ci] < POS_T) and (br[ci] < ROT_T_DEG)
+                    col = (0, 220, 0) if reached else (255, 210, 0)
+                    cv2.putText(img, f"success clip  kin leader-follower", (20, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+                    cv2.putText(img, f"pos={bp[ci]*100:.1f}cm(<2)  rot={br[ci]:.0f}deg(<10)  {'REACHED' if reached else '...'}",
+                                (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, col, 2, cv2.LINE_AA)
+                    buf.append(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
         batch = env._build_policy_batch()
-    # 성공한 에피소드만 영상에 write
-    if (bp < POS_T) and (br < ROT_T_DEG):
+    return buf, bp, br
+
+
+# 렌더 없이 여러 batch 판정 → 성공 env 좌표(batch, env_idx) 수집.
+# 근데 batch마다 pose가 새로 랜덤이라 재현 불가 → 판정과 녹화를 한 rollout에서:
+# 각 batch를 "env 0 카메라로 녹화"하되, env 0이 성공한 batch만 keep. (렌더는 매 batch 있지만
+# 실패해도 렌더 비용은 동일 — 대신 num_envs 병렬로 시도수 자체를 줄임: 한 batch에 4개 판정,
+# env 0 성공률 93.7%라 대부분 첫 시도 성공 → 시도수 급감.)
+collected = 0; attempt = 0; max_attempts = N * 4
+while collected < N and attempt < max_attempts and sim_app.is_running():
+    attempt += 1
+    buf, bp, br = rollout_record(record_env=0)
+    if (bp[0] < POS_T) and (br[0] < ROT_T_DEG):
         for f in buf:
             writer.write(f)
         collected += 1
-        print(f"  ✅ clip {collected}/{N} (시도 {attempt})  min pos={bp*100:.1f}cm  rot={br:.0f}deg")
+        print(f"  ✅ clip {collected}/{N} (시도 {attempt})  pos={bp[0]*100:.1f}cm rot={br[0]:.0f}deg")
     else:
-        print(f"  ✗ 실패 버림 (시도 {attempt})  min pos={bp*100:.1f}cm  rot={br:.0f}deg")
+        print(f"  ✗ env0 실패 (시도 {attempt})  pos={bp[0]*100:.1f}cm rot={br[0]:.0f}deg")
 
 writer.release()
-print(f"✅ 저장: {args.out}  성공 {collected}/{N}개 ({attempt}회 시도, {time.time()-t0:.0f}s)")
+print(f"✅ 저장: {args.out}  성공 {collected}/{N} ({attempt}회, {time.time()-t0:.0f}s)")
 env.close(); sim_app.close()
