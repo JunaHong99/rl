@@ -17,7 +17,7 @@ parser.add_argument("--model_path", type=str, required=True)
 parser.add_argument("--out", type=str, default="lf_replay.mp4")
 parser.add_argument("--n_clips", type=int, default=6, help="녹화할 env(=운반 사례) 수. 카메라가 순차로 비춤.")
 parser.add_argument("--steps_per_env", type=int, default=40, help="env당 녹화 스텝(에피소드 ~30 + 여유).")
-parser.add_argument("--fps", type=int, default=10)
+parser.add_argument("--fps", type=int, default=5, help="제어 5Hz라 fps=5면 실시간(1x), 10이면 2x배속.")
 parser.add_argument("--res_w", type=int, default=1280)
 parser.add_argument("--res_h", type=int, default=720)
 parser.add_argument("--env_spacing", type=float, default=4.0)
@@ -75,7 +75,7 @@ env.reset(); batch = env._build_policy_batch()
 t0 = time.time()
 for i in range(N):
     look_at(i)
-    best = 9.9; reached = False
+    best_p = 9.9; best_r = 999.0; reached = False
     for s in range(args.steps_per_env):
         if not sim_app.is_running():
             break
@@ -86,22 +86,27 @@ for i in range(N):
         perr = (goal[i] - rod[i]).norm().item()
         qd = math_utils.quat_mul(env.goal_rod_marker.data.root_quat_w[i:i+1],
                                  math_utils.quat_conjugate(env.rod.data.root_quat_w[i:i+1]))
-        rerr = 2.0 * math.atan2(qd[:, 1:4].norm().item(), abs(qd[0, 0].item()))
-        best = min(best, perr)
-        if perr < POS_T and rerr < ROT_T:
-            reached = True
+        rerr = math.degrees(2.0 * math.atan2(qd[:, 1:4].norm().item(), abs(qd[0, 0].item())))
+        best_p = min(best_p, perr); best_r = min(best_r, rerr)
+        # 성공 판정 = eval_lf와 동일: 위치·자세 각각 독립 min이 임계 미만(동시 아님).
+        reached = (best_p < POS_T) and (best_r < math.degrees(ROT_T))
         frame = env.render()
         if frame is None or frame.size == 0:
             batch = env._build_policy_batch(); continue
         img = np.ascontiguousarray(frame[:, :, :3])
         col = (0, 220, 0) if reached else (255, 210, 0)
-        cv2.putText(img, f"clip {i+1}/{N}  leader-follower", (20, 40),
+        cv2.putText(img, f"clip {i+1}/{N}  kin leader-follower", (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(img, f"rod-goal={best*100:.1f}cm  {'REACHED' if reached else '...'}", (20, 80),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, col, 2, cv2.LINE_AA)
+        cv2.putText(img, f"pos={best_p*100:.1f}cm(<2)  rot={best_r:.0f}deg(<10)  {'REACHED' if reached else '...'}",
+                    (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, col, 2, cv2.LINE_AA)
         writer.write(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
         batch = env._build_policy_batch()
-    print(f"  [{i+1}/{N}] {'✅REACHED' if reached else '❌미도달'}  min rod-goal={best*100:.1f}cm")
+    # 실패 원인 진단: 위치는 됐는데 자세 때문인지
+    cause = ""
+    if not reached:
+        cause = " (자세 미달)" if best_p < POS_T else (" (위치 미달)" if best_r < math.degrees(ROT_T) else " (둘다)")
+    print(f"  [{i+1}/{N}] {'✅REACHED' if reached else '❌미도달'+cause}  "
+          f"min pos={best_p*100:.1f}cm  min rot={best_r:.0f}deg")
 
 writer.release()
 print(f"✅ 저장: {args.out}  ({time.time()-t0:.0f}s)")
