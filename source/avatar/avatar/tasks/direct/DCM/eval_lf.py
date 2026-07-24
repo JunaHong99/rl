@@ -67,6 +67,7 @@ print(f"✅ {os.path.basename(args.model_path)}  action_dim={A}  global_dim={gc.
 env.reset(); batch = env._build_policy_batch()
 rr_min_pos = torch.full((B,), float("inf"), device=dev)
 rr_min_rot = torch.full((B,), float("inf"), device=dev)
+rr_reached = torch.zeros(B, dtype=torch.bool, device=dev)   # ★ 동시 도달(pos&rot 같은 스텝) 여부
 rr_len = torch.zeros(B, dtype=torch.long, device=dev)
 rod_start = env.rod.data.root_pos_w.clone()
 rod_disp_max = torch.zeros(B, device=dev)          # 에피소드 내 rod 최대 이동량
@@ -83,14 +84,16 @@ for step in range(args.num_steps):
                                  math_utils.quat_conjugate(env.rod.data.root_quat_w))
     rot_err = 2.0 * torch.atan2(torch.norm(q_diff[:, 1:4], dim=-1), torch.abs(q_diff[:, 0]))
     rr_min_pos = torch.min(rr_min_pos, pos_err); rr_min_rot = torch.min(rr_min_rot, rot_err)
+    rr_reached |= (pos_err < POS_T) & (rot_err < ROT_T)     # ★ 이 스텝에 pos&rot 동시 만족
     rod_disp_max = torch.maximum(rod_disp_max, (rod_pos - rod_start).norm(dim=-1))
     rr_len += 1
     done = term | trunc
     if done.any():
         for i in done.nonzero(as_tuple=True)[0].tolist():
             if rr_len[i].item() > settle:
-                ep_succ.append((rr_min_pos[i].item() < POS_T) and (rr_min_rot[i].item() < ROT_T))
-            rr_min_pos[i] = float("inf"); rr_min_rot[i] = float("inf"); rr_len[i] = 0
+                ep_succ.append(bool(rr_reached[i].item()))   # 동시 도달 기준
+            rr_min_pos[i] = float("inf"); rr_min_rot[i] = float("inf"); rr_reached[i] = False
+            rr_len[i] = 0
             rod_start[i] = env.rod.data.root_pos_w[i]; rod_disp_max[i] = 0.0
     batch = env._build_policy_batch()
 

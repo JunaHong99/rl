@@ -84,7 +84,8 @@ def rollout_record(record_env):
     """한 batch rollout. record_env가 None이면 렌더 없이 성공판정만(빠름).
        int면 그 env의 프레임을 오버레이해 buf 반환. 반환: (buf, best_p(NP,), best_r(NP,))."""
     env.reset(); batch = env._build_policy_batch()
-    bp = np.full(NP, 9.9); br = np.full(NP, 999.0); buf = []
+    bp = np.full(NP, 9.9); br = np.full(NP, 999.0)
+    reached_once = np.zeros(NP, dtype=bool); buf = []
     ci = 0 if record_env is None else record_env
     for s in range(total_steps):
         if not sim_app.is_running():
@@ -99,19 +100,20 @@ def rollout_record(record_env):
         rerr = np.degrees(2.0 * np.arctan2(qd[:, 1:4].norm(dim=-1).cpu().numpy(), qd[:, 0].abs().cpu().numpy()))
         if s >= settle:                        # settle 스킵
             bp = np.minimum(bp, perr); br = np.minimum(br, rerr)
+            reached_once |= (perr < POS_T) & (rerr < ROT_T_DEG)   # ★ 이 스텝에 동시 만족
             if record_env is not None:
                 frame = env.render()
                 if frame is not None and frame.size > 0:
                     img = np.ascontiguousarray(frame[:, :, :3])
-                    reached = (bp[ci] < POS_T) and (br[ci] < ROT_T_DEG)
-                    col = (0, 220, 0) if reached else (255, 210, 0)
+                    now = (perr[ci] < POS_T) and (rerr[ci] < ROT_T_DEG)   # 지금 순간 도달중?
+                    col = (0, 220, 0) if now else (255, 210, 0)
                     cv2.putText(img, f"success clip  kin leader-follower", (20, 40),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
-                    cv2.putText(img, f"pos={bp[ci]*100:.1f}cm(<2)  rot={br[ci]:.0f}deg(<10)  {'REACHED' if reached else '...'}",
+                    cv2.putText(img, f"pos={perr[ci]*100:.1f}cm(<2)  rot={rerr[ci]:.0f}deg(<10)  {'REACHED' if now else '...'}",
                                 (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, col, 2, cv2.LINE_AA)
                     buf.append(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
         batch = env._build_policy_batch()
-    return buf, bp, br
+    return buf, bp, br, reached_once
 
 
 # 렌더 없이 여러 batch 판정 → 성공 env 좌표(batch, env_idx) 수집.
@@ -122,14 +124,14 @@ def rollout_record(record_env):
 collected = 0; attempt = 0; max_attempts = N * 4
 while collected < N and attempt < max_attempts and sim_app.is_running():
     attempt += 1
-    buf, bp, br = rollout_record(record_env=0)
-    if (bp[0] < POS_T) and (br[0] < ROT_T_DEG):
+    buf, bp, br, reached = rollout_record(record_env=0)
+    if bool(reached[0]):                       # ★ 동시 도달한 에피소드만
         for f in buf:
             writer.write(f)
         collected += 1
-        print(f"  ✅ clip {collected}/{N} (시도 {attempt})  pos={bp[0]*100:.1f}cm rot={br[0]:.0f}deg")
+        print(f"  ✅ clip {collected}/{N} (시도 {attempt})  동시도달  min pos={bp[0]*100:.1f}cm rot={br[0]:.0f}deg")
     else:
-        print(f"  ✗ env0 실패 (시도 {attempt})  pos={bp[0]*100:.1f}cm rot={br[0]:.0f}deg")
+        print(f"  ✗ env0 실패 (시도 {attempt})  min pos={bp[0]*100:.1f}cm rot={br[0]:.0f}deg")
 
 writer.release()
 print(f"✅ 저장: {args.out}  성공 {collected}/{N} ({attempt}회, {time.time()-t0:.0f}s)")
