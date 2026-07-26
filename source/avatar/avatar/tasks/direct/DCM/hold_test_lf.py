@@ -17,6 +17,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--num_envs", type=int, default=64)
 parser.add_argument("--hold_steps", type=int, default=30)
 parser.add_argument("--move_steps", type=int, default=40)
+parser.add_argument("--vary_grasp", action="store_true", help="파지 변이 켜고 팔로워 추종 검증(per-env d,θ).")
+parser.add_argument("--same_side", action="store_true")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 app = AppLauncher(args); sim_app = app.app
@@ -30,6 +32,9 @@ cfg.scene.num_envs = args.num_envs
 cfg.leader_follower = True
 cfg.action_space = 7
 cfg.n_obstacles = 0
+if args.vary_grasp:
+    cfg.vary_grasp = True
+    cfg.grasp_same_side = args.same_side
 env = DualrobotEnv(cfg, render_mode=None)
 B = args.num_envs
 J1, J2 = env.robot_1_joint_ids, env.robot_2_joint_ids
