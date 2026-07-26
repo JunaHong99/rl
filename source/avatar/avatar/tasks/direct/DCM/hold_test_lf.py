@@ -63,6 +63,13 @@ for _ in range(args.hold_steps):
     env.step(zero)
     fi = f_int(); fi_hold_max = max(fi_hold_max, fi.max().item()); fi_hold_means.append(fi.mean().item())
 dz = (rod_z() - z0).abs().max().item()
+# 진단: 팔로워/리더 IK 목표 vs 실제 hand 추종오차 (IK offset·수렴 문제 판별)
+q1c = env.robot_1.data.joint_pos[:, J1]; q2c = env.robot_2.data.joint_pos[:, J2]
+d_lead = (q1c - env._lf_q1_des).abs().max().item()          # 리더 실제vs명령 관절오차
+d_foll = (q2c - env._lf_q2_des).abs().max().item() if env._lf_q2_des is not None else -1
+# rod가 xy로도 움직였나(처짐이 z만인지 전체인지)
+rod_disp = (env.rod.data.root_pos_w[:, :3] - torch.cat([rod_xy(), z0.unsqueeze(-1)], -1)).norm(dim=-1) if False else None
+print(f"  [진단] 리더 관절 실제-명령 오차 max={d_lead:.3f}rad  팔로워 실제-IK목표 오차 max={d_foll:.3f}rad")
 fi_hold_mean = sum(fi_hold_means[-10:]) / min(10, len(fi_hold_means))
 print("\n===== Phase A: HOLD (리더 Δq=0) =====")
 print(f"  rodΔz={dz*100:.1f}cm  f_int mean={fi_hold_mean:.0f}N (max spike={fi_hold_max:.0f}N)")
