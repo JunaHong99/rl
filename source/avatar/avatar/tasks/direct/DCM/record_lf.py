@@ -94,6 +94,9 @@ def rollout_record(record_env):
         with torch.no_grad():
             action, _, _ = agent.actor.get_action_and_log_prob(batch, deterministic=True)
             _, _, term, trunc, _ = env.step(action)
+        # ★ done이면 env가 이미 자동 리셋 → 지금 rod/goal은 새 에피소드(텔레포트). 렌더/판정 말고 즉시 종료.
+        if s >= settle and (bool(term[0].item()) or bool(trunc[0].item())):
+            break
         rod = env.rod.data.root_pos_w; goal = env.goal_rod_marker.data.root_pos_w
         perr = (goal - rod).norm(dim=-1).cpu().numpy()
         qd = math_utils.quat_mul(env.goal_rod_marker.data.root_quat_w,
@@ -115,12 +118,9 @@ def rollout_record(record_env):
                     cv2.putText(img, f"pos={perr[ci]*100:.1f}cm(<2)  rot={rerr[ci]:.0f}deg(<10)  {'REACHED' if now else '...'}",
                                 (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, col, 2, cv2.LINE_AA)
                     buf.append(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-            # ★ env 0이 이번 스텝에 done(성공종료/timeout)이면 여기까지가 한 에피소드 → 중단.
-            #   (다음 스텝부터 env 0은 자동 리셋된 새 에피소드라 녹화하면 안 됨.)
-            if bool(term[0].item()) or bool(trunc[0].item()):
-                break
         batch = env._build_policy_batch()
-    return buf, bp, br, reached_once
+    sp = float(start_perr[ci]) if start_perr is not None else -1.0
+    return buf, bp, br, reached_once, sp
 
 
 # 렌더 없이 여러 batch 판정 → 성공 env 좌표(batch, env_idx) 수집.
@@ -131,14 +131,17 @@ def rollout_record(record_env):
 collected = 0; attempt = 0; max_attempts = N * 4
 while collected < N and attempt < max_attempts and sim_app.is_running():
     attempt += 1
-    buf, bp, br, reached = rollout_record(record_env=0)
-    if bool(reached[0]):                       # ★ 동시 도달한 에피소드만
+    buf, bp, br, reached, sp = rollout_record(record_env=0)
+    # genuine 성공 = 동시도달 + 시작 시 목표에서 충분히 멀었음(운반) + 프레임 있음
+    genuine = bool(reached[0]) and (sp > 0.08) and (len(buf) >= 3)
+    if genuine:
         for f in buf:
             writer.write(f)
         collected += 1
-        print(f"  ✅ clip {collected}/{N} (시도 {attempt})  동시도달  min pos={bp[0]*100:.1f}cm rot={br[0]:.0f}deg")
+        print(f"  ✅ clip {collected}/{N} (시도 {attempt})  시작{sp*100:.0f}cm→도달  min pos={bp[0]*100:.1f}cm rot={br[0]:.0f}deg  ({len(buf)}프레임)")
     else:
-        print(f"  ✗ env0 실패 (시도 {attempt})  min pos={bp[0]*100:.1f}cm rot={br[0]:.0f}deg")
+        why = "미도달" if not bool(reached[0]) else ("trivial(시작가까움)" if sp <= 0.08 else "짧음")
+        print(f"  ✗ env0 제외:{why} (시도 {attempt})  시작{sp*100:.0f}cm  min pos={bp[0]*100:.1f}cm rot={br[0]:.0f}deg")
 
 writer.release()
 print(f"✅ 저장: {args.out}  성공 {collected}/{N} ({attempt}회, {time.time()-t0:.0f}s)")
