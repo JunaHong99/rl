@@ -99,9 +99,7 @@ class DualrobotEnv(DirectRLEnv):
         if getattr(self.cfg, "joint_action", False):
             self._internal_w = float(getattr(self.cfg, "w_internal", 0.0))
             self._f_safe = float(getattr(self.cfg, "f_int_safe", 0.0))
-        # 리더-팔로워(feedforward): 두 grasp가 rod 양끝(±0.4)에 고정 → 팔로워 EE = 리더 EE + 0.8m·(리더 EE x축).
-        if getattr(self.cfg, "leader_follower", False):
-            self._lf_sep = 2.0 * 0.4    # rod 길이 = 두 grasp 간 거리 [m]
+        # 리더-팔로워: 팔로워 EE는 _follower_ik에서 rod-매개(per-env grasp offset)로 계산. _lf_sep 불필요.
 
         # (관절 인덱스 등은 나중에 필요시 여기에 추가)
         self.robot_1_joint_ids = self.robot_1.actuators["all_joints"].joint_indices
@@ -608,26 +606,53 @@ class DualrobotEnv(DirectRLEnv):
 
     def _follower_ik(self):
         """팔로워(arm2) 관절 목표 (★feedforward = Hong2025식): 실제 rod가 아니라 **리더 *명령* config의
-        FK**로 팔로워 EE 목표를 예측 → 되먹임 고리 제거(feedback은 발산). 두 grasp는 rod에 고정이라
-        팔로워 EE = 리더 EE + (rod길이 0.8m)·(리더 EE x축), 자세 동일. → 팔로워 base frame IK."""
+        FK**로 팔로워 EE 목표를 예측 → 되먹임 고리 제거(feedback은 발산).
+        ★ rod-매개(파지 변이 대응): 리더 EE → rod pose 역산 → per-env grasp offset으로 팔로워 EE.
+          리더 EE = rod·T1(d,θ) → rod = 리더EE·T1⁻¹ ; 팔로워 EE = rod·T2(d,θ).
+          T_i = (off_pos_i, off_quat_i): 리더=(-d,0,TCP)/q1, 팔로워=(+d,0,TCP)/q2. 고정파지면 d=0.4,θ=0."""
         sampler = self.pose_sampler._base
         ik = sampler.ik_solver
-        # 1. 리더 EE (리더 base frame) = FK(리더 명령 q1_des) → world
+        B = self.num_envs; dev = self.device
+        # 1. 리더 EE(world) = base·FK(q1_des)
         fk_p, fk_R = ik.forward_kinematics(self._lf_q1_des)
         b1_p = self.robot_1.data.root_pos_w; b1_q = self.robot_1.data.root_quat_w
         R_b1 = sampler._quat_to_matrix(b1_q)
-        lead_p = torch.bmm(R_b1, fk_p.unsqueeze(2)).squeeze(2) + b1_p          # world
-        lead_R = torch.bmm(R_b1, fk_R)
-        # 2. 팔로워 EE = 리더 EE + 0.8·(리더 EE x축), 자세 동일 (두 grasp가 rod 양끝 고정)
-        fol_p = lead_p + self._lf_sep * lead_R[:, :, 0]
-        fol_R = lead_R
-        # 3. 팔로워 base frame → IK (warm-start = 현재 q2)
+        lead_p = torch.bmm(R_b1, fk_p.unsqueeze(2)).squeeze(2) + b1_p          # (B,3) world
+        lead_R = torch.bmm(R_b1, fk_R)                                        # (B,3,3)
+        # 2. per-env grasp offset (rod frame). off1=리더, off2=팔로워.
+        off_p1, off_R1, off_p2, off_R2 = self._lf_grasp_offsets()             # (B,3),(B,3,3) ×2
+        # 3. rod = 리더EE · T1⁻¹  →  R_rod = lead_R·off_R1ᵀ ,  p_rod = lead_p − R_rod·off_p1
+        R_rod = torch.bmm(lead_R, off_R1.transpose(1, 2))
+        p_rod = lead_p - torch.bmm(R_rod, off_p1.unsqueeze(2)).squeeze(2)
+        # 4. 팔로워 EE = rod · T2
+        fol_R = torch.bmm(R_rod, off_R2)
+        fol_p = p_rod + torch.bmm(R_rod, off_p2.unsqueeze(2)).squeeze(2)
+        # 5. 팔로워 base frame → IK (warm-start = 현재 q2)
         b2_p = self.robot_2.data.root_pos_w; b2_q = self.robot_2.data.root_quat_w
         R_b2_T = sampler._quat_to_matrix(b2_q).transpose(1, 2)
         ee_loc_p = torch.bmm(R_b2_T, (fol_p - b2_p).unsqueeze(2)).squeeze(2)
         ee_loc_R = torch.bmm(R_b2_T, fol_R)
         q2_cur = self.robot_2.data.joint_pos[:, self.robot_2_joint_ids]
         return ik.solve_ik_gradient(ee_loc_p, ee_loc_R, q_init=q2_cur, max_iter=int(self.cfg.lf_ik_iters))
+
+    def _lf_grasp_offsets(self):
+        """rod frame 기준 양팔 grasp offset (pos, R) 반환. 파지변이면 per-env (_grasp_d/q1/q2), 아니면 고정.
+        리더 off_pos=(-d,0,TCP)/off_R=R(q1);  팔로워 off_pos=(+d,0,TCP)/off_R=R(q2). (B,3),(B,3,3) ×2."""
+        B = self.num_envs; dev = self.device
+        sampler = self.pose_sampler._base
+        TCP = VectorizedPoseSampler.TCP_OFFSET
+        if getattr(self, "_grasp_d", None) is not None:      # 파지 변이: per-env
+            d = self._grasp_d.unsqueeze(-1)                                    # (B,1)
+            q1 = self._grasp_q1; q2 = self._grasp_q2                           # (B,4)
+        else:                                                # 고정 파지: d=0.4, θ=0(→Rx(π))
+            d = torch.full((B, 1), 0.4, device=dev)
+            rxpi = torch.tensor([0., 1., 0., 0.], device=dev).expand(B, 4)
+            q1 = rxpi; q2 = rxpi
+        z = torch.zeros_like(d); tcp = torch.full_like(d, TCP)
+        off_p1 = torch.cat([-d, z, tcp], dim=-1)                              # (B,3)
+        off_p2 = torch.cat([+d, z, tcp], dim=-1)
+        off_R1 = sampler._quat_to_matrix(q1); off_R2 = sampler._quat_to_matrix(q2)
+        return off_p1, off_R1, off_p2, off_R2
 
     def _apply_action(self) -> None:
         """target_obj_pos/quat를 controller로 joint torque에 매핑해 양 arm에 인가."""
