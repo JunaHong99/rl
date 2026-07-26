@@ -636,8 +636,10 @@ class DualrobotEnv(DirectRLEnv):
         return ik.solve_ik_gradient(ee_loc_p, ee_loc_R, q_init=q2_cur, max_iter=int(self.cfg.lf_ik_iters))
 
     def _lf_grasp_offsets(self):
-        """rod frame 기준 양팔 grasp offset (pos, R) 반환. 파지변이면 per-env (_grasp_d/q1/q2), 아니면 고정.
-        리더 off_pos=(-d,0,TCP)/off_R=R(q1);  팔로워 off_pos=(+d,0,TCP)/off_R=R(q2). (B,3),(B,3,3) ×2."""
+        """rod frame 기준 양팔 **EE(panda_hand origin)** offset (pos, R). 용접 구조 정확 반영:
+          용접: hand의 (0,0,TCP)점 = rod의 (±d,0,0)점, hand자세 R = R_rod·R_grasp(q_i).
+          ⇒ EE자세(rod frame) = R_grasp(q_i);  EE위치(rod frame) = (±d,0,0) − R_grasp·(0,0,TCP).
+        (내가 (±d,0,TCP)로 두던 건 θ=0에서만 맞고 θ≠0이면 틀림 → rod 처짐 버그.)"""
         B = self.num_envs; dev = self.device
         sampler = self.pose_sampler._base
         TCP = VectorizedPoseSampler.TCP_OFFSET
@@ -648,10 +650,13 @@ class DualrobotEnv(DirectRLEnv):
             d = torch.full((B, 1), 0.4, device=dev)
             rxpi = torch.tensor([0., 1., 0., 0.], device=dev).expand(B, 4)
             q1 = rxpi; q2 = rxpi
-        z = torch.zeros_like(d); tcp = torch.full_like(d, TCP)
-        off_p1 = torch.cat([-d, z, tcp], dim=-1)                              # (B,3)
-        off_p2 = torch.cat([+d, z, tcp], dim=-1)
-        off_R1 = sampler._quat_to_matrix(q1); off_R2 = sampler._quat_to_matrix(q2)
+        z = torch.zeros_like(d)
+        off_R1 = sampler._quat_to_matrix(q1); off_R2 = sampler._quat_to_matrix(q2)   # EE 자세 = R_grasp
+        tcp_vec = torch.cat([z, z, torch.full_like(d, TCP)], dim=-1)          # (B,3) = (0,0,TCP)
+        grasp_pt1 = torch.cat([-d, z, z], dim=-1); grasp_pt2 = torch.cat([+d, z, z], dim=-1)  # (±d,0,0)
+        # EE위치 = 파지점 − R_grasp·(0,0,TCP)
+        off_p1 = grasp_pt1 - torch.bmm(off_R1, tcp_vec.unsqueeze(2)).squeeze(2)
+        off_p2 = grasp_pt2 - torch.bmm(off_R2, tcp_vec.unsqueeze(2)).squeeze(2)
         return off_p1, off_R1, off_p2, off_R2
 
     def _apply_action(self) -> None:
