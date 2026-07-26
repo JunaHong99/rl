@@ -270,6 +270,7 @@ class DualrobotCfg(DirectRLEnvCfg):
     #   joint_action과 동일하게 포지션 액추에이터(joint_kp/kd) 사용.
     leader_follower: bool = False
     lf_ik_iters: int = 12             # 팔로워 IK warm-start 반복(작게=빠름, 스텝간 모션 작아 수렴).
+    lf_grav_comp: bool = False        # 리더-팔로워 중력보상 feedforward(G(q)). 파지변이 불리한 자세 sag 방지.
     # kinematic 그래프 관측(17노드 base+joint+rod). leader_follower와 함께 씀. GNN 정책(gnn_policy_kin).
     #   파지 폭/각도=grasp 엣지, base 간격=base-rel 엣지, 관절 feasibility=joint 노드 → morphology 일반화.
     use_kin_graph: bool = False

@@ -613,7 +613,7 @@ class DualrobotEnv(DirectRLEnv):
         sampler = self.pose_sampler._base
         ik = sampler.ik_solver
         B = self.num_envs; dev = self.device
-        # 1. 리더 EE(world) = base·FK(q1_des)
+        # 1. 리더 EE(world) = base·FK(q1_des 명령). (실제 관절 사용은 노이즈로 더 나빴음 → 명령 유지.)
         fk_p, fk_R = ik.forward_kinematics(self._lf_q1_des)
         b1_p = self.robot_1.data.root_pos_w; b1_q = self.robot_1.data.root_quat_w
         R_b1 = sampler._quat_to_matrix(b1_q)
@@ -636,10 +636,10 @@ class DualrobotEnv(DirectRLEnv):
         return ik.solve_ik_gradient(ee_loc_p, ee_loc_R, q_init=q2_cur, max_iter=int(self.cfg.lf_ik_iters))
 
     def _lf_grasp_offsets(self):
-        """rod frame 기준 양팔 **EE(panda_hand origin)** offset (pos, R). 용접 구조 정확 반영:
-          용접: hand의 (0,0,TCP)점 = rod의 (±d,0,0)점, hand자세 R = R_rod·R_grasp(q_i).
-          ⇒ EE자세(rod frame) = R_grasp(q_i);  EE위치(rod frame) = (±d,0,0) − R_grasp·(0,0,TCP).
-        (내가 (±d,0,TCP)로 두던 건 θ=0에서만 맞고 θ≠0이면 틀림 → rod 처짐 버그.)"""
+        """rod frame 기준 양팔 **FK-EE**(IK 솔버 FK가 반환하는 프레임) offset (pos, R). ★샘플러 convention:
+          FK-EE 위치(rod frame) = (±d, 0, TCP), 자세 = R_grasp(q_i). (diag_follower_offset로 측정 확인:
+          측정 off = (±d,0,~TCP), z가 각도 따라 미세변동은 grasp_quat이 흡수 → off_pos=(±d,0,TCP) + off_R=R_grasp.)
+          이게 pose_sampler.sample_episodes의 grasp_off(off_pos=(±d,0,z_offset=TCP), off_quat=grasp_quat)와 동일."""
         B = self.num_envs; dev = self.device
         sampler = self.pose_sampler._base
         TCP = VectorizedPoseSampler.TCP_OFFSET
@@ -650,13 +650,10 @@ class DualrobotEnv(DirectRLEnv):
             d = torch.full((B, 1), 0.4, device=dev)
             rxpi = torch.tensor([0., 1., 0., 0.], device=dev).expand(B, 4)
             q1 = rxpi; q2 = rxpi
-        z = torch.zeros_like(d)
-        off_R1 = sampler._quat_to_matrix(q1); off_R2 = sampler._quat_to_matrix(q2)   # EE 자세 = R_grasp
-        tcp_vec = torch.cat([z, z, torch.full_like(d, TCP)], dim=-1)          # (B,3) = (0,0,TCP)
-        grasp_pt1 = torch.cat([-d, z, z], dim=-1); grasp_pt2 = torch.cat([+d, z, z], dim=-1)  # (±d,0,0)
-        # EE위치 = 파지점 − R_grasp·(0,0,TCP)
-        off_p1 = grasp_pt1 - torch.bmm(off_R1, tcp_vec.unsqueeze(2)).squeeze(2)
-        off_p2 = grasp_pt2 - torch.bmm(off_R2, tcp_vec.unsqueeze(2)).squeeze(2)
+        z = torch.zeros_like(d); tcp = torch.full_like(d, TCP)
+        off_p1 = torch.cat([-d, z, tcp], dim=-1)                              # (B,3) = (-d,0,TCP)
+        off_p2 = torch.cat([+d, z, tcp], dim=-1)                              # (+d,0,TCP)
+        off_R1 = sampler._quat_to_matrix(q1); off_R2 = sampler._quat_to_matrix(q2)
         return off_p1, off_R1, off_p2, off_R2
 
     def _apply_action(self) -> None:
@@ -668,6 +665,13 @@ class DualrobotEnv(DirectRLEnv):
             self.robot_1.set_joint_position_target(self._lf_q1_des, joint_ids=self.robot_1_joint_ids)
             if getattr(self, "_lf_q2_des", None) is not None:
                 self.robot_2.set_joint_position_target(self._lf_q2_des, joint_ids=self.robot_2_joint_ids)
+            # ★ 중력보상 feedforward: ImplicitActuator가 τ=kp·err−kd·q̇+effort로 더함(actuator_pd.py:138).
+            #   파지 변이의 불리한 자세에서 kp만으론 sag(처짐) → G(q)를 feedforward로 상쇄 → 자세무관 hold.
+            if getattr(self.cfg, "lf_grav_comp", False):
+                self.robot_1.set_joint_effort_target(
+                    self._gravity_comp(self.robot_1, self.robot_1_joint_ids), joint_ids=self.robot_1_joint_ids)
+                self.robot_2.set_joint_effort_target(
+                    self._gravity_comp(self.robot_2, self.robot_2_joint_ids), joint_ids=self.robot_2_joint_ids)
             return
         tau_1, tau_2, info = self.controller.compute_torques(
             self.target_obj_pos, self.target_obj_quat, self.target_x_rel,
