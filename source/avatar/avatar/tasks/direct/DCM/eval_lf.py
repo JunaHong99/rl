@@ -53,9 +53,15 @@ scale = [float(cfg.joint_dq_scale)] * A
 sd = torch.load(os.path.abspath(args.model_path), map_location=dev, weights_only=False)["model"]
 if args.use_kin_graph:
     import gnn_policy_kin
-    agent = gnn_policy_kin.KinSACAgent(num_rounds=args.num_rounds, action_scale=scale).to(dev)
+    # 체크포인트 키로 KinGNN(joint_head) vs KinMLP(mean_head) 자동 판별.
+    is_kinmlp = any("actor.mean_head" in k for k in sd.keys())
+    if is_kinmlp:
+        agent = gnn_policy_kin.KinMLPSACAgent(action_scale=scale).to(dev)
+        print("🧠 KinMLP 로드 (flatten ablation)")
+    else:
+        agent = gnn_policy_kin.KinSACAgent(num_rounds=args.num_rounds, action_scale=scale).to(dev)
+        print(f"🕸️ KinGNN 로드 (rounds={args.num_rounds})")
     agent.load_state_dict(sd); agent.eval()
-    print(f"🕸️ KinGNN 로드 (rounds={args.num_rounds})")
 else:
     agent = mlp_policy.MLPSACAgent(action_dim=A, action_scale=scale, hidden_dim=256,
                                    num_hidden_layers=2, use_full_state=False, use_lean_obstacle=False).to(dev)

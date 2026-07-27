@@ -131,3 +131,89 @@ class KinSACAgent(nn.Module):
         for p_target, p in zip(self.q_target.parameters(), self.q.parameters()):
             p_target.data.mul_(1 - tau)
             p_target.data.add_(tau * p.data)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# KinMLP — 공정 ablation: kin 그래프와 *같은 정보*(전 노드+전 엣지+global)를 flat하게 받되
+#   message passing/그래프 구조 없음(순수 MLP). → "그래프 구조가 파지 일반화에 기여하나" 판별.
+#   입력 = 17노드×12 + 34엣지×13 + global 2 = 648. 출력 = 리더 Δq 7 (KinActor와 동일).
+# ──────────────────────────────────────────────────────────────────────
+def _flatten_kin_batch(batch):
+    """kin Batch → (B, 648) flat 벡터 (전 노드 feat + 전 엣지 feat + global)."""
+    B = batch.num_graphs
+    x = batch.x.view(B, gk.NODES_PER_ENV * gk.NODE_FEATURE_DIM)          # (B, 204)
+    e = batch.edge_attr.view(B, gk.N_EDGES_PER_ENV * gk.EDGE_FEATURE_DIM)  # (B, 442)
+    return torch.cat([x, e, batch.u], dim=-1)                            # (B, 648)
+
+
+_KIN_FLAT_DIM = (gk.NODES_PER_ENV * gk.NODE_FEATURE_DIM
+                 + gk.N_EDGES_PER_ENV * gk.EDGE_FEATURE_DIM
+                 + gk.GLOBAL_FEATURE_DIM)
+
+
+class KinMLPActor(nn.Module):
+    """flatten(kin batch) → MLP → 7D Δq. GNN과 정보 동일, 구조(message passing)만 없음."""
+    LOG_STD_MIN, LOG_STD_MAX, EPS = -5.0, 2.0, 1e-6
+
+    def __init__(self, action_scale, init_log_std=0.0, hidden_dim=512, num_layers=3):
+        super().__init__()
+        self.action_dim = gk.N_ARM_JOINTS
+        if isinstance(action_scale, (int, float)):
+            action_scale = torch.full((self.action_dim,), float(action_scale))
+        elif isinstance(action_scale, (list, tuple)):
+            action_scale = torch.tensor(action_scale, dtype=torch.float32)
+        self.register_buffer("action_scale", action_scale.float())
+        self.mean_head = gnn_core.MLP(_KIN_FLAT_DIM, hidden_dim=hidden_dim, num_layers=num_layers,
+                                      output_dim=self.action_dim)
+        self.log_std = nn.Parameter(torch.full((self.action_dim,), init_log_std))
+
+    def forward(self, batch):
+        mean_raw = self.mean_head(_flatten_kin_batch(batch))
+        return mean_raw, self.log_std.clamp(self.LOG_STD_MIN, self.LOG_STD_MAX)
+
+    def get_action_and_log_prob(self, batch, deterministic=False):
+        mean_raw, log_std = self.forward(batch)
+        if deterministic:
+            return self.action_scale * torch.tanh(mean_raw), None, None
+        std = torch.exp(log_std)
+        dist = Normal(mean_raw, std)
+        u = dist.rsample()
+        a_norm = torch.tanh(u)
+        log_prob = dist.log_prob(u) - torch.log(1.0 - a_norm.pow(2) + self.EPS)
+        return self.action_scale * a_norm, log_prob.sum(dim=-1, keepdim=True), None
+
+
+class KinMLPQCritic(nn.Module):
+    def __init__(self, action_dim=7, hidden_dim=512, num_layers=3):
+        super().__init__()
+        self.q_head = gnn_core.MLP(_KIN_FLAT_DIM + action_dim, hidden_dim=hidden_dim,
+                                   num_layers=num_layers, output_dim=1)
+
+    def forward(self, batch, action):
+        return self.q_head(torch.cat([_flatten_kin_batch(batch), action], dim=-1))
+
+
+class KinMLPTwinQ(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.q1 = KinMLPQCritic(); self.q2 = KinMLPQCritic()
+
+    def forward(self, batch, action):
+        return self.q1(batch, action), self.q2(batch, action)
+
+
+class KinMLPSACAgent(nn.Module):
+    """SAC ablation: KinMLP(flatten) actor + twin Q. KinSACAgent와 인터페이스 동일."""
+    def __init__(self, action_scale=None, **kw):
+        super().__init__()
+        self.actor = KinMLPActor(action_scale=action_scale)
+        self.q = KinMLPTwinQ()
+        self.q_target = KinMLPTwinQ()
+        self.q_target.load_state_dict(self.q.state_dict())
+        for p in self.q_target.parameters():
+            p.requires_grad = False
+
+    def soft_update_target(self, tau: float = 0.005):
+        for p_target, p in zip(self.q_target.parameters(), self.q.parameters()):
+            p_target.data.mul_(1 - tau)
+            p_target.data.add_(tau * p.data)

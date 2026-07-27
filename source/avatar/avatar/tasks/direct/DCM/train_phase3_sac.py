@@ -241,11 +241,14 @@ def main():
         print(f"🦿 joint MLP: state=rod+global(dim {_gc.GLOBAL_FEATURE_DIM}), action_scale={env_cfg.joint_dq_scale}×{env.cfg.action_space}")
     if getattr(env.cfg, "use_kin_graph", False):
         import gnn_policy_kin
-        agent = gnn_policy_kin.KinSACAgent(
-            num_rounds=args.num_rounds,
-            action_scale=[float(env_cfg.joint_dq_scale)] * env.cfg.action_space,
-        ).to(device)
-        print(f"🕸️ Kinematic GNN SAC (17노드, 리더 joint 출력): action_dim={env.cfg.action_space} rounds={args.num_rounds}")
+        _sc = [float(env_cfg.joint_dq_scale)] * env.cfg.action_space
+        if args.use_mlp:
+            # ablation: kin 그래프와 같은 정보(전 노드+엣지+global) flat → MLP (구조만 없음).
+            agent = gnn_policy_kin.KinMLPSACAgent(action_scale=_sc).to(device)
+            print(f"🧠 Kinematic MLP SAC (flatten ablation): action_dim={env.cfg.action_space} (그래프 구조 없음)")
+        else:
+            agent = gnn_policy_kin.KinSACAgent(num_rounds=args.num_rounds, action_scale=_sc).to(device)
+            print(f"🕸️ Kinematic GNN SAC (17노드, 리더 joint 출력): action_dim={env.cfg.action_space} rounds={args.num_rounds}")
     elif args.use_mlp:
         agent = mlp_policy.MLPSACAgent(
             action_dim=env.cfg.action_space,
