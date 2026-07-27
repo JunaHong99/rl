@@ -99,6 +99,8 @@ parser.add_argument("--lf_dense_progress", action="store_true",
                     help="dense progress 보상(Cartesian rod 접근량). sparse+HER가 리더관절 액션엔 약해 학습 굶는 것 보강.")
 parser.add_argument("--use_kin_graph", action="store_true",
                     help="kinematic 그래프 관측(17노드) + KinGNN 정책(리더 joint 출력). leader_follower와 함께. morphology 일반화.")
+parser.add_argument("--no_gravity", action="store_true",
+                    help="로봇+rod 중력 OFF. 파지 pose 일반화 단계(무게 무관)에서 sag 제거.")
 parser.add_argument("--use_hard_safety", action="store_true",
                     help="팔 hard 안전 필터 ON으로 학습 (충돌 0 지향). RoboBallet velocity-zeroing 근사(제동토크).")
 parser.add_argument("--use_swivel_nullspace", action="store_true",
@@ -194,6 +196,9 @@ def main():
     if args.use_kin_graph:
         env_cfg.use_kin_graph = True
         print("🕸️ kinematic 그래프 관측 ON (17노드 base+joint+rod). KinGNN 정책.")
+    if args.no_gravity:
+        env_cfg.disable_gravity_all = True
+        print("🪶 중력 OFF (로봇+rod): 파지 일반화 단계 sag 제거. 무게/sim-to-real 때 다시 ON.")
     if args.use_hard_safety:
         env_cfg.use_hard_safety = True
         print("🛡️  hard safety filter ON (팔 충돌 0 지향)")

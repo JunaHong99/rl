@@ -23,6 +23,8 @@ parser.add_argument("--kp", type=float, default=None, help="포지션 stiffness 
 parser.add_argument("--kd", type=float, default=None)
 parser.add_argument("--ik_iters", type=int, default=None)
 parser.add_argument("--grav_comp", action="store_true", help="중력보상 feedforward ON.")
+parser.add_argument("--follower_hold", action="store_true", help="팔로워 IK 끄고 q_start 고정(처짐 원인 판별).")
+parser.add_argument("--no_gravity", action="store_true", help="중력 OFF(로봇+rod).")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 app = AppLauncher(args); sim_app = app.app
@@ -40,6 +42,8 @@ if args.kp is not None: cfg.joint_kp = args.kp
 if args.kd is not None: cfg.joint_kd = args.kd
 if args.ik_iters is not None: cfg.lf_ik_iters = args.ik_iters
 if args.grav_comp: cfg.lf_grav_comp = True
+if args.follower_hold: cfg.lf_follower_hold = True
+if args.no_gravity: cfg.disable_gravity_all = True
 if args.vary_grasp:
     cfg.vary_grasp = True
     cfg.grasp_same_side = args.same_side
@@ -64,8 +68,14 @@ def rod_xy():
 
 # ── Phase A: HOLD (리더 Δq=0) ──
 env.reset()
-z0 = rod_z().clone()
 zero = torch.zeros(B, 7, device=dev)
+# ★ 초기 snap(reset 시 rod-hand 배치 불일치를 PhysX가 강제정렬) 흡수 후 z0 기록 → 순수 '이후 처짐'만 측정.
+z_reset = rod_z().clone()                         # reset 직후(snap 전)
+for _ in range(35):                               # env 내부 settle(30)+여유 → snap 완전 흡수
+    env.step(zero)
+z0 = rod_z().clone()                              # snap 후 기준
+snap_dz = (z0 - z_reset).abs().mean().item()
+print(f"  [snap] reset→settle후 rod z 이동 mean={snap_dz*100:.1f}cm (초기 배치 불일치 흡수량)")
 fi_hold_max = 0.0; fi_hold_means = []
 for _ in range(args.hold_steps):
     env.step(zero)

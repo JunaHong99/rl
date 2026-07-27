@@ -74,6 +74,12 @@ class DualrobotEnv(DirectRLEnv):
                 _act.stiffness = float(cfg.joint_kp)
                 _act.damping = float(cfg.joint_kd)
                 _act.effort_limit_sim = float(getattr(cfg, "joint_effort_limit", 87.0))
+        # 중력 비활성(파지 pose 일반화 단계): 중력 처짐(sag)이 파지 변이 학습을 흐림 → OFF.
+        #   목표=기구학(파지) 일반화라 물체무게 무관. 나중 무게/sim-to-real 때 다시 ON.
+        if getattr(cfg, "disable_gravity_all", False):
+            cfg.robot_1.spawn.rigid_props.disable_gravity = True
+            cfg.robot_2.spawn.rigid_props.disable_gravity = True
+            cfg.rod.spawn.rigid_props.disable_gravity = True
         super().__init__(cfg, render_mode, **kwargs)
 
         # Phase A (2026-05-26): CachedPoseSampler 사용. 학습 시작 시 100k samples 사전 생성 +
@@ -455,7 +461,10 @@ class DualrobotEnv(DirectRLEnv):
             if getattr(self, "_lf_q1_des", None) is None:
                 self._lf_q1_des = self.robot_1.data.joint_pos[:, self.robot_1_joint_ids].clone()
             self._lf_q1_des = self._lf_q1_des + self.cfg.joint_dq_scale * self.actions[:, :7]
-            self._lf_q2_des = self._follower_ik()      # 팔로워 추종 (control rate 1회)
+            if getattr(self.cfg, "lf_follower_hold", False):
+                pass                                    # 디버그: 팔로워 IK 끄고 q_start 고정(_lf_q2_des 유지)
+            else:
+                self._lf_q2_des = self._follower_ik()  # 팔로워 추종 (control rate 1회)
             return
         pos_disp = self.actions[:, 0:3]
         rot_aa = self.actions[:, 3:6]
