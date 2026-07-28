@@ -22,6 +22,7 @@ parser.add_argument("--vary_grasp", action="store_true", help="파지 변이(학
 parser.add_argument("--same_side", action="store_true")
 parser.add_argument("--no_gravity", action="store_true", help="중력 OFF(학습과 일치).")
 parser.add_argument("--grasp_preset", type=str, default=None, help="held-out 파지 세트(.pt, gen_grasp로 생성). 없으면 학습 8버킷.")
+parser.add_argument("--cache_size", type=int, default=20000, help="reset용 pose 캐시(eval은 작게=빠름. 학습은 100k). preset 캐시 생성 가속.")
 parser.add_argument("--stochastic", action="store_true", help="탐험 확인용(기본 deterministic).")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -49,6 +50,7 @@ if args.no_gravity:
     cfg.disable_gravity_all = True
 if args.grasp_preset:
     cfg.grasp_preset_path = args.grasp_preset   # held-out 파지 주입(랜덤 8버킷 대신)
+cfg.pose_cache_size = args.cache_size           # eval은 작게 → preset 캐시 생성 빠름
 # train과 동일: leader_follower=time+리더sin/cos(14)+f_int+base pos(3)+rot6d(6)=25, joint=time+28+1=30
 if args.leader_follower and not args.use_kin_graph:
     gc.GLOBAL_FEATURE_DIM = 1 + 14 + 1 + 3 + 6
