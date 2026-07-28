@@ -60,11 +60,10 @@ class KinActor(nn.Module):
         elif isinstance(action_scale, (list, tuple)):
             action_scale = torch.tensor(action_scale, dtype=torch.float32)
         self.register_buffer("action_scale", action_scale.float())
-        # 공유 per-joint head: [joint 노드 raw + MP embedding + ★rod goal오차(직접) + global] → 스칼라 Δq.
-        #   ★공정성: MLP는 flatten에 rod goal(idx8) 직접 포함 → GNN actor도 goal을 message passing만이 아닌
-        #     직접 skip으로 봐야 공정(리더 joint 노드 raw엔 goal 없음 → 전파 의존 = 불리했음).
-        head_in = (gk.NODE_FEATURE_DIM + backbone.out_node_dim
-                   + gk.OBJECT_RAW_DIM + gk.GLOBAL_FEATURE_DIM)
+        # 공유 per-joint head: [joint 노드 raw + MP embedding + global(goal 포함)] → 스칼라 Δq.
+        #   ★goal은 global feature(u)로 이동 → backbone message passing이 모든 노드에 전파(actor/critic 자동).
+        #     global을 head에도 skip(전파 보강 + MLP와 공정).
+        head_in = gk.NODE_FEATURE_DIM + backbone.out_node_dim + gk.GLOBAL_FEATURE_DIM
         self.joint_head = gnn_core.MLP(head_in, hidden_dim=256, num_layers=2, output_dim=1)
         # per-joint log_std (7개, state-independent)
         self.log_std = nn.Parameter(torch.full((self.action_dim,), init_log_std))
@@ -75,11 +74,8 @@ class KinActor(nn.Module):
         idx = _leader_joint_gather_idx(B, x.device)                  # (B,7)
         mp = x[idx]                                                  # (B,7,node_dim) MP
         raw = batch.x[idx]                                           # (B,7,NODE_FEATURE_DIM) joint raw skip
-        # ★ rod goal오차(직접) + global을 7 joint에 broadcast (MLP와 동일 정보 접근).
-        rod_i = gk.ROD_IDX + torch.arange(B, device=x.device) * gk.NODES_PER_ENV
-        goal = batch.x[rod_i][:, :gk.OBJECT_RAW_DIM]                 # (B,9) rod goal오차
-        gb = torch.cat([goal, batch.u], dim=-1).unsqueeze(1).expand(B, 7, -1)  # (B,7,9+2)
-        h = torch.cat([raw, mp, gb], dim=-1)                        # (B,7, head_in)
+        gb = batch.u.unsqueeze(1).expand(B, 7, -1)                  # (B,7,global) — goal 포함
+        h = torch.cat([raw, mp, gb], dim=-1)
         mean_raw = self.joint_head(h).squeeze(-1)                    # (B,7)
         log_std = self.log_std.clamp(self.LOG_STD_MIN, self.LOG_STD_MAX)
         return mean_raw, log_std
@@ -98,23 +94,19 @@ class KinActor(nn.Module):
 
 
 class KinQCritic(nn.Module):
-    """Q(s,a): backbone → global mean-pool + global + ★rod goal(직접) + action → scalar.
-    ★공정성: mean-pool은 goal(rod노드)을 1/17 희석 → MLP critic(full flatten)과 맞추려 goal 직접 skip."""
+    """Q(s,a): backbone → global mean-pool + global(goal 포함) + action → scalar (노드 수 무관).
+    goal은 global(u)에 있어 backbone 통과 → mean-pool + u로 반영."""
     def __init__(self, backbone: KinBackbone, action_dim=7):
         super().__init__()
         self.backbone = backbone
-        head_in = (backbone.out_node_dim + backbone.out_global_dim
-                   + gk.OBJECT_RAW_DIM + action_dim)
+        head_in = backbone.out_node_dim + backbone.out_global_dim + action_dim
         self.q_head = gnn_core.MLP(head_in, hidden_dim=256, num_layers=2, output_dim=1)
 
     def forward(self, batch, action):
         from torch_scatter import scatter_mean
         x, _, u = self.backbone(batch)
         x_pool = scatter_mean(x, batch.batch, dim=0)                 # (B, node_dim)
-        B = batch.num_graphs
-        rod_i = gk.ROD_IDX + torch.arange(B, device=x.device) * gk.NODES_PER_ENV
-        goal = batch.x[rod_i][:, :gk.OBJECT_RAW_DIM]                 # (B,9) rod goal 직접
-        return self.q_head(torch.cat([x_pool, u, goal, action], dim=-1))
+        return self.q_head(torch.cat([x_pool, u, action], dim=-1))
 
 
 class KinTwinQ(nn.Module):
@@ -147,14 +139,15 @@ class KinSACAgent(nn.Module):
 # ──────────────────────────────────────────────────────────────────────
 # KinMLP — 공정 ablation: kin 그래프와 *같은 정보*(전 노드+전 엣지+global)를 flat하게 받되
 #   message passing/그래프 구조 없음(순수 MLP). → "그래프 구조가 파지 일반화에 기여하나" 판별.
-#   입력 = 17노드×12 + 34엣지×13 + global 2 = 648. 출력 = 리더 Δq 7 (KinActor와 동일).
+#   입력 = 17노드×10 + 34엣지×13 + global 11 = 623. 출력 = 리더 Δq 7 (KinActor와 동일).
+#   ★goal은 global(11)에 포함 → GNN(u)·MLP(flat u) 둘 다 동일하게 goal 직접 접근(공정).
 # ──────────────────────────────────────────────────────────────────────
 def _flatten_kin_batch(batch):
-    """kin Batch → (B, 648) flat 벡터 (전 노드 feat + 전 엣지 feat + global)."""
+    """kin Batch → (B, 623) flat 벡터 (전 노드 feat + 전 엣지 feat + global)."""
     B = batch.num_graphs
-    x = batch.x.view(B, gk.NODES_PER_ENV * gk.NODE_FEATURE_DIM)          # (B, 204)
+    x = batch.x.view(B, gk.NODES_PER_ENV * gk.NODE_FEATURE_DIM)          # (B, 170)
     e = batch.edge_attr.view(B, gk.N_EDGES_PER_ENV * gk.EDGE_FEATURE_DIM)  # (B, 442)
-    return torch.cat([x, e, batch.u], dim=-1)                            # (B, 648)
+    return torch.cat([x, e, batch.u], dim=-1)                            # (B, 623)
 
 
 _KIN_FLAT_DIM = (gk.NODES_PER_ENV * gk.NODE_FEATURE_DIM

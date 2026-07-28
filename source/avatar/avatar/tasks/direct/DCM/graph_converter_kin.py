@@ -19,9 +19,10 @@ lean 3-node(EE만)로는 파지/base 변이 시 관절 상태를 표현 못 함(
 
 노드 feature (타입별 raw + one-hot):
     base:   0 (identity)
-    joint:  축(3) + 값 sin/cos(2) + margin(min·max, 2) + 0(type은 one-hot) = 7
-    object: goal오차 base-frame pos(3) + rot6d(6) = 9
-    → padded max(9) + type one-hot(3) = NODE_FEATURE_DIM 12
+    joint:  축(3) + 값 sin/cos(2) + margin(min·max, 2) = 7
+    object: 0 (identity) — ★goal오차는 global로 이동, rod 노드는 grasp 엣지 공간 앵커
+    → padded max(7) + type one-hot(3) = NODE_FEATURE_DIM 10
+  global: time(1) + f_int(1) + goal오차 base-frame pos(3)+rot6d(6) = 11
 
 env는 각 노드의 공간 pose(엣지용)와 raw feature를 dict로 넘긴다(아래 convert 시그니처 참고).
 """
@@ -62,9 +63,11 @@ N_NODE_TYPES = 3                     # base, joint, object
 TYPE_BASE, TYPE_JOINT, TYPE_OBJECT = 0, 1, 2
 BASE_RAW_DIM = 0
 JOINT_RAW_DIM = 7                    # 축(3)+sincos(2)+margin(2)
-OBJECT_RAW_DIM = 9                   # goal pos(3)+rot6d(6)
-NODE_RAW_PADDED_DIM = max(BASE_RAW_DIM, JOINT_RAW_DIM, OBJECT_RAW_DIM)  # 9
-NODE_FEATURE_DIM = NODE_RAW_PADDED_DIM + N_NODE_TYPES  # 9 + 3 = 12
+# ★ goal오차는 global로 이동(rod 노드 identity). object 노드 raw=0(공간 pose만, grasp 엣지 앵커용).
+OBJECT_RAW_DIM = 0
+GOAL_DIM = 9                         # goal pos(3)+rot6d(6) — global에 포함
+NODE_RAW_PADDED_DIM = max(BASE_RAW_DIM, JOINT_RAW_DIM, OBJECT_RAW_DIM)  # 7
+NODE_FEATURE_DIM = NODE_RAW_PADDED_DIM + N_NODE_TYPES  # 7 + 3 = 10
 
 # 엣지 타입
 N_EDGE_TYPES = 4
@@ -72,7 +75,7 @@ E_BASE_FIRST, E_CHAIN, E_GRASP, E_BASEREL = 0, 1, 2, 3
 EDGE_GEOM_DIM = 3 + 6
 EDGE_FEATURE_DIM = N_EDGE_TYPES + EDGE_GEOM_DIM  # 4 + 9 = 13
 
-GLOBAL_FEATURE_DIM = 2               # time(1) + f_int(1)
+GLOBAL_FEATURE_DIM = 2 + GOAL_DIM    # time(1) + f_int(1) + goal오차(9, 리더 base frame)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -116,9 +119,11 @@ def convert_kin_graph(raw: dict, num_envs: int) -> Batch:
         'joint_axis'   (B, 14, 3)   리더7+팔로워7 관절축(부모링크 frame or world 일관되게)
         'joint_val'    (B, 14)      관절각 [rad]
         'joint_margin' (B, 14, 2)   (q-q_min)/range, (q_max-q)/range  ∈[0,1]
-      object 노드 raw:
-        'obj_goal_pos6d' (B, 9)     base-frame goal오차 pos(3)+rot6d(6)
+      grasp 엣지용 EE(panda_hand) pose — joint7 노드의 chain은 link7, grasp는 hand로(파지 pose 직접 노출):
+        'ee_pos'  (B, 2, 3)   리더/팔로워 hand 위치 (env-local)
+        'ee_quat' (B, 2, 4)
       global:
+        'obj_goal_pos6d' (B, 9)  base-frame goal오차 pos(3)+rot6d(6) ← ★global로 이동
         'time' (B,), 'f_int' (B,)
     """
     device = raw['node_pos'].device
@@ -142,11 +147,10 @@ def convert_kin_graph(raw: dict, num_envs: int) -> Batch:
     for k, nidx in enumerate(all_joint_idx):
         raw_feat[:, nidx, :JOINT_RAW_DIM] = jfeat[:, k]
         onehot[:, nidx, TYPE_JOINT] = 1.0
-    # object 노드: base-frame goal오차 (9)
-    raw_feat[:, ROD_IDX, :OBJECT_RAW_DIM] = raw['obj_goal_pos6d']
+    # object 노드: raw 없음(goal은 global로 이동). type one-hot만 → grasp 엣지 공간 앵커 역할.
     onehot[:, ROD_IDX, TYPE_OBJECT] = 1.0
 
-    x_per_env = torch.clamp(torch.cat([raw_feat, onehot], dim=-1), -FEAT_CLIP, FEAT_CLIP)  # (B,17,12)
+    x_per_env = torch.clamp(torch.cat([raw_feat, onehot], dim=-1), -FEAT_CLIP, FEAT_CLIP)  # (B,17,10)
 
     # ── 엣지 index (batch offset) ──
     src = torch.tensor(_EDGE_SRC, device=device, dtype=torch.long)
@@ -157,9 +161,23 @@ def convert_kin_graph(raw: dict, num_envs: int) -> Batch:
     edge_index = torch.stack([(src.unsqueeze(0) + offs).reshape(-1),
                               (dst.unsqueeze(0) + offs).reshape(-1)], dim=0)
 
+    # ── 엣지용 노드 pose. ★ grasp 엣지(joint7↔rod)는 joint7 대신 **EE(panda_hand) pose** 사용
+    #   → grasp 엣지 상대pose = 파지 offset(d,θ) 자체 = 파지 pose 직접 노출. (chain 엣지는 link7 유지.)
+    epos = node_pos.clone(); equat = node_quat.clone()
+    if 'ee_pos' in raw:
+        # grasp 엣지의 joint7 노드 pose를 hand로 override (엣지 계산 전용 복사본).
+        epos[:, JOINT_L_IDX[-1]] = raw['ee_pos'][:, 0]; equat[:, JOINT_L_IDX[-1]] = raw['ee_quat'][:, 0]
+        epos[:, JOINT_F_IDX[-1]] = raw['ee_pos'][:, 1]; equat[:, JOINT_F_IDX[-1]] = raw['ee_quat'][:, 1]
+    # 단, chain 엣지(joint6↔joint7 등)는 원래 link7 pose를 써야 함 → 엣지 타입별로 소스 선택.
+    is_grasp = (etype == E_GRASP)                               # (E,) bool
+    p_src_ch, q_src_ch = node_pos[:, src], node_quat[:, src]    # chain/others용 link pose
+    p_dst_ch, q_dst_ch = node_pos[:, dst], node_quat[:, dst]
+    p_src_ee, q_src_ee = epos[:, src], equat[:, src]            # grasp용 hand pose
+    p_dst_ee, q_dst_ee = epos[:, dst], equat[:, dst]
+    m = is_grasp.view(1, E, 1)
+    p_src = torch.where(m, p_src_ee, p_src_ch); q_src = torch.where(m, q_src_ee, q_src_ch)
+    p_dst = torch.where(m, p_dst_ee, p_dst_ch); q_dst = torch.where(m, q_dst_ee, q_dst_ch)
     # ── 엣지 feature: type one-hot(4) + receiver-frame 상대pose(9) ──
-    p_src, q_src = node_pos[:, src], node_quat[:, src]           # (B,E,3),(B,E,4)
-    p_dst, q_dst = node_pos[:, dst], node_quat[:, dst]
     q_dst_conj = _quat_conj(q_dst)
     rel_pos = _quat_apply(q_dst_conj, p_src - p_dst) / POS_NORM
     rel_6d = _quat_to_6d(_quat_mul(q_dst_conj, q_src))
@@ -168,8 +186,9 @@ def convert_kin_graph(raw: dict, num_envs: int) -> Batch:
     eoh.scatter_(2, etype.view(1, E, 1).expand(B, E, 1), 1.0)
     edge_attr = torch.cat([eoh, geom], dim=-1).reshape(B * E, EDGE_FEATURE_DIM)
 
-    # ── global ──
-    u = torch.stack([raw['time'], 0.01 * raw['f_int']], dim=-1)  # (B,2)
+    # ── global: time + f_int + ★goal오차(9, 리더 base frame) ──
+    u = torch.cat([raw['time'].unsqueeze(-1), (0.01 * raw['f_int']).unsqueeze(-1),
+                   raw['obj_goal_pos6d']], dim=-1)              # (B, 2+9=11)
 
     # ── assemble (기존 lean converter와 동일 방식) ──
     x = x_per_env.reshape(B * NODES_PER_ENV, NODE_FEATURE_DIM)

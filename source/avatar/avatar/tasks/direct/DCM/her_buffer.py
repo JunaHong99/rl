@@ -97,22 +97,23 @@ def replace_goal_in_node_features(x_per_env, rod_pos, rod_quat, new_goal_pos, ne
     return x_modified
 
 
-def replace_goal_in_kin_object(x_per_env, rod_pos, rod_quat, base_quat, new_goal_pos, new_goal_quat):
-    """kinematic 그래프(17노드) object 노드의 base-frame goal오차를 새 goal로 교체(HER B).
+def replace_goal_in_kin_global(u_per_env, rod_pos, rod_quat, base_quat, new_goal_pos, new_goal_quat):
+    """kinematic 그래프의 **global feature(u)** base-frame goal오차를 새 goal로 교체(HER B).
 
-    kin object 노드(idx gk.ROD_IDX) raw = base-frame pos오차(3) + rot6d(6). env._build_kin_raw와 동일 계산.
-    base_quat = 그 시점 리더 base quat (base frame 변환용). one-hot(뒤 3)은 안 건드림.
+    ★goal은 이제 rod 노드가 아닌 global u에 있음. u 레이아웃 = [time(1), f_int(1), goal_pos오차(3), rot6d(6)]
+      → 뒤 GOAL_DIM(9)만 교체(time·f_int는 state기반이라 보존). env._build_kin_raw와 동일 계산.
+    base_quat = 그 시점 리더 base quat (base frame 변환용).
     """
     import graph_converter_kin as gk
-    x = x_per_env.clone()
+    u = u_per_env.clone()
     R_inv = _quat_conj(base_quat)                                       # (M,4)
     perr = _quat_apply_vec(R_inv, new_goal_pos - rod_pos)               # (M,3) base frame 위치오차
     q_err = _quat_mul(new_goal_quat, _quat_conj(rod_quat))             # (M,4) 월드 오차회전
     q_err_base = _quat_mul(R_inv, q_err)                               # base frame
     rerr6d = gk._quat_to_6d(q_err_base)                               # (M,6)
-    obj = torch.cat([perr, rerr6d], dim=-1)                           # (M,9)
-    x[:, gk.ROD_IDX, :gk.OBJECT_RAW_DIM] = obj.clamp(-FEAT_CLIP, FEAT_CLIP)
-    return x
+    goal = torch.cat([perr, rerr6d], dim=-1)                          # (M,9)
+    u[:, -gk.GOAL_DIM:] = goal.clamp(-FEAT_CLIP, FEAT_CLIP)
+    return u
 
 
 def _quat_apply_vec(q, v):
@@ -461,10 +462,11 @@ class HERReplayBuffer:
             n_rod_q_h = self.ep_next_rod_quat[t_her, env_her]
 
             if self._is_kin:
-                # kin: object 노드의 base-frame goal오차 교체 (그 시점 리더 base quat 사용).
+                # kin: ★goal은 global(u)에 있음 → u_h/nu_h만 relabel. 노드 feature(x)는 goal 없음(불변).
                 bq_h = self.ep_base_quat[t_her, env_her]
-                vx_h = replace_goal_in_kin_object(x_h, rod_p_h, rod_q_h, bq_h, vg_pos, vg_quat)
-                vnx_h = replace_goal_in_kin_object(nx_h, n_rod_p_h, n_rod_q_h, bq_h, vg_pos, vg_quat)
+                vx_h, vnx_h = x_h, nx_h
+                u_h = replace_goal_in_kin_global(u_h, rod_p_h, rod_q_h, bq_h, vg_pos, vg_quat)
+                nu_h = replace_goal_in_kin_global(nu_h, n_rod_p_h, n_rod_q_h, bq_h, vg_pos, vg_quat)
             else:
                 vx_h = replace_goal_in_node_features(x_h, rod_p_h, rod_q_h, vg_pos, vg_quat)
                 vnx_h = replace_goal_in_node_features(nx_h, n_rod_p_h, n_rod_q_h, vg_pos, vg_quat)

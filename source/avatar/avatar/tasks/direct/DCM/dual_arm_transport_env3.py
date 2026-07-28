@@ -1266,9 +1266,17 @@ class DualrobotEnv(DirectRLEnv):
         w1, w2 = self._get_grasp_wrenches()
         f_int = (0.5 * (w1[:, :3] - w2[:, :3])).norm(dim=-1)               # (B,)
         ntime = (self.episode_length_buf.float() / self.max_episode_length).clamp(0, 1)
+        # ★ grasp 엣지용 EE(panda_hand) pose — grasp 엣지가 파지 pose(d,θ)를 직접 노출.
+        eeL_p = self.robot_1.data.body_pos_w[:, self.ee_body_idx_1] - env_origins   # (B,3)
+        eeL_q = self.robot_1.data.body_quat_w[:, self.ee_body_idx_1]
+        eeF_p = self.robot_2.data.body_pos_w[:, self.ee_body_idx_2] - env_origins
+        eeF_q = self.robot_2.data.body_quat_w[:, self.ee_body_idx_2]
+        ee_pos = torch.stack([eeL_p, eeF_p], dim=1)                        # (B,2,3)
+        ee_quat = torch.stack([eeL_q, eeF_q], dim=1)                       # (B,2,4)
         return {
             'node_pos': node_pos, 'node_quat': node_quat,
             'joint_axis': joint_axis, 'joint_val': joint_val, 'joint_margin': joint_margin,
+            'ee_pos': ee_pos, 'ee_quat': ee_quat,
             'obj_goal_pos6d': obj_goal, 'time': ntime, 'f_int': f_int,
         }
 
