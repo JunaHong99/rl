@@ -188,8 +188,11 @@ def main():
     if args.leader_follower:
         env_cfg.leader_follower = True
         env_cfg.action_space = 7           # 리더 7 관절 Δq (팔로워는 IK)
-        args.use_mlp = True
-        print("🤝 leader_follower ON: 리더(arm1) 7 Δq + 팔로워(arm2) 추종 IK, 협응 구조적 보장 + MLP")
+        # ★ kin 그래프 경로에선 --use_mlp 명시(KinMLP ablation)일 때만 MLP. 미지정 시 KinGNN.
+        #   비-kin(lean) leader_follower는 예전대로 MLP 진단 기본.
+        if not args.use_kin_graph:
+            args.use_mlp = True
+        print("🤝 leader_follower ON: 리더(arm1) 7 Δq + 팔로워(arm2) 추종 IK, 협응 구조적 보장")
     if args.lf_dense_progress:
         env_cfg.lf_dense_progress = True
         print(f"📈 dense progress ON: r_progress = {env_cfg.lf_dense_w}·(rod 목표 접근량) — sparse 보강")
