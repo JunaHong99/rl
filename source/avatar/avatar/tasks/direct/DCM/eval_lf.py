@@ -18,6 +18,10 @@ parser.add_argument("--leader_follower", action="store_true")
 parser.add_argument("--joint_action", action="store_true")
 parser.add_argument("--use_kin_graph", action="store_true", help="kinematic 그래프 + KinGNN 정책 로드.")
 parser.add_argument("--num_rounds", type=int, default=8, help="KinGNN message-passing rounds(학습과 일치).")
+parser.add_argument("--vary_grasp", action="store_true", help="파지 변이(학습과 일치). 없으면 고정파지.")
+parser.add_argument("--same_side", action="store_true")
+parser.add_argument("--no_gravity", action="store_true", help="중력 OFF(학습과 일치).")
+parser.add_argument("--grasp_preset", type=str, default=None, help="held-out 파지 세트(.pt, gen_grasp로 생성). 없으면 학습 8버킷.")
 parser.add_argument("--stochastic", action="store_true", help="탐험 확인용(기본 deterministic).")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -38,6 +42,13 @@ if args.joint_action:
     cfg.joint_action = True; cfg.action_space = 14
 if args.use_kin_graph:
     cfg.use_kin_graph = True    # leader_follower와 함께
+# ★ 학습 조건 일치 (안 맞추면 mismatch로 결과 무의미)
+if args.vary_grasp:
+    cfg.vary_grasp = True; cfg.grasp_same_side = args.same_side
+if args.no_gravity:
+    cfg.disable_gravity_all = True
+if args.grasp_preset:
+    cfg.grasp_preset_path = args.grasp_preset   # held-out 파지 주입(랜덤 8버킷 대신)
 # train과 동일: leader_follower=time+리더sin/cos(14)+f_int+base pos(3)+rot6d(6)=25, joint=time+28+1=30
 if args.leader_follower and not args.use_kin_graph:
     gc.GLOBAL_FEATURE_DIM = 1 + 14 + 1 + 3 + 6
