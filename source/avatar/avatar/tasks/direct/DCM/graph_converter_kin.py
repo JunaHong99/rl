@@ -187,8 +187,13 @@ def convert_kin_graph(raw: dict, num_envs: int) -> Batch:
     edge_attr = torch.cat([eoh, geom], dim=-1).reshape(B * E, EDGE_FEATURE_DIM)
 
     # ── global: time + f_int + ★goal오차(9, 리더 base frame) ──
-    u = torch.cat([raw['time'].unsqueeze(-1), (0.01 * raw['f_int']).unsqueeze(-1),
-                   raw['obj_goal_pos6d']], dim=-1)              # (B, 2+9=11)
+    #   ★★ clamp 필수: u가 actor head에 raw로 직결(global-skip)됨. 옛 그래프는 goal을 x에 넣어
+    #     clamp(±5)했으나, u로 옮기며 clamp가 빠져 있었음 → 닫힌사슬 내력(f_int) 폭주 시 raw u가
+    #     actor를 발산시킴(q_loss runaway). x/edge와 동일하게 ±FEAT_CLIP로 bound.
+    u = torch.clamp(
+        torch.cat([raw['time'].unsqueeze(-1), (0.01 * raw['f_int']).unsqueeze(-1),
+                   raw['obj_goal_pos6d']], dim=-1),             # (B, 2+9=11)
+        -FEAT_CLIP, FEAT_CLIP)
 
     # ── assemble (기존 lean converter와 동일 방식) ──
     x = x_per_env.reshape(B * NODES_PER_ENV, NODE_FEATURE_DIM)
