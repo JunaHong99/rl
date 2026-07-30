@@ -23,6 +23,11 @@ parser.add_argument("--res_h", type=int, default=720)
 parser.add_argument("--env_spacing", type=float, default=4.0)
 parser.add_argument("--use_kin_graph", action="store_true", help="kinematic 그래프 + KinGNN 로드.")
 parser.add_argument("--num_rounds", type=int, default=8)
+parser.add_argument("--vary_grasp", action="store_true", help="파지 변이(학습과 일치). 없으면 고정파지.")
+parser.add_argument("--same_side", action="store_true")
+parser.add_argument("--no_gravity", action="store_true", help="중력 OFF(학습과 일치).")
+parser.add_argument("--grasp_preset", type=str, default=None, help="held-out 파지 세트(.pt).")
+parser.add_argument("--cache_size", type=int, default=20000, help="reset용 pose 캐시.")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.enable_cameras = True
@@ -46,6 +51,14 @@ if args.use_kin_graph:
     cfg.use_kin_graph = True
 else:
     gc.GLOBAL_FEATURE_DIM = 1 + 14 + 1 + 3 + 6
+# ★ 학습 조건 일치 (안 맞추면 mismatch로 이상하게 나옴)
+if args.vary_grasp:
+    cfg.vary_grasp = True; cfg.grasp_same_side = args.same_side
+if args.no_gravity:
+    cfg.disable_gravity_all = True
+if args.grasp_preset:
+    cfg.grasp_preset_path = args.grasp_preset
+cfg.pose_cache_size = args.cache_size
 env = DualrobotEnv(cfg, render_mode="rgb_array")
 A = env.cfg.action_space
 POS_T, ROT_T = 0.02, math.radians(10)
@@ -55,8 +68,13 @@ sd = torch.load(os.path.abspath(args.model_path), map_location=dev, weights_only
 scale = [float(cfg.joint_dq_scale)] * A
 if args.use_kin_graph:
     import gnn_policy_kin
-    agent = gnn_policy_kin.KinSACAgent(num_rounds=args.num_rounds, action_scale=scale).to(dev)
-    print(f"🕸️ KinGNN 로드 (rounds={args.num_rounds})")
+    is_kinmlp = any("actor.mean_head" in k for k in sd.keys())   # 체크포인트 키로 자동판별
+    if is_kinmlp:
+        agent = gnn_policy_kin.KinMLPSACAgent(action_scale=scale).to(dev)
+        print("🧠 KinMLP 로드 (flatten ablation)")
+    else:
+        agent = gnn_policy_kin.KinSACAgent(num_rounds=args.num_rounds, action_scale=scale).to(dev)
+        print(f"🕸️ KinGNN 로드 (rounds={args.num_rounds})")
 else:
     agent = mlp_policy.MLPSACAgent(action_dim=A, action_scale=scale, hidden_dim=256,
                                    num_hidden_layers=2, use_full_state=False, use_lean_obstacle=False).to(dev)
