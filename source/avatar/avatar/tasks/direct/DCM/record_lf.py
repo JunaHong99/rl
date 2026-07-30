@@ -38,7 +38,8 @@ from dual_arm_transport_env3 import DualrobotEnv, DualrobotCfg
 import mlp_policy, graph_converter as gc
 import isaaclab.utils.math as math_utils
 
-dev = "cuda" if torch.cuda.is_available() else "cpu"
+# ★ 렌더링엔 CUDA_VISIBLE_DEVICES 금지(GLX 깨짐) → --device cuda:N 사용. torch도 이 device로 통일.
+dev = getattr(args, "device", "cuda") if torch.cuda.is_available() else "cpu"
 N = args.n_clips
 cfg = DualrobotCfg()
 cfg.scene.num_envs = 4              # env 0만 녹화(카메라 고정), 나머지는 무시. 시도마다 reset=새 에피소드.
