@@ -42,7 +42,8 @@ import isaaclab.utils.math as math_utils
 dev = getattr(args, "device", "cuda") if torch.cuda.is_available() else "cpu"
 N = args.n_clips
 cfg = DualrobotCfg()
-cfg.scene.num_envs = 4              # env 0만 녹화(카메라 고정), 나머지는 무시. 시도마다 reset=새 에피소드.
+# vary_grasp면 env마다 다른 버킷(=다른 grasp) → 클립마다 다른 env 녹화 위해 num_envs 확보.
+cfg.scene.num_envs = max(8, args.n_clips) if args.vary_grasp else 4
 cfg.scene.env_spacing = args.env_spacing
 cfg.viewer.resolution = (args.res_w, args.res_h)
 cfg.leader_follower = True
@@ -147,20 +148,22 @@ def rollout_record(record_env):
 # 각 batch를 "env 0 카메라로 녹화"하되, env 0이 성공한 batch만 keep. (렌더는 매 batch 있지만
 # 실패해도 렌더 비용은 동일 — 대신 num_envs 병렬로 시도수 자체를 줄임: 한 batch에 4개 판정,
 # env 0 성공률 93.7%라 대부분 첫 시도 성공 → 시도수 급감.)
-collected = 0; attempt = 0; max_attempts = N * 4
+collected = 0; attempt = 0; max_attempts = N * 6
 while collected < N and attempt < max_attempts and sim_app.is_running():
     attempt += 1
-    buf, bp, br, reached, sp = rollout_record(record_env=0)
+    tenv = collected % NP                 # ★ 클립마다 다른 env = 다른 grasp 버킷
+    look_at(tenv)                         # 카메라를 그 env로
+    buf, bp, br, reached, sp = rollout_record(record_env=tenv)
     # genuine 성공 = 동시도달 + 시작 시 목표에서 충분히 멀었음(운반) + 프레임 있음
-    genuine = bool(reached[0]) and (sp > 0.08) and (len(buf) >= 3)
+    genuine = bool(reached[tenv]) and (sp > 0.08) and (len(buf) >= 3)
     if genuine:
         for f in buf:
             writer.write(f)
         collected += 1
-        print(f"  ✅ clip {collected}/{N} (시도 {attempt})  시작{sp*100:.0f}cm→도달  min pos={bp[0]*100:.1f}cm rot={br[0]:.0f}deg  ({len(buf)}프레임)")
+        print(f"  ✅ clip {collected}/{N} (env{tenv}, 시도 {attempt})  시작{sp*100:.0f}cm→도달  min pos={bp[tenv]*100:.1f}cm rot={br[tenv]:.0f}deg  ({len(buf)}프레임)")
     else:
-        why = "미도달" if not bool(reached[0]) else ("trivial(시작가까움)" if sp <= 0.08 else "짧음")
-        print(f"  ✗ env0 제외:{why} (시도 {attempt})  시작{sp*100:.0f}cm  min pos={bp[0]*100:.1f}cm rot={br[0]:.0f}deg")
+        why = "미도달" if not bool(reached[tenv]) else ("trivial(시작가까움)" if sp <= 0.08 else "짧음")
+        print(f"  ✗ env{tenv} 제외:{why} (시도 {attempt})  시작{sp*100:.0f}cm  min pos={bp[tenv]*100:.1f}cm rot={br[tenv]:.0f}deg")
 
 writer.release()
 print(f"✅ 저장: {args.out}  성공 {collected}/{N} ({attempt}회, {time.time()-t0:.0f}s)")
