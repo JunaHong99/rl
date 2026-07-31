@@ -28,6 +28,8 @@ parser.add_argument("--same_side", action="store_true")
 parser.add_argument("--no_gravity", action="store_true", help="중력 OFF(학습과 일치).")
 parser.add_argument("--grasp_preset", type=str, default=None, help="held-out 파지 세트(.pt).")
 parser.add_argument("--cache_size", type=int, default=20000, help="reset용 pose 캐시.")
+parser.add_argument("--seed", type=int, default=0, help="matched 비교용: reset 재현 seed. GNN·MLP 같은 seed면 동일 에피소드.")
+parser.add_argument("--min_start_dist", type=float, default=0.15, help="녹화 에피소드 최소 시작-골 거리[m] (trivial 배제).")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.enable_cameras = True
@@ -100,10 +102,18 @@ writer = cv2.VideoWriter(args.out, cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (a
 t0 = time.time()
 
 
-def rollout_record(record_env):
+def rollout_record(record_env, min_start_dist=0.0):
     """한 batch rollout. record_env가 None이면 렌더 없이 성공판정만(빠름).
        int면 그 env의 프레임을 오버레이해 buf 반환. 반환: (buf, best_p(NP,), best_r(NP,))."""
-    env.reset(); batch = env._build_policy_batch()
+    # ★ 녹화 대상 env의 시작-골 거리 >= min_start_dist 될 때까지 reset (seed 고정 시 재현 → 모델 무관 동일 에피소드).
+    while True:
+        env.reset()
+        if record_env is None or min_start_dist <= 0:
+            break
+        rp = env.rod.data.root_pos_w; gp = env.goal_rod_marker.data.root_pos_w
+        if (gp[record_env] - rp[record_env]).norm().item() >= min_start_dist:
+            break
+    batch = env._build_policy_batch()
     bp = np.full(NP, 9.9); br = np.full(NP, 999.0)
     reached_once = np.zeros(NP, dtype=bool); buf = []
     start_perr = None
@@ -134,7 +144,7 @@ def rollout_record(record_env):
                     img = np.ascontiguousarray(frame[:, :, :3])
                     now = (perr[ci] < POS_T) and (rerr[ci] < ROT_T_DEG)   # 지금 순간 도달중?
                     col = (0, 220, 0) if now else (255, 210, 0)
-                    cv2.putText(img, f"success clip  kin leader-follower", (20, 40),
+                    cv2.putText(img, f"kin leader-follower (matched eval)", (20, 40),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
                     cv2.putText(img, f"pos={perr[ci]*100:.1f}cm(<2)  rot={rerr[ci]:.0f}deg(<10)  {'REACHED' if now else '...'}",
                                 (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, col, 2, cv2.LINE_AA)
@@ -144,28 +154,25 @@ def rollout_record(record_env):
     return buf, bp, br, reached_once, sp
 
 
-# 렌더 없이 여러 batch 판정 → 성공 env 좌표(batch, env_idx) 수집.
-# 근데 batch마다 pose가 새로 랜덤이라 재현 불가 → 판정과 녹화를 한 rollout에서:
-# 각 batch를 "env 0 카메라로 녹화"하되, env 0이 성공한 batch만 keep. (렌더는 매 batch 있지만
-# 실패해도 렌더 비용은 동일 — 대신 num_envs 병렬로 시도수 자체를 줄임: 한 batch에 4개 판정,
-# env 0 성공률 93.7%라 대부분 첫 시도 성공 → 시도수 급감.)
-collected = 0; attempt = 0; max_attempts = N * 6
-while collected < N and attempt < max_attempts and sim_app.is_running():
-    attempt += 1
-    tenv = collected % NP                 # ★ 클립마다 다른 env = 다른 grasp 버킷
+# ★ matched 녹화: seed 고정으로 GNN·MLP가 정확히 같은 에피소드(start/goal/grasp)를 보게 함.
+#   성공/실패 무관 녹화(cherry-pick 안 함, 정직) + min_start_dist로 trivial 배제.
+#   start/goal은 policy 이전(reset)에 정해지므로 seed 같으면 모델과 무관하게 동일 → 공정 비교.
+torch.manual_seed(args.seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(args.seed)
+collected = 0
+for c in range(N):
+    if not sim_app.is_running():
+        break
+    tenv = c % NP                         # 클립마다 다른 env = 다른 grasp 버킷
     look_at(tenv)                         # 카메라를 그 env로
-    buf, bp, br, reached, sp = rollout_record(record_env=tenv)
-    # genuine 성공 = 동시도달 + 시작 시 목표에서 충분히 멀었음(운반) + 프레임 있음
-    genuine = bool(reached[tenv]) and (sp > 0.08) and (len(buf) >= 3)
-    if genuine:
-        for f in buf:
-            writer.write(f)
-        collected += 1
-        print(f"  ✅ clip {collected}/{N} (env{tenv}, 시도 {attempt})  시작{sp*100:.0f}cm→도달  min pos={bp[tenv]*100:.1f}cm rot={br[tenv]:.0f}deg  ({len(buf)}프레임)")
-    else:
-        why = "미도달" if not bool(reached[tenv]) else ("trivial(시작가까움)" if sp <= 0.08 else "짧음")
-        print(f"  ✗ env{tenv} 제외:{why} (시도 {attempt})  시작{sp*100:.0f}cm  min pos={bp[tenv]*100:.1f}cm rot={br[tenv]:.0f}deg")
+    buf, bp, br, reached, sp = rollout_record(record_env=tenv, min_start_dist=args.min_start_dist)
+    for f in buf:
+        writer.write(f)
+    collected += 1
+    tag = "REACHED" if bool(reached[tenv]) else "MISS"
+    print(f"  clip {c+1}/{N} (env{tenv}, {tag})  시작{sp*100:.0f}cm  min pos={bp[tenv]*100:.1f}cm rot={br[tenv]:.0f}deg  ({len(buf)}프레임)")
 
 writer.release()
-print(f"✅ 저장: {args.out}  성공 {collected}/{N} ({attempt}회, {time.time()-t0:.0f}s)")
+print(f"✅ 저장: {args.out}  {collected}/{N} 클립 (matched seed={args.seed}, min_dist={args.min_start_dist}m, {time.time()-t0:.0f}s)")
 env.close(); sim_app.close()
