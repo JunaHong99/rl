@@ -270,6 +270,7 @@ class DualrobotCfg(DirectRLEnvCfg):
     #   joint_action과 동일하게 포지션 액추에이터(joint_kp/kd) 사용.
     leader_follower: bool = False
     lf_ik_iters: int = 12             # 팔로워 IK warm-start 반복(작게=빠름, 스텝간 모션 작아 수렴).
+    lf_rot_weight: float = 0.1        # progress 거리 current_dist = pos_err + w·rot_err. ↑=회전 우선(위치 과달성/회전 marginal 교정). env·HER 일관.
     lf_grav_comp: bool = False        # 리더-팔로워 중력보상 feedforward(G(q)). 파지변이 불리한 자세 sag 방지.
     lf_follower_hold: bool = False     # 디버그: 팔로워 IK 끄고 q_start 고정(처짐 원인=IK인지 sag인지 판별).
     disable_gravity_all: bool = False  # 로봇+rod 중력 OFF. 파지 pose 일반화 단계(무게 무관)에서 sag 제거용.

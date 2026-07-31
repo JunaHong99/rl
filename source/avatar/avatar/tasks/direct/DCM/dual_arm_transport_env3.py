@@ -981,7 +981,7 @@ class DualrobotEnv(DirectRLEnv):
         # ── 1. Dense progress 제거 (Roboballet식 sparse-only + HER). ──
         # 정지 정책에 대한 음수 reward도 없애 HER virtual exploit 안 키움.
         # is_first는 success threshold gate(첫 step bug 패치)에 여전히 사용.
-        current_dist = pos_err + 0.1 * rot_err
+        current_dist = pos_err + float(self.cfg.lf_rot_weight) * rot_err
         is_first = torch.isinf(self.prev_dist)
         r_progress = torch.zeros_like(pos_err)
         r_joint_pbr = torch.zeros_like(r_progress)

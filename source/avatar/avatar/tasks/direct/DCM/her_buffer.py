@@ -126,7 +126,7 @@ def _quat_apply_vec(q, v):
 def recompute_reward(rod_pos, rod_quat, new_goal_pos, new_goal_quat,
                      prev_dist, is_first,
                      pos_thresh=0.02, rot_thresh=0.1745,
-                     progress_weight=0.0, success_bonus=100.0):
+                     progress_weight=0.0, success_bonus=100.0, rot_weight=0.1):
     """
     Virtual goal 기준 reward + reached 재계산.
 
@@ -141,7 +141,7 @@ def recompute_reward(rod_pos, rod_quat, new_goal_pos, new_goal_quat,
     rot_err_aa = _quat_to_axis_angle(q_err)
     rot_err = torch.norm(rot_err_aa, dim=-1)
 
-    current_dist = pos_err + 0.1 * rot_err
+    current_dist = pos_err + rot_weight * rot_err
     # Progress
     is_first_safe = is_first | torch.isinf(prev_dist)
     safe_prev = torch.where(is_first_safe, current_dist, prev_dist)
@@ -178,8 +178,9 @@ class HERReplayBuffer:
                  strategy: str = "random_task",
                  goal_offset_pos_pool: torch.Tensor | None = None,
                  goal_offset_quat_pool: torch.Tensor | None = None,
-                 progress_weight: float = 50.0, graph_mod=None):
+                 progress_weight: float = 50.0, graph_mod=None, rot_weight: float = 0.1):
         self.capacity = capacity
+        self.rot_weight = rot_weight   # ★ current_dist의 회전 가중 (env cfg.lf_rot_weight와 일치해야 함)
         self.num_envs = num_envs
         self.action_dim = action_dim
         self.device = device
@@ -387,7 +388,7 @@ class HERReplayBuffer:
         pos_err_o = torch.norm(goal_p_o - n_rod_p_o, dim=-1)
         q_err_o = _quat_mul(goal_q_o, _quat_conj(n_rod_q_o))
         rot_err_o = torch.norm(_quat_to_axis_angle(q_err_o), dim=-1)
-        cur_dist_o = pos_err_o + 0.1 * rot_err_o
+        cur_dist_o = pos_err_o + self.rot_weight * rot_err_o
 
         is_first_o = (t_flat == 0)
         prev_dist_o = torch.empty_like(cur_dist_o)
@@ -475,12 +476,13 @@ class HERReplayBuffer:
             prev_pos_h = torch.norm(vg_pos - rod_p_h, dim=-1)
             prev_q_h = _quat_mul(vg_quat, _quat_conj(rod_q_h))
             prev_rot_h = torch.norm(_quat_to_axis_angle(prev_q_h), dim=-1)
-            prev_dist_h = prev_pos_h + 0.1 * prev_rot_h
+            prev_dist_h = prev_pos_h + self.rot_weight * prev_rot_h
             is_first_h = torch.zeros(M_her, dtype=torch.bool, device=d)
             r_h, reached_h, _ = recompute_reward(
                 n_rod_p_h, n_rod_q_h, vg_pos, vg_quat,
                 prev_dist_h, is_first_h,
                 progress_weight=self.progress_weight,   # virtual도 original과 동일 진행 보상 (이전엔 0)
+                rot_weight=self.rot_weight,
             )
             # goal-무관 보상(충돌 등)은 virtual goal에도 동일하게 더함 (state 기반이므로 보존).
             r_h = r_h + self.ep_goal_indep[t_her, env_her]

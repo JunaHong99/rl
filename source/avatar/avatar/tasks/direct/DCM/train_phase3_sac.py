@@ -95,6 +95,10 @@ parser.add_argument("--w_internal", type=float, default=0.002,
                     help="antagonistic 내력 페널티 가중치(협응 학습 신호). f_int[N] 스케일이라 작게(예 0.002).")
 parser.add_argument("--leader_follower", action="store_true",
                     help="리더-팔로워: 리더(arm1) 7 Δq(학습) + 팔로워(arm2) 추종 IK. 협응 구조적 보장(freeze 회피). action_space=7.")
+parser.add_argument("--lf_rot_weight", type=float, default=0.1,
+                    help="progress 거리 회전 가중(current_dist=pos+w·rot). ↑=회전 우선(기본0.1→0.3 권장). env·HER 일관.")
+parser.add_argument("--lf_ik_iters", type=int, default=None,
+                    help="팔로워 IK 반복수 override(기본 cfg=12). 수렴 개선(예:30).")
 parser.add_argument("--lf_dense_progress", action="store_true",
                     help="dense progress 보상(Cartesian rod 접근량). sparse+HER가 리더관절 액션엔 약해 학습 굶는 것 보강.")
 parser.add_argument("--use_kin_graph", action="store_true",
@@ -192,7 +196,10 @@ def main():
         #   비-kin(lean) leader_follower는 예전대로 MLP 진단 기본.
         if not args.use_kin_graph:
             args.use_mlp = True
-        print("🤝 leader_follower ON: 리더(arm1) 7 Δq + 팔로워(arm2) 추종 IK, 협응 구조적 보장")
+        env_cfg.lf_rot_weight = args.lf_rot_weight      # 회전 가중(env·HER 일관, 아래 버퍼에도 전달)
+        if args.lf_ik_iters is not None:
+            env_cfg.lf_ik_iters = args.lf_ik_iters      # 팔로워 IK 수렴 개선
+        print(f"🤝 leader_follower ON: 리더 7Δq + 팔로워 IK(iters={env_cfg.lf_ik_iters}), rot_weight={env_cfg.lf_rot_weight}")
     if args.lf_dense_progress:
         env_cfg.lf_dense_progress = True
         print(f"📈 dense progress ON: r_progress = {env_cfg.lf_dense_w}·(rod 목표 접근량) — sparse 보강")
@@ -332,6 +339,7 @@ def main():
             goal_offset_quat_pool=offset_quat_pool,
             progress_weight=args.her_progress_weight,
             graph_mod=_her_gm,
+            rot_weight=args.lf_rot_weight,   # ★ env cfg.lf_rot_weight와 일치 (HER relabel 일관)
         )
         print(f"🎯 HER enabled: strategy={args.her_strategy}, k_future={args.k_future}, "
               f"progress_weight={args.her_progress_weight}, max_ep_len={max_ep_len}")
