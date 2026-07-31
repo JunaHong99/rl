@@ -92,6 +92,9 @@ rod_start = env.rod.data.root_pos_w.clone()
 rod_disp_max = torch.zeros(B, device=dev)          # 에피소드 내 rod 최대 이동량
 act_abs_sum = 0.0; n_act = 0
 ep_succ = []
+# ★ 버킷별 성공률 추적 (vary_grasp/preset일 때). env i → 고정 버킷.
+bkt_idx = getattr(env, "_grasp_bucket_idx", None)
+ep_bkt = []
 for step in range(args.num_steps):
     with torch.no_grad():
         action, _, _ = agent.actor.get_action_and_log_prob(batch, deterministic=not args.stochastic)
@@ -111,6 +114,8 @@ for step in range(args.num_steps):
         for i in done.nonzero(as_tuple=True)[0].tolist():
             if rr_len[i].item() > settle:
                 ep_succ.append(bool(rr_reached[i].item()))   # 동시 도달 기준
+                if bkt_idx is not None:
+                    ep_bkt.append(int(bkt_idx[i].item()))
             rr_min_pos[i] = float("inf"); rr_min_rot[i] = float("inf"); rr_reached[i] = False
             rr_len[i] = 0
             rod_start[i] = env.rod.data.root_pos_w[i]; rod_disp_max[i] = 0.0
@@ -118,6 +123,17 @@ for step in range(args.num_steps):
 
 S = np.array(ep_succ)
 print(f"  genuine ep: {len(S)}   success: {100*S.mean() if len(S) else 0:.1f}%")
+# ── 버킷별 성공률 (worst 먼저) ──
+if bkt_idx is not None and len(ep_bkt):
+    eb = np.array(ep_bkt); nb = int(env.cfg.grasp_n_buckets)
+    bd = env._grasp_bucket_d.cpu().numpy(); bth = env._grasp_bucket_theta.cpu().numpy()
+    rows = []
+    for b in range(nb):
+        m = eb == b; n = int(m.sum())
+        if n: rows.append((100.0 * S[m].mean(), b, n, float(bd[b]), float(bth[b])))
+    print("  ── 버킷별 성공률 (낮은 순) ──")
+    for sr, b, n, d, th in sorted(rows):
+        print(f"    버킷{b:2d}: {sr:5.1f}%  (n={n:4d})  d={d:.3f}m  θ={th:+.3f}rad ({th*57.3:+.0f}°)")
 print(f"  rod 최대이동(에피소드): mean={rod_disp_max.mean()*100:.1f}cm  max={rod_disp_max.max()*100:.1f}cm")
 print(f"  액션 |mean|: {act_abs_sum/max(1,n_act):.3f}  (0에 가까우면 정책 붕괴=freeze)")
 print(f"  → 진단: rod가 {'거의 안 움직임 → 정책 붕괴/탐험실패' if rod_disp_max.mean()<0.03 else '움직임 → 도달만 못함(탐험/HER)'}")
