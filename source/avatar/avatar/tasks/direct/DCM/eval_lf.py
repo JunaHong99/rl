@@ -24,6 +24,7 @@ parser.add_argument("--no_gravity", action="store_true", help="중력 OFF(학습
 parser.add_argument("--grasp_preset", type=str, default=None, help="held-out 파지 세트(.pt, gen_grasp로 생성). 없으면 학습 8버킷.")
 parser.add_argument("--cache_size", type=int, default=20000, help="reset용 pose 캐시(eval은 작게=빠름. 학습은 100k). preset 캐시 생성 가속.")
 parser.add_argument("--stochastic", action="store_true", help="탐험 확인용(기본 deterministic).")
+parser.add_argument("--lf_ik_iters", type=int, default=None, help="팔로워 IK 반복수 override(기본 cfg=12). IK잔차 원인 진단용(예: 50).")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 app = AppLauncher(args); sim_app = app.app
@@ -51,6 +52,9 @@ if args.no_gravity:
 if args.grasp_preset:
     cfg.grasp_preset_path = args.grasp_preset   # held-out 파지 주입(랜덤 8버킷 대신)
 cfg.pose_cache_size = args.cache_size           # eval은 작게 → preset 캐시 생성 빠름
+if args.lf_ik_iters is not None:
+    cfg.lf_ik_iters = args.lf_ik_iters          # 팔로워 IK 반복수 override (IK잔차 원인 진단)
+    print(f"🔧 lf_ik_iters override → {cfg.lf_ik_iters}")
 # train과 동일: leader_follower=time+리더sin/cos(14)+f_int+base pos(3)+rot6d(6)=25, joint=time+28+1=30
 if args.leader_follower and not args.use_kin_graph:
     gc.GLOBAL_FEATURE_DIM = 1 + 14 + 1 + 3 + 6
