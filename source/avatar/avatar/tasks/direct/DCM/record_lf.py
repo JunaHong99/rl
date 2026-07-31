@@ -115,7 +115,8 @@ def rollout_record(record_env):
             action, _, _ = agent.actor.get_action_and_log_prob(batch, deterministic=True)
             _, _, term, trunc, _ = env.step(action)
         # ★ done이면 env가 이미 자동 리셋 → 지금 rod/goal은 새 에피소드(텔레포트). 렌더/판정 말고 즉시 종료.
-        if s >= settle and (bool(term[0].item()) or bool(trunc[0].item())):
+        #   ★ 녹화 대상 env(ci) 기준으로 break해야 함 (env0 하드코딩 시 tenv≠0 클립에 다른 에피소드 프레임 섞임).
+        if s >= settle and (bool(term[ci].item()) or bool(trunc[ci].item())):
             break
         rod = env.rod.data.root_pos_w; goal = env.goal_rod_marker.data.root_pos_w
         perr = (goal - rod).norm(dim=-1).cpu().numpy()
