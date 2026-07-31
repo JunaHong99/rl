@@ -642,7 +642,20 @@ class DualrobotEnv(DirectRLEnv):
         ee_loc_p = torch.bmm(R_b2_T, (fol_p - b2_p).unsqueeze(2)).squeeze(2)
         ee_loc_R = torch.bmm(R_b2_T, fol_R)
         q2_cur = self.robot_2.data.joint_pos[:, self.robot_2_joint_ids]
-        return ik.solve_ik_gradient(ee_loc_p, ee_loc_R, q_init=q2_cur, max_iter=int(self.cfg.lf_ik_iters))
+        q2 = ik.solve_ik_gradient(ee_loc_p, ee_loc_R, q_init=q2_cur, max_iter=int(self.cfg.lf_ik_iters))
+        # ── 진단(옵션, _lf_diag일 때만): 팔로워 IK 추종 잔차 + manipulability(특이점) ──
+        #   IK가 목표 EE를 못 맞추면(잔차↑) or 특이점 근처면(manip↓) → rod가 피벗 → 회전 오차 가설 검증용.
+        if getattr(self, "_lf_diag", False):
+            fk2_p, fk2_R = ik.forward_kinematics(q2)                        # 달성 EE (팔로워 base frame)
+            self._lf_ik_res_pos = (fk2_p - ee_loc_p).norm(dim=-1)          # (B,) m
+            R_err = torch.bmm(fk2_R.transpose(1, 2), ee_loc_R)
+            cos = ((R_err[:, 0, 0] + R_err[:, 1, 1] + R_err[:, 2, 2]) - 1.0) * 0.5
+            self._lf_ik_res_rot = torch.acos(cos.clamp(-1.0, 1.0))         # (B,) rad
+            if getattr(self, "_fol_jac", None) is None:
+                self._fol_jac = FrankaJacobianIK(device=self.device)
+            J, _ = self._fol_jac.compute_jacobian(q2)                      # (B,6,7)
+            self._lf_manip = torch.sqrt(torch.det(torch.bmm(J, J.transpose(1, 2))).clamp_min(0.0))  # (B,)
+        return q2
 
     def _lf_grasp_offsets(self):
         """rod frame 기준 양팔 **FK-EE**(IK 솔버 FK가 반환하는 프레임) offset (pos, R). ★샘플러 convention:

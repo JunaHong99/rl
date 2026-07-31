@@ -95,6 +95,11 @@ ep_succ = []
 # ★ 버킷별 성공률 추적 (vary_grasp/preset일 때). env i → 고정 버킷.
 bkt_idx = getattr(env, "_grasp_bucket_idx", None)
 ep_bkt = []
+# ★ 팔로워 IK 잔차·manipulability 진단 (성공 vs 실패 대비 → IK/특이점 가설 검증)
+env._lf_diag = True
+ep_diag = []   # (success, ikres_pos_mm, ikres_rot_deg, manip_min)
+ikp_max = torch.zeros(B, device=dev); ikr_max = torch.zeros(B, device=dev)
+manip_min = torch.full((B,), float("inf"), device=dev)
 for step in range(args.num_steps):
     with torch.no_grad():
         action, _, _ = agent.actor.get_action_and_log_prob(batch, deterministic=not args.stochastic)
@@ -108,6 +113,10 @@ for step in range(args.num_steps):
     rr_min_pos = torch.min(rr_min_pos, pos_err); rr_min_rot = torch.min(rr_min_rot, rot_err)
     rr_reached |= (pos_err < POS_T) & (rot_err < ROT_T)     # ★ 이 스텝에 pos&rot 동시 만족
     rod_disp_max = torch.maximum(rod_disp_max, (rod_pos - rod_start).norm(dim=-1))
+    if hasattr(env, "_lf_ik_res_pos"):     # 팔로워 IK 진단 누적 (에피소드 내 최악)
+        ikp_max = torch.maximum(ikp_max, env._lf_ik_res_pos)
+        ikr_max = torch.maximum(ikr_max, env._lf_ik_res_rot)
+        manip_min = torch.minimum(manip_min, env._lf_manip)
     rr_len += 1
     done = term | trunc
     if done.any():
@@ -116,9 +125,12 @@ for step in range(args.num_steps):
                 ep_succ.append(bool(rr_reached[i].item()))   # 동시 도달 기준
                 if bkt_idx is not None:
                     ep_bkt.append(int(bkt_idx[i].item()))
+                ep_diag.append((bool(rr_reached[i].item()), float(ikp_max[i]) * 1000.0,
+                                float(ikr_max[i]) * 57.3, float(manip_min[i])))
             rr_min_pos[i] = float("inf"); rr_min_rot[i] = float("inf"); rr_reached[i] = False
             rr_len[i] = 0
             rod_start[i] = env.rod.data.root_pos_w[i]; rod_disp_max[i] = 0.0
+            ikp_max[i] = 0.0; ikr_max[i] = 0.0; manip_min[i] = float("inf")
     batch = env._build_policy_batch()
 
 S = np.array(ep_succ)
@@ -134,6 +146,18 @@ if bkt_idx is not None and len(ep_bkt):
     print("  ── 버킷별 성공률 (낮은 순) ──")
     for sr, b, n, d, th in sorted(rows):
         print(f"    버킷{b:2d}: {sr:5.1f}%  (n={n:4d})  d={d:.3f}m  θ={th:+.3f}rad ({th*57.3:+.0f}°)")
+# ── ★팔로워 IK 잔차·특이점: 성공 vs 실패 (IK/특이점 가설 검증) ──
+if ep_diag:
+    D = np.array([[float(s), ip, ir, mp] for (s, ip, ir, mp) in ep_diag])
+    sm = D[:, 0] > 0.5; fm = ~sm
+    def _st(m):
+        if m.sum() == 0: return "n=0"
+        return (f"n={int(m.sum()):5d}  IK잔차 pos={np.median(D[m,1]):5.1f}mm rot={np.median(D[m,2]):4.1f}°  "
+                f"manip_min(median)={np.median(D[m,3]):.3f}  (p10={np.percentile(D[m,3],10):.3f})")
+    print("  ── 팔로워 IK 잔차·특이점 (성공 vs 실패, median) ──")
+    print(f"    성공: {_st(sm)}")
+    print(f"    실패: {_st(fm)}")
+    print(f"    → 실패가 IK잔차↑ 또는 manip↓면 IK/특이점 원인(가설), 비슷하면 리워드/정밀도")
 print(f"  rod 최대이동(에피소드): mean={rod_disp_max.mean()*100:.1f}cm  max={rod_disp_max.max()*100:.1f}cm")
 print(f"  액션 |mean|: {act_abs_sum/max(1,n_act):.3f}  (0에 가까우면 정책 붕괴=freeze)")
 print(f"  → 진단: rod가 {'거의 안 움직임 → 정책 붕괴/탐험실패' if rod_disp_max.mean()<0.03 else '움직임 → 도달만 못함(탐험/HER)'}")
