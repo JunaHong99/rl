@@ -99,6 +99,23 @@ parser.add_argument("--lf_rot_weight", type=float, default=0.1,
                     help="progress 거리 회전 가중(current_dist=pos+w·rot). ↑=회전 우선(기본0.1→0.3 권장). env·HER 일관.")
 parser.add_argument("--lf_ik_iters", type=int, default=None,
                     help="팔로워 IK 반복수 override(기본 cfg=12). 수렴 개선(예:30).")
+# r_ik / r_sing (Hong2025 Eq.4,5): 특이점·팔로워IK 실패 페널티. goal-무관 → HER preserve.
+parser.add_argument("--use_sing_penalty", action="store_true",
+                    help="r_sing: manip<thresh(특이점 근처)면 벌. Hong2025 Eq.5.")
+parser.add_argument("--sing_penalty", type=float, default=250.0,
+                    help="r_sing 크기. 도달보너스=100이라 크면 freeze 위험(80~150 권장 시작).")
+parser.add_argument("--sing_manip_thresh", type=float, default=1.0e-3,
+                    help="manip=√det(JJᵀ) 이 값 미만=특이점. 진단 실패군 median≈0.001.")
+parser.add_argument("--use_ik_penalty", action="store_true",
+                    help="r_ik: 팔로워 IK 잔차>thresh(유효해 못 찾음)면 벌. Hong2025 Eq.4.")
+parser.add_argument("--ik_penalty", type=float, default=375.0,
+                    help="r_ik 크기. freeze 주의(100~200 권장 시작).")
+parser.add_argument("--ik_fail_pos_thresh", type=float, default=0.05,
+                    help="팔로워 IK pos잔차[m] 초과=실패. 진단 성공median=45mm라 0.05 보수적.")
+parser.add_argument("--penalty_ramp_start", type=int, default=0,
+                    help="r_sing/r_ik 페널티 ramp 시작 env_step(이 전엔 0). fresh 학습 freeze 방지(예:4000000).")
+parser.add_argument("--penalty_ramp_end", type=int, default=0,
+                    help="이 env_step에서 페널티 ramp이 1.0 도달. 0=즉시 full(ramp 없음, 논문값 그대로).")
 parser.add_argument("--lf_dense_progress", action="store_true",
                     help="dense progress 보상(Cartesian rod 접근량). sparse+HER가 리더관절 액션엔 약해 학습 굶는 것 보강.")
 parser.add_argument("--use_kin_graph", action="store_true",
@@ -200,6 +217,17 @@ def main():
         if args.lf_ik_iters is not None:
             env_cfg.lf_ik_iters = args.lf_ik_iters      # 팔로워 IK 수렴 개선
         print(f"🤝 leader_follower ON: 리더 7Δq + 팔로워 IK(iters={env_cfg.lf_ik_iters}), rot_weight={env_cfg.lf_rot_weight}")
+        # r_sing / r_ik (Hong2025 Eq.5/4): 특이점·팔로워IK 실패 페널티
+        if args.use_sing_penalty:
+            env_cfg.use_sing_penalty = True
+            env_cfg.sing_penalty = args.sing_penalty
+            env_cfg.sing_manip_thresh = args.sing_manip_thresh
+            print(f"🎯 r_sing ON: manip<{args.sing_manip_thresh} → −{args.sing_penalty} (특이점 회피)")
+        if args.use_ik_penalty:
+            env_cfg.use_ik_penalty = True
+            env_cfg.ik_penalty = args.ik_penalty
+            env_cfg.ik_fail_pos_thresh = args.ik_fail_pos_thresh
+            print(f"🎯 r_ik ON: 팔로워IK잔차>{args.ik_fail_pos_thresh}m → −{args.ik_penalty} (미도달 회피)")
     if args.lf_dense_progress:
         env_cfg.lf_dense_progress = True
         print(f"📈 dense progress ON: r_progress = {env_cfg.lf_dense_w}·(rod 목표 접근량) — sparse 보강")
@@ -423,6 +451,13 @@ def main():
                 denom = max(1, args.obstacle_curr_end - args.obstacle_curr_start)
                 env._obstacle_curr_frac = min(1.0, (env_steps - args.obstacle_curr_start) / denom)
 
+        # ── r_sing/r_ik 페널티 ramp (fresh freeze 방지: 0→1 선형) ──
+        if args.penalty_ramp_end > args.penalty_ramp_start:
+            _d = max(1, args.penalty_ramp_end - args.penalty_ramp_start)
+            env._penalty_ramp = min(1.0, max(0.0, (env_steps - args.penalty_ramp_start) / _d))
+        else:
+            env._penalty_ramp = 1.0   # ramp 없음 = 즉시 full
+
         # ── Action selection ──
         if env_steps < args.warmup_steps:
             # Warmup: random action scaled to (action_scale × warmup_scale_factor)
@@ -545,6 +580,8 @@ def main():
             writer.add_scalar("perf/fps", fps, env_steps)
             if args.curriculum:
                 writer.add_scalar("curriculum/frac", env.pose_sampler.curriculum_frac, env_steps)
+            if args.use_sing_penalty or args.use_ik_penalty:
+                writer.add_scalar("curriculum/penalty_ramp", float(getattr(env, "_penalty_ramp", 1.0)), env_steps)
             if args.use_cbf_stop and hasattr(env, "_cbf_stop_rate"):
                 writer.add_scalar("diag/cbf_stop_rate", float(env._cbf_stop_rate), env_steps)
                 if hasattr(env, "_cbf_intervene"):
