@@ -271,18 +271,6 @@ class DualrobotCfg(DirectRLEnvCfg):
     leader_follower: bool = False
     lf_ik_iters: int = 12             # 팔로워 IK warm-start 반복(작게=빠름, 스텝간 모션 작아 수렴).
     lf_rot_weight: float = 0.1        # progress 거리 current_dist = pos_err + w·rot_err. ↑=회전 우선(위치 과달성/회전 marginal 교정). env·HER 일관.
-    # === r_ik / r_sing (Hong2025 "Novel DRL Path/Force" Eq.4,5, 2026-08-03) ===
-    #   진단: 성공 에피소드조차 팔로워 IK잔차 pos=45mm·manip_min≈0.006(상시 특이점 근처)인데,
-    #   특이점/IK 회피 유인이 리워드에 전혀 없었음(진단 로깅만). 논문식 페널티로 정책이 특이자세 회피 학습.
-    #   ★ goal-무관(관절 config만 의존) → _goal_indep_reward에 넣어 HER preserve.
-    #   ★ freeze 주의: 우리 도달보너스=+100(논문 +300)이라 -250/-375 그대로면 상대적으로 커 정지 유인.
-    #      → threshold 보수적(진짜 특이/미도달만) + 크기는 낮춰 시작 권장.
-    use_sing_penalty: bool = False    # r_sing: manip_min < sing_manip_thresh 이면 벌 (Eq.5 |det J|<1e-6 대응).
-    sing_penalty: float = 250.0       # Hong2025 값. Franka 7DoF라 det(J) 대신 manip=√det(JJᵀ) 사용.
-    sing_manip_thresh: float = 1.0e-3 # manip=√det(JJᵀ) 이 값 미만=특이점 근처. 진단상 실패군 median≈0.001.
-    use_ik_penalty: bool = False      # r_ik: 팔로워 IK 추종 실패(잔차>thresh)면 벌 (Eq.4 no-valid-IK 대응).
-    ik_penalty: float = 375.0         # Hong2025 값. gradient IK라 "해 없음"을 잔차 초과로 대체.
-    ik_fail_pos_thresh: float = 0.05  # 팔로워 IK pos잔차[m] 초과=유효해 못 찾음. 진단 성공median=45mm라 0.05가 보수적.
     lf_grav_comp: bool = False        # 리더-팔로워 중력보상 feedforward(G(q)). 파지변이 불리한 자세 sag 방지.
     lf_follower_hold: bool = False     # 디버그: 팔로워 IK 끄고 q_start 고정(처짐 원인=IK인지 sag인지 판별).
     disable_gravity_all: bool = False  # 로봇+rod 중력 OFF. 파지 pose 일반화 단계(무게 무관)에서 sag 제거용.

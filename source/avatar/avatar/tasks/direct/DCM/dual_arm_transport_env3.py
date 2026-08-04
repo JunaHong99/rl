@@ -643,14 +643,11 @@ class DualrobotEnv(DirectRLEnv):
         ee_loc_R = torch.bmm(R_b2_T, fol_R)
         q2_cur = self.robot_2.data.joint_pos[:, self.robot_2_joint_ids]
         q2 = ik.solve_ik_gradient(ee_loc_p, ee_loc_R, q_init=q2_cur, max_iter=int(self.cfg.lf_ik_iters))
-        # ── 팔로워 IK 추종 잔차 + manipulability(특이점) ──
-        #   IK가 목표 EE를 못 맞추면(잔차↑) or 특이점 근처면(manip↓) → rod가 피벗 → 회전 오차.
-        #   pos잔차는 r_ik(use_ik_penalty)에도 쓰므로 그 경우 상시 계산. rot잔차·manip은 진단에서만(비쌈).
-        _need_res = getattr(self, "_lf_diag", False) or getattr(self.cfg, "use_ik_penalty", False)
-        if _need_res:
+        # ── 진단(옵션, _lf_diag일 때만): 팔로워 IK 추종 잔차 + manipulability(특이점) ──
+        #   IK가 목표 EE를 못 맞추면(잔차↑) or 특이점 근처면(manip↓) → rod가 피벗 → 회전 오차 가설 검증용.
+        if getattr(self, "_lf_diag", False):
             fk2_p, fk2_R = ik.forward_kinematics(q2)                        # 달성 EE (팔로워 base frame)
             self._lf_ik_res_pos = (fk2_p - ee_loc_p).norm(dim=-1)          # (B,) m
-        if getattr(self, "_lf_diag", False):
             R_err = torch.bmm(fk2_R.transpose(1, 2), ee_loc_R)
             cos = ((R_err[:, 0, 0] + R_err[:, 1, 1] + R_err[:, 2, 2]) - 1.0) * 0.5
             self._lf_ik_res_rot = torch.acos(cos.clamp(-1.0, 1.0))         # (B,) rad
@@ -1012,11 +1009,6 @@ class DualrobotEnv(DirectRLEnv):
         r_safety = torch.zeros_like(pos_err)             # 진단용 측정만
 
         # ── 진단 로깅 (2026-07-15): manipulability(특이점) + f_int 스파이크(내력) 에피소드 누적 ──
-        # r_sing / r_ik (Hong2025 Eq.5/4): 특이점·팔로워IK 실패 페널티. goal-무관이라 아래 _goal_indep에 합산.
-        # _penalty_ramp: fresh 학습 cold-start freeze 방지용 0→1 워밍업(trainer가 step마다 주입). 없으면 1.0.
-        r_sing = torch.zeros_like(pos_err)
-        r_ik = torch.zeros_like(pos_err)
-        _pr = float(getattr(self, "_penalty_ramp", 1.0))
         _m1 = getattr(self.controller, "_manip1", None)
         if _m1 is not None:
             _mmin = torch.minimum(_m1, self.controller._manip2)   # 두 팔 중 더 특이한 쪽
@@ -1024,20 +1016,6 @@ class DualrobotEnv(DirectRLEnv):
             self.extras["diag/manip_arm1_mean"] = _m1.mean()
             self.extras["diag/manip_arm2_mean"] = self.controller._manip2.mean()
             self.extras["diag/manip_min_mean"] = _mmin.mean()
-            # r_sing (Eq.5): manip < thresh (특이점 근처)면 −sing_penalty. 두 팔 중 나쁜 쪽 기준.
-            if getattr(self.cfg, "use_sing_penalty", False):
-                near_sing = _mmin < float(self.cfg.sing_manip_thresh)
-                r_sing = torch.where(near_sing, -float(self.cfg.sing_penalty) * _pr,
-                                     torch.zeros_like(pos_err))
-                self.extras["reward/r_sing_mean"] = r_sing.mean()
-                self.extras["diag/near_sing_rate"] = near_sing.float().mean()
-        # r_ik (Eq.4): 팔로워 IK 추종 잔차 > thresh (유효해 못 찾음)면 −ik_penalty.
-        if getattr(self.cfg, "use_ik_penalty", False) and getattr(self, "_lf_ik_res_pos", None) is not None:
-            ik_fail = self._lf_ik_res_pos > float(self.cfg.ik_fail_pos_thresh)
-            r_ik = torch.where(ik_fail, -float(self.cfg.ik_penalty) * _pr, torch.zeros_like(pos_err))
-            self.extras["reward/r_ik_mean"] = r_ik.mean()
-            self.extras["diag/ik_fail_rate"] = ik_fail.float().mean()
-            self.extras["diag/lf_ik_res_pos_mm"] = self._lf_ik_res_pos.mean() * 1000.0
         self.episode_max_fint = torch.maximum(self.episode_max_fint, f_int_lin_norm)
         self.extras["diag/f_int_max"] = f_int_lin_norm.max()
         # 도달거리 (IK 해 존재 여부): 두 팔 중 더 먼 EE target 거리. 0.855m 초과 = 도달불가 명령.
@@ -1128,9 +1106,7 @@ class DualrobotEnv(DirectRLEnv):
 
         # goal-무관 보상 합 (HER가 virtual goal에도 보존하도록 train에서 buffer에 전달).
         # time+smooth+clearance+collision+null+filter는 goal에 무관 (충돌·nullspace·필터는 state/action 기반).
-        # r_sing/r_ik도 관절 config만 의존(goal 무관) → 여기 합산해야 HER relabel 시 보존됨.
-        self._goal_indep_reward = (r_time + r_smooth + r_clearance + r_collision + r_null + r_filter
-                                   + r_sing + r_ik)
+        self._goal_indep_reward = r_time + r_smooth + r_clearance + r_collision + r_null + r_filter
 
         # ── Total ──
         if getattr(self, "_k_reward_mode", False):
@@ -1143,7 +1119,7 @@ class DualrobotEnv(DirectRLEnv):
         else:
             total_reward = (r_progress + r_joint_pbr + r_safety + r_success + r_time
                             + r_internal + r_K_smooth + r_clearance + r_collision + r_smooth + r_null
-                            + r_filter + r_sing + r_ik)
+                            + r_filter)
 
         # ── Episode 최소 오차 추적 (timeout 시 _get_dones에서 평균 측정) ──
         self.episode_min_pos_err = torch.min(self.episode_min_pos_err, pos_err)
