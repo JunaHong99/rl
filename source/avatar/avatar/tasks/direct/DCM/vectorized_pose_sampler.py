@@ -17,10 +17,13 @@ class CachedPoseSampler:
                  cache_path: str | None = None,
                  fixed_grasp_roll: bool = True,
                  bucket_vals=None, bucket_grasp_offs=None, cache_tag=None,
-                 same_side: bool = False):
+                 same_side: bool = False,
+                 randomize_base: bool = False, base_spacing_range=(0.8, 1.4),
+                 base_yaw_range: float = 0.2618):
         self.device = device
         self.cache_size = cache_size
         self.same_side = same_side       # 두 파지점이 베이스축 같은 편(straddle 샘플 배제)
+        self.randomize_base = randomize_base   # 베이스 간격+yaw 랜덤화 (별도 캐시)
         # 버킷: None=고정(기존). bucket_vals=버킷별 half_len(크기변이). bucket_grasp_offs=버킷별
         #   grasp_off dict(형태/파지 변이). 둘 다 버킷 pool + env 버킷별 draw는 동일, 생성만 다름.
         self.bucket_vals = None if bucket_vals is None else [float(v) for v in bucket_vals]
@@ -40,6 +43,8 @@ class CachedPoseSampler:
             else:
                 cache_path = os.path.join(
                     script_dir, f"pose_cache_{cache_tag or 'chain'}_{cache_size}_{self.n_buckets}.pt")
+        if self.randomize_base and cache_path.endswith(".pt"):
+            cache_path = cache_path[:-3] + "_basevar.pt"  # 베이스 변이 캐시는 별도(고정-base와 충돌 X)
         if same_side and cache_path.endswith(".pt"):
             cache_path = cache_path[:-3] + "_ss.pt"     # same_side 캐시는 별도 파일(비-ss와 충돌 X)
         self.cache_path = cache_path
@@ -52,7 +57,10 @@ class CachedPoseSampler:
         self.sorted_idxs: torch.Tensor | None = None
 
         # Internal sampler (cache 생성용)
-        self._base = VectorizedPoseSampler(device=device, fixed_grasp_roll=fixed_grasp_roll)
+        self._base = VectorizedPoseSampler(device=device, fixed_grasp_roll=fixed_grasp_roll,
+                                           randomize_base=randomize_base,
+                                           base_spacing_range=base_spacing_range,
+                                           base_yaw_range=base_yaw_range)
 
         self._load_or_generate()
         self._build_curriculum_order()
@@ -161,14 +169,22 @@ class VectorizedPoseSampler:
     # Franka panda_hand origin(wrist)에서 TCP(fingers 사이)까지의 +Z축 오프셋
     TCP_OFFSET = 0.1034
 
-    def __init__(self, device='cuda:0', fixed_grasp_roll: bool = False):
+    def __init__(self, device='cuda:0', fixed_grasp_roll: bool = False,
+                 randomize_base: bool = False, base_spacing_range=(0.8, 1.4),
+                 base_yaw_range: float = 0.2618):
         """
         Args:
             fixed_grasp_roll: True면 grasp_roll=π로 고정 + TCP가 rod_end에 오도록 wrist backoff.
                 Phase 2(fixed joint)에서 필수. False(기본)면 기존 동작.
+            randomize_base: True면 두 베이스 간격(x)+yaw를 per-sample 랜덤화(morphology 일반화).
+            base_spacing_range: 두 베이스 x간격 [m] 범위 (기본 (0.8,1.4)).
+            base_yaw_range: 각 베이스 yaw 랜덤 진폭 [rad] (기본 0.2618=±15°).
         """
         self.device = device
         self.ik_solver = FrankaTensorIK(device=device)
+        self.randomize_base = randomize_base
+        self.base_spacing_range = base_spacing_range
+        self.base_yaw_range = float(base_yaw_range)
 
         # Robot Base Ranges (Robot 1: Left, Robot 2: Right)
         self.r1_ranges = torch.tensor([[-0.5, -0.45], [0.0, 0.0]], device=device)
@@ -304,20 +320,29 @@ class VectorizedPoseSampler:
                 else:
                     N = max(needed * 10, 10000) # Large batch for large requests (e.g. initialization)
                 
-                # --- A. Sample Bases (Fixed to remove initial learning complexity) ---
-                # Robot 1: Fixed at (-0.5, 0, 0) facing 0 rad
-                r1_x = torch.full((N,), -0.5, device=self.device)
+                # --- A. Sample Bases ---
+                if self.randomize_base:
+                    # 간격(x거리) + 각 베이스 yaw 랜덤화 (morphology 일반화). 중심은 원점 유지(대칭).
+                    smin, smax = self.base_spacing_range
+                    spacing = torch.rand(N, device=self.device) * (smax - smin) + smin   # [smin,smax]
+                    r1_x = -spacing / 2.0
+                    r2_x =  spacing / 2.0
+                    ya = self.base_yaw_range
+                    r1_yaw = (torch.rand(N, device=self.device) * 2.0 - 1.0) * ya          # 0 ± ya
+                    r2_yaw = torch.pi + (torch.rand(N, device=self.device) * 2.0 - 1.0) * ya  # π ± ya
+                else:
+                    # 기존 고정: r1=(-0.5,0) yaw0, r2=(0.5,0) yawπ (마주봄).
+                    r1_x = torch.full((N,), -0.5, device=self.device)
+                    r2_x = torch.full((N,), 0.5, device=self.device)
+                    r1_yaw = torch.zeros(N, device=self.device)
+                    r2_yaw = torch.full((N,), torch.pi, device=self.device)
                 r1_y = torch.zeros(N, device=self.device)
-                r1_yaw = torch.zeros(N, device=self.device)
-                base_pos_1 = torch.stack([r1_x, r1_y, torch.zeros(N, device=self.device)], dim=1)
-                base_quat_1 = self._euler_to_quat(torch.zeros(N, device=self.device), torch.zeros(N, device=self.device), r1_yaw)
-                
-                # Robot 2: Fixed at (0.5, 0, 0) facing PI rad
-                r2_x = torch.full((N,), 0.5, device=self.device)
                 r2_y = torch.zeros(N, device=self.device)
-                r2_yaw = torch.full((N,), torch.pi, device=self.device)
+                _z = torch.zeros(N, device=self.device)
+                base_pos_1 = torch.stack([r1_x, r1_y, torch.zeros(N, device=self.device)], dim=1)
+                base_quat_1 = self._euler_to_quat(_z, _z, r1_yaw)
                 base_pos_2 = torch.stack([r2_x, r2_y, torch.zeros(N, device=self.device)], dim=1)
-                base_quat_2 = self._euler_to_quat(torch.zeros(N, device=self.device), torch.zeros(N, device=self.device), r2_yaw)
+                base_quat_2 = self._euler_to_quat(_z, _z, r2_yaw)
 
                 # --- B. Sample Object ---
                 center_x = (r1_x + r2_x) / 2.0; center_y = (r1_y + r2_y) / 2.0

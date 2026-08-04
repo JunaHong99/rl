@@ -63,7 +63,7 @@ class DualrobotEnv(DirectRLEnv):
         # 원본 Cfg를 부모 클래스에 전달
         # 파지 변이(grasp 일반화): env별 독립 용접 앵커 편집 필요 → 물리 env마다 파싱.
         #   (per-env rod_joint LocalPos1/Rot1 override가 물리에 반영되려면 replicate_physics=False.)
-        if getattr(cfg, "vary_grasp", False):
+        if getattr(cfg, "vary_grasp", False) or getattr(cfg, "randomize_base", False):
             cfg.scene.replicate_physics = False
         # Joint 액션(Phase1 A): ImplicitActuator를 포지션 모드로. explicit 토크 PD는 닫힌사슬
         #   용접 반력에 압도당해 붕괴(hold FAIL) → PhysX가 제어+제약 암시적 co-solve = 안정.
@@ -87,17 +87,23 @@ class DualrobotEnv(DirectRLEnv):
         # 파지 변이 시: 버킷별(d,θ) grasp-정합 캐시 (용접/컨트롤러 오프셋과 일치하는 IK).
         _cache_size = int(getattr(self.cfg, "pose_cache_size", 100_000))   # 뷰어 등 빠른 확인 시 축소
         _same_side = bool(getattr(self.cfg, "grasp_same_side", False))      # 두 파지점 베이스축 같은 편
+        # 베이스 배치 랜덤화 (morphology 일반화). 켜지면 별도 _basevar 캐시 생성.
+        _rand_base = bool(getattr(self.cfg, "randomize_base", False))
+        _bsr = getattr(self.cfg, "base_spacing_range", (0.8, 1.4))
+        _byr = float(getattr(self.cfg, "base_yaw_range", 0.2618))
         if getattr(self.cfg, "vary_grasp", False):
             self.pose_sampler = CachedPoseSampler(
                 device=self.device, cache_size=_cache_size, fixed_grasp_roll=True,
                 bucket_grasp_offs=self._grasp_bucket_grasp_offs(),
                 cache_tag=getattr(self, "_grasp_cache_tag", f"graspvar_{self.cfg.grasp_n_buckets}b"),
                 same_side=_same_side,
+                randomize_base=_rand_base, base_spacing_range=_bsr, base_yaw_range=_byr,
             )
         else:
             self.pose_sampler = CachedPoseSampler(
                 device=self.device, cache_size=_cache_size, fixed_grasp_roll=True,
                 same_side=_same_side,
+                randomize_base=_rand_base, base_spacing_range=_bsr, base_yaw_range=_byr,
             )
         self.external_samples = None # 외부 샘플 저장용 (테스트용)
 

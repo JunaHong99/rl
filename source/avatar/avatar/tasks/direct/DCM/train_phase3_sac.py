@@ -88,6 +88,11 @@ parser.add_argument("--vary_grasp", action="store_true",
                     help="파지 변이 학습(S2): per-env grasp 위치 d + 각도 θ(a1·a2>0). replicate_physics=False 강제.")
 parser.add_argument("--same_side", action="store_true",
                     help="두 파지점이 베이스축 같은 편에 오도록 pose 샘플 필터(straddle 배제). 별도 _ss 캐시.")
+parser.add_argument("--randomize_base", action="store_true",
+                    help="두 로봇 베이스 간격+yaw 랜덤화(morphology 일반화). 별도 _basevar 캐시, replicate_physics=False.")
+parser.add_argument("--base_spacing_min", type=float, default=0.8, help="베이스 x간격 최소 [m] (기존 고정=1.0).")
+parser.add_argument("--base_spacing_max", type=float, default=1.4, help="베이스 x간격 최대 [m].")
+parser.add_argument("--base_yaw_range", type=float, default=0.2618, help="각 베이스 yaw 랜덤 진폭 [rad] (기본 ±15°).")
 parser.add_argument("--joint_action", action="store_true",
                     help="Phase1 A: object-centric 폐기, per-joint Δq(14) 액션 + antagonistic 내력 리워드 "
                          "+ MLP(관절각 sin/cos·f_int는 global feature). 네트워크가 관절 협응 소유.")
@@ -183,6 +188,12 @@ def main():
     if args.same_side:
         env_cfg.grasp_same_side = True
         print("↔️ same_side ON: 두 파지점 베이스축 같은 편(straddle 배제), 별도 _ss 캐시")
+    if args.randomize_base:
+        env_cfg.randomize_base = True
+        env_cfg.base_spacing_range = (args.base_spacing_min, args.base_spacing_max)
+        env_cfg.base_yaw_range = args.base_yaw_range
+        print(f"🤖 베이스 랜덤화 ON: 간격 {args.base_spacing_min}~{args.base_spacing_max}m, "
+              f"yaw ±{args.base_yaw_range:.3f}rad (±{args.base_yaw_range*57.3:.0f}°), 별도 _basevar 캐시, replicate_physics=False")
     if args.joint_action:
         env_cfg.joint_action = True
         env_cfg.action_space = 14          # 팔당 7 관절 Δq

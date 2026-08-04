@@ -246,6 +246,13 @@ class DualrobotCfg(DirectRLEnvCfg):
     # 두 파지점이 베이스축(두 base 잇는 선)의 *같은 편*에 오도록 샘플 필터(straddle 배제).
     #   True면 pose 캐시 생성 시 한 파지점 왼편·다른 파지점 오른편인 샘플 제거(별도 _ss 캐시).
     grasp_same_side: bool = False
+    # === 베이스 배치 랜덤화 (morphology 일반화, 2026-08-04) ===
+    #   두 로봇 베이스의 간격(x거리)+yaw를 per-episode 랜덤화 → 로봇 배치 일반화.
+    #   env는 이미 reset에서 per-env 베이스 write, 팔로워 IK·kin그래프(base-rel 엣지)가 실제 pose 읽음
+    #   → 샘플러만 베이스를 고정→랜덤으로 바꾸면 됨. 캐시는 별도 파일(_basevar). replicate_physics=False 필요.
+    randomize_base: bool = False
+    base_spacing_range: tuple = (0.8, 1.4)  # 두 베이스 x간격 [m] 범위 (기존 고정=1.0).
+    base_yaw_range: float = 0.2618          # 각 베이스 yaw 랜덤 진폭 [rad] ±15° (r1=0±, r2=π±).
 
     # === 8. Joint 액션 (Phase 1 A: 네트워크가 관절 협응 소유, 2026-07-21) ===
     # object-centric 폐기 → per-joint 출력. action = per-step Δq → q_des += joint_dq_scale·action
