@@ -25,6 +25,9 @@ parser.add_argument("--grasp_preset", type=str, default=None, help="held-out 파
 parser.add_argument("--cache_size", type=int, default=20000, help="reset용 pose 캐시(eval은 작게=빠름. 학습은 100k). preset 캐시 생성 가속.")
 parser.add_argument("--stochastic", action="store_true", help="탐험 확인용(기본 deterministic).")
 parser.add_argument("--lf_ik_iters", type=int, default=None, help="팔로워 IK 반복수 override(기본 cfg=12). IK잔차 원인 진단용(예: 50).")
+parser.add_argument("--oracle", action="store_true", help="정책 대신 리더를 정답 q*(target_joint_pos)로 P-제어 → 컨트롤러/닫힌사슬 도달 상한 측정(정책 vs 컨트롤러 한계 판별).")
+parser.add_argument("--oracle_cap", type=float, default=1.0, help="오라클 스텝당 액션 clamp(작을수록 완만=팔로워 추종 쉬움). 1.0=최대속도, 0.2≈정책속도.")
+parser.add_argument("--episode_len_s", type=float, default=None, help="에피소드 길이[s] override(기본6=30step). 오라클 컨트롤러 천장 테스트용(예:20=100step).")
 parser.add_argument("--randomize_base", action="store_true", help="베이스 간격+yaw 랜덤화(학습과 일치). 별도 _basevar 캐시.")
 parser.add_argument("--base_spacing_min", type=float, default=0.8)
 parser.add_argument("--base_spacing_max", type=float, default=1.4)
@@ -64,6 +67,9 @@ cfg.pose_cache_size = args.cache_size           # eval은 작게 → preset 캐�
 if args.lf_ik_iters is not None:
     cfg.lf_ik_iters = args.lf_ik_iters          # 팔로워 IK 반복수 override (IK잔차 원인 진단)
     print(f"🔧 lf_ik_iters override → {cfg.lf_ik_iters}")
+if args.episode_len_s is not None:
+    cfg.episode_length_s = args.episode_len_s   # 에피소드 길이 override (오라클 컨트롤러 천장 테스트)
+    print(f"🔧 episode_length_s override → {cfg.episode_length_s} ({int(args.episode_len_s/0.2)} step)")
 # train과 동일: leader_follower=time+리더sin/cos(14)+f_int+base pos(3)+rot6d(6)=25, joint=time+28+1=30
 if args.leader_follower and not args.use_kin_graph:
     gc.GLOBAL_FEATURE_DIM = 1 + 14 + 1 + 3 + 6
@@ -124,7 +130,14 @@ ep_osc = []   # (success, act_flip, act_mag, pe_flip, re_flip)
 jscale = float(cfg.joint_dq_scale)
 for step in range(args.num_steps):
     with torch.no_grad():
-        action, _, _ = agent.actor.get_action_and_log_prob(batch, deterministic=not args.stochastic)
+        if args.oracle:
+            # 오라클: 정책 대신 리더를 정답 관절 q*(=target_joint_pos 앞7, 골 rod pose의 IK해)로 P-제어.
+            #   팔로워 IK가 추종 → rod가 실제 도달하나 측정 = 컨트롤러/닫힌사슬 achievability 상한.
+            q1c = env.robot_1.data.joint_pos[:, env.robot_1_joint_ids]
+            qstar = env.target_joint_pos[:, :7]
+            action = ((qstar - q1c) / max(1e-6, jscale)).clamp(-args.oracle_cap, args.oracle_cap)
+        else:
+            action, _, _ = agent.actor.get_action_and_log_prob(batch, deterministic=not args.stochastic)
         act_abs_sum += action.abs().mean().item(); n_act += 1
         _, _, term, trunc, _ = env.step(action)
     rod_pos = env.rod.data.root_pos_w; goal_pos = env.goal_rod_marker.data.root_pos_w
