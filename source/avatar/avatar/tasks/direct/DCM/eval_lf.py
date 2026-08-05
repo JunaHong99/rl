@@ -28,6 +28,7 @@ parser.add_argument("--lf_ik_iters", type=int, default=None, help="팔로워 IK 
 parser.add_argument("--oracle", action="store_true", help="정책 대신 리더를 정답 q*(target_joint_pos)로 P-제어 → 컨트롤러/닫힌사슬 도달 상한 측정(정책 vs 컨트롤러 한계 판별).")
 parser.add_argument("--oracle_cap", type=float, default=1.0, help="오라클 스텝당 액션 clamp(작을수록 완만=팔로워 추종 쉬움). 1.0=최대속도, 0.2≈정책속도.")
 parser.add_argument("--episode_len_s", type=float, default=None, help="에피소드 길이[s] override(기본6=30step). 오라클 컨트롤러 천장 테스트용(예:20=100step).")
+parser.add_argument("--save_failures", type=str, default=None, help="실패 에피소드 config를 .pt로 저장(external_samples 형식) → 나중에 record_lf --replay_cases로 재생/시각화.")
 parser.add_argument("--randomize_base", action="store_true", help="베이스 간격+yaw 랜덤화(학습과 일치). 별도 _basevar 캐시.")
 parser.add_argument("--base_spacing_min", type=float, default=0.8)
 parser.add_argument("--base_spacing_max", type=float, default=1.4)
@@ -128,7 +129,9 @@ pe_h = torch.zeros(B, OSC_K, device=dev)
 re_h = torch.zeros(B, OSC_K, device=dev)
 ep_osc = []   # (success, act_flip, act_mag, pe_flip, re_flip)
 jscale = float(cfg.joint_dq_scale)
+fail_idxs = []   # ★ 실패 에피소드의 cache 글로벌 인덱스 (--save_failures로 저장 → 나중에 재생)
 for step in range(args.num_steps):
+    cur_idx = env.current_sample_idxs.clone()   # 이 스텝에 도는 에피소드의 cache idx (reset 전 스냅샷)
     with torch.no_grad():
         if args.oracle:
             # 오라클: 정책 대신 리더를 정답 관절 q*(=target_joint_pos 앞7, 골 rod pose의 IK해)로 P-제어.
@@ -175,6 +178,9 @@ for step in range(args.num_steps):
                 _dre = re_h[i][1:] - re_h[i][:-1]; _sr = torch.sign(_dre)
                 _rf = ((_sr[1:] * _sr[:-1]) < 0).float().mean().item()          # rot_err 방향반전
                 ep_osc.append((bool(rr_reached[i].item()), _af, _am, _pf, _rf))
+                # ★ 실패 에피소드의 cache idx 저장 (external 주입/-1 제외)
+                if args.save_failures and (not rr_reached[i].item()) and int(cur_idx[i]) >= 0:
+                    fail_idxs.append(int(cur_idx[i]))
             rr_min_pos[i] = float("inf"); rr_min_rot[i] = float("inf"); rr_reached[i] = False
             rr_len[i] = 0
             rod_start[i] = env.rod.data.root_pos_w[i]; rod_disp_max[i] = 0.0
@@ -222,4 +228,14 @@ if ep_osc:
 print(f"  rod 최대이동(에피소드): mean={rod_disp_max.mean()*100:.1f}cm  max={rod_disp_max.max()*100:.1f}cm")
 print(f"  액션 |mean|: {act_abs_sum/max(1,n_act):.3f}  (0에 가까우면 정책 붕괴=freeze)")
 print(f"  → 진단: rod가 {'거의 안 움직임 → 정책 붕괴/탐험실패' if rod_disp_max.mean()<0.03 else '움직임 → 도달만 못함(탐험/HER)'}")
+# ── ★ 실패 케이스 저장 (external_samples 형식, record_lf --replay_cases로 재생) ──
+if args.save_failures and fail_idxs:
+    cache = env.pose_sampler.cache
+    fi = torch.tensor(sorted(set(fail_idxs)), dtype=torch.long, device=dev)
+    sub = {k: v[fi].cpu() for k, v in cache.items()
+           if isinstance(v, torch.Tensor) and v.shape[0] == next(iter(cache.values())).shape[0]}
+    # 버킷 정보도 저장(재생 시 env._grasp_bucket_idx 세팅용 — grasp offset 정합)
+    torch.save({"samples": sub, "cache_idx": fi.cpu()}, args.save_failures)
+    print(f"  💾 실패 {len(fi)}개 config 저장 → {args.save_failures} "
+          f"(record_lf --replay_cases {args.save_failures} 로 재생)")
 os._exit(0)
