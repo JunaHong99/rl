@@ -25,6 +25,10 @@ parser.add_argument("--grasp_preset", type=str, default=None, help="held-out 파
 parser.add_argument("--cache_size", type=int, default=20000, help="reset용 pose 캐시(eval은 작게=빠름. 학습은 100k). preset 캐시 생성 가속.")
 parser.add_argument("--stochastic", action="store_true", help="탐험 확인용(기본 deterministic).")
 parser.add_argument("--lf_ik_iters", type=int, default=None, help="팔로워 IK 반복수 override(기본 cfg=12). IK잔차 원인 진단용(예: 50).")
+parser.add_argument("--randomize_base", action="store_true", help="베이스 간격+yaw 랜덤화(학습과 일치). 별도 _basevar 캐시.")
+parser.add_argument("--base_spacing_min", type=float, default=0.8)
+parser.add_argument("--base_spacing_max", type=float, default=1.4)
+parser.add_argument("--base_yaw_range", type=float, default=0.2618)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 app = AppLauncher(args); sim_app = app.app
@@ -47,6 +51,11 @@ if args.use_kin_graph:
 # ★ 학습 조건 일치 (안 맞추면 mismatch로 결과 무의미)
 if args.vary_grasp:
     cfg.vary_grasp = True; cfg.grasp_same_side = args.same_side
+if args.randomize_base:
+    cfg.randomize_base = True
+    cfg.base_spacing_range = (args.base_spacing_min, args.base_spacing_max)
+    cfg.base_yaw_range = args.base_yaw_range
+    print(f"🤖 베이스 랜덤화 ON (eval): 간격 {args.base_spacing_min}~{args.base_spacing_max}m, yaw ±{args.base_yaw_range:.3f}rad")
 if args.no_gravity:
     cfg.disable_gravity_all = True
 if args.grasp_preset:
@@ -104,6 +113,15 @@ env._lf_diag = True
 ep_diag = []   # (success, ikres_pos_mm, ikres_rot_deg, manip_min)
 ikp_max = torch.zeros(B, device=dev); ikr_max = torch.zeros(B, device=dev)
 manip_min = torch.full((B,), float("inf"), device=dev)
+# ── ★ 진동 진단 (H1 네트워크출력 진동 vs H2 협응 진동) ──
+#   마지막 OSC_K 스텝(목표 근처)에서 리더 액션 방향반전율(액션flip)·오차 진동(err flip) 측정.
+#   실패가 액션flip↑ = H1(출력 진동). 액션flip 낮고 err flip↑ = H2(팔로워 협응이 진동).
+OSC_K = 8
+act_h = torch.zeros(B, OSC_K, A, device=dev)
+pe_h = torch.zeros(B, OSC_K, device=dev)
+re_h = torch.zeros(B, OSC_K, device=dev)
+ep_osc = []   # (success, act_flip, act_mag, pe_flip, re_flip)
+jscale = float(cfg.joint_dq_scale)
 for step in range(args.num_steps):
     with torch.no_grad():
         action, _, _ = agent.actor.get_action_and_log_prob(batch, deterministic=not args.stochastic)
@@ -114,6 +132,10 @@ for step in range(args.num_steps):
     q_diff = math_utils.quat_mul(env.goal_rod_marker.data.root_quat_w,
                                  math_utils.quat_conjugate(env.rod.data.root_quat_w))
     rot_err = 2.0 * torch.atan2(torch.norm(q_diff[:, 1:4], dim=-1), torch.abs(q_diff[:, 0]))
+    # 진동 진단용 롤링 버퍼 (최근 OSC_K 스텝)
+    act_h = torch.cat([act_h[:, 1:], action.detach().unsqueeze(1)], dim=1)
+    pe_h = torch.cat([pe_h[:, 1:], pos_err.unsqueeze(1)], dim=1)
+    re_h = torch.cat([re_h[:, 1:], rot_err.unsqueeze(1)], dim=1)
     rr_min_pos = torch.min(rr_min_pos, pos_err); rr_min_rot = torch.min(rr_min_rot, rot_err)
     rr_reached |= (pos_err < POS_T) & (rot_err < ROT_T)     # ★ 이 스텝에 pos&rot 동시 만족
     rod_disp_max = torch.maximum(rod_disp_max, (rod_pos - rod_start).norm(dim=-1))
@@ -131,10 +153,20 @@ for step in range(args.num_steps):
                     ep_bkt.append(int(bkt_idx[i].item()))
                 ep_diag.append((bool(rr_reached[i].item()), float(ikp_max[i]) * 1000.0,
                                 float(ikr_max[i]) * 57.3, float(manip_min[i])))
+                # 진동 지표: 액션 방향반전율(액션flip), 액션 크기(mag/scale), pos·rot 오차 진동율.
+                _a = act_h[i]; _sg = torch.sign(_a)
+                _af = ((_sg[1:] * _sg[:-1]) < 0).float().mean().item()          # 액션 부호반전 비율
+                _am = _a.abs().mean().item() / max(1e-6, jscale)               # |액션|/scale ∈[0,1]
+                _dpe = pe_h[i][1:] - pe_h[i][:-1]; _sp = torch.sign(_dpe)
+                _pf = ((_sp[1:] * _sp[:-1]) < 0).float().mean().item()          # pos_err 방향반전
+                _dre = re_h[i][1:] - re_h[i][:-1]; _sr = torch.sign(_dre)
+                _rf = ((_sr[1:] * _sr[:-1]) < 0).float().mean().item()          # rot_err 방향반전
+                ep_osc.append((bool(rr_reached[i].item()), _af, _am, _pf, _rf))
             rr_min_pos[i] = float("inf"); rr_min_rot[i] = float("inf"); rr_reached[i] = False
             rr_len[i] = 0
             rod_start[i] = env.rod.data.root_pos_w[i]; rod_disp_max[i] = 0.0
             ikp_max[i] = 0.0; ikr_max[i] = 0.0; manip_min[i] = float("inf")
+            act_h[i] = 0.0; pe_h[i] = 0.0; re_h[i] = 0.0
     batch = env._build_policy_batch()
 
 S = np.array(ep_succ)
@@ -162,6 +194,18 @@ if ep_diag:
     print(f"    성공: {_st(sm)}")
     print(f"    실패: {_st(fm)}")
     print(f"    → 실패가 IK잔차↑ 또는 manip↓면 IK/특이점 원인(가설), 비슷하면 리워드/정밀도")
+# ── ★ 진동 진단 (H1 네트워크출력 진동 vs H2 협응 진동) ──
+if ep_osc:
+    O = np.array([[float(s), af, am, pf, rf] for (s, af, am, pf, rf) in ep_osc])
+    sm = O[:, 0] > 0.5; fm = ~sm
+    def _o(m):
+        if m.sum() == 0: return "n=0"
+        return (f"n={int(m.sum()):5d}  액션flip={np.median(O[m,1]):.2f}  액션mag={np.median(O[m,2]):.2f}  "
+                f"pos_err flip={np.median(O[m,3]):.2f}  rot_err flip={np.median(O[m,4]):.2f}")
+    print(f"  ── 진동 진단 (마지막 {OSC_K}스텝, 성공 vs 실패, median) ──")
+    print(f"    성공: {_o(sm)}")
+    print(f"    실패: {_o(fm)}")
+    print(f"    → 실패 '액션flip'↑ = H1(네트워크 출력 진동). '액션flip' 낮고 'err flip'↑ = H2(팔로워 협응 진동).")
 print(f"  rod 최대이동(에피소드): mean={rod_disp_max.mean()*100:.1f}cm  max={rod_disp_max.max()*100:.1f}cm")
 print(f"  액션 |mean|: {act_abs_sum/max(1,n_act):.3f}  (0에 가까우면 정책 붕괴=freeze)")
 print(f"  → 진단: rod가 {'거의 안 움직임 → 정책 붕괴/탐험실패' if rod_disp_max.mean()<0.03 else '움직임 → 도달만 못함(탐험/HER)'}")
