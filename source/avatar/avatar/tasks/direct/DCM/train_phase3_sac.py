@@ -79,6 +79,9 @@ parser.add_argument("--resume_path", type=str, default=None)
 parser.add_argument("--init_weights_path", type=str, default=None,
                     help="네트워크 가중치만 로드(optimizer/buffer/step은 fresh, new log_dir). "
                          "2-phase warm-start용 (convert_phaseA_to_phaseB.py 출력). resume_path와 배타적.")
+parser.add_argument("--no_obstacles", action="store_true",
+                    help="장애물 완전 제거(n_obstacles=0). 순수 운반(grasp/base 일반화) phase용. "
+                         "이거 켜면 --no_rod_filter/--max_active_obstacles 0 불필요(rod filter는 n_obstacles>0에만 작동).")
 parser.add_argument("--no_rod_filter", action="store_true",
                     help="rod safety filter OFF로 학습 — RL이 회피를 스스로 학습하는지 검증 (Hong2025 노선).")
 parser.add_argument("--max_active_obstacles", type=int, default=None,
@@ -176,6 +179,9 @@ def main():
     # Env
     env_cfg = DualrobotCfg()
     env_cfg.scene.num_envs = args.num_envs
+    if args.no_obstacles:
+        env_cfg.n_obstacles = 0                 # 장애물 슬롯 자체 제거(순수 운반). rod filter/충돌 코드 전부 게이트 OFF.
+        print("🚫 장애물 제거 (n_obstacles=0): 순수 운반 phase. rod filter/장애물 관련 플래그 무시됨.")
     if args.no_rod_filter:
         env_cfg.use_rod_safety_filter = False
         print("⚠️  rod safety filter OFF — RL이 회피를 스스로 학습 (Hong2025 노선)")
