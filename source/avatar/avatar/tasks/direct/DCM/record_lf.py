@@ -26,6 +26,10 @@ parser.add_argument("--num_rounds", type=int, default=8)
 parser.add_argument("--vary_grasp", action="store_true", help="파지 변이(학습과 일치). 없으면 고정파지.")
 parser.add_argument("--same_side", action="store_true")
 parser.add_argument("--no_gravity", action="store_true", help="중력 OFF(학습과 일치).")
+parser.add_argument("--randomize_base", action="store_true", help="베이스 간격+yaw 랜덤화(학습과 일치).")
+parser.add_argument("--base_spacing_min", type=float, default=0.8)
+parser.add_argument("--base_spacing_max", type=float, default=1.4)
+parser.add_argument("--base_yaw_range", type=float, default=0.2618)
 parser.add_argument("--grasp_preset", type=str, default=None, help="held-out 파지 세트(.pt).")
 parser.add_argument("--cache_size", type=int, default=20000, help="reset용 pose 캐시.")
 parser.add_argument("--seed", type=int, default=0, help="matched 비교용: reset 재현 seed. GNN·MLP 같은 seed면 동일 에피소드.")
@@ -58,6 +62,11 @@ else:
 # ★ 학습 조건 일치 (안 맞추면 mismatch로 이상하게 나옴)
 if args.vary_grasp:
     cfg.vary_grasp = True; cfg.grasp_same_side = args.same_side
+if args.randomize_base:
+    cfg.randomize_base = True
+    cfg.base_spacing_range = (args.base_spacing_min, args.base_spacing_max)
+    cfg.base_yaw_range = args.base_yaw_range
+    print(f"🤖 베이스 랜덤화 ON (record): 간격 {args.base_spacing_min}~{args.base_spacing_max}m, yaw ±{args.base_yaw_range:.3f}")
 if args.no_gravity:
     cfg.disable_gravity_all = True
 if args.grasp_preset:
