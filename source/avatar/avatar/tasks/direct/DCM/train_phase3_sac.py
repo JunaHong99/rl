@@ -103,6 +103,9 @@ parser.add_argument("--w_internal", type=float, default=0.002,
                     help="antagonistic 내력 페널티 가중치(협응 학습 신호). f_int[N] 스케일이라 작게(예 0.002).")
 parser.add_argument("--leader_follower", action="store_true",
                     help="리더-팔로워: 리더(arm1) 7 Δq(학습) + 팔로워(arm2) 추종 IK. 협응 구조적 보장(freeze 회피). action_space=7.")
+parser.add_argument("--use_simul_dist", action="store_true",
+                    help="동시성 리워드: progress 거리를 max(pos_err/POS_T, rot_err/ROT_T)로(뒤처진 좌표 우선). "
+                         "타이밍 실패(pos·rot 동시도달 못함) 겨냥. env·HER 둘 다 일관 적용.")
 parser.add_argument("--lf_rot_weight", type=float, default=0.1,
                     help="progress 거리 회전 가중(current_dist=pos+w·rot). ↑=회전 우선(기본0.1→0.3 권장). env·HER 일관.")
 parser.add_argument("--lf_ik_iters", type=int, default=None,
@@ -214,6 +217,9 @@ def main():
         if not args.use_kin_graph:
             args.use_mlp = True
         env_cfg.lf_rot_weight = args.lf_rot_weight      # 회전 가중(env·HER 일관, 아래 버퍼에도 전달)
+        env_cfg.use_simul_dist = args.use_simul_dist    # 동시성 거리(env·HER 일관)
+        if args.use_simul_dist:
+            print("🎯 동시성 리워드 ON: progress 거리 = max(pos_err/POS_T, rot_err/ROT_T) (뒤처진 좌표 우선)")
         if args.lf_ik_iters is not None:
             env_cfg.lf_ik_iters = args.lf_ik_iters      # 팔로워 IK 수렴 개선
         print(f"🤝 leader_follower ON: 리더 7Δq + 팔로워 IK(iters={env_cfg.lf_ik_iters}), rot_weight={env_cfg.lf_rot_weight}")
@@ -357,6 +363,7 @@ def main():
             progress_weight=args.her_progress_weight,
             graph_mod=_her_gm,
             rot_weight=args.lf_rot_weight,   # ★ env cfg.lf_rot_weight와 일치 (HER relabel 일관)
+            use_simul_dist=args.use_simul_dist,  # ★ env cfg.use_simul_dist와 일치 (동시성 거리)
         )
         print(f"🎯 HER enabled: strategy={args.her_strategy}, k_future={args.k_future}, "
               f"progress_weight={args.her_progress_weight}, max_ep_len={max_ep_len}")
