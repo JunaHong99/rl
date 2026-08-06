@@ -468,7 +468,19 @@ class DualrobotEnv(DirectRLEnv):
             if getattr(self, "_lf_q1_des", None) is None:
                 self._lf_q1_des = self.robot_1.data.joint_pos[:, self.robot_1_joint_ids].clone()
             _dqs = 1.0 if getattr(self.cfg, "single_action_scale", False) else self.cfg.joint_dq_scale
-            self._lf_q1_des = self._lf_q1_des + _dqs * self.actions[:, :7]
+            _dq = _dqs * self.actions[:, :7]
+            # 목표 근처 fine control: rod가 목표에 가까울수록 Δq 축소(근접 정밀, travel 유지)
+            if getattr(self.cfg, "use_near_goal_fine", False):
+                rp = self.rod.data.root_pos_w; rq = self.rod.data.root_quat_w
+                gp = self.goal_rod_marker.data.root_pos_w; gq = self.goal_rod_marker.data.root_quat_w
+                _pe = torch.norm(gp - rp, dim=-1)
+                _qd = math_utils.quat_mul(gq, math_utils.quat_conjugate(rq))
+                _re = 2.0 * torch.atan2(torch.norm(_qd[:, 1:4], dim=-1), torch.abs(_qd[:, 0]))
+                _prox = torch.maximum(_pe / 0.02, _re / 0.1745)
+                _g = float(self.cfg.fine_gate); _fm = float(self.cfg.fine_min_scale)
+                _t = ((_prox - 1.0) / max(1e-6, _g - 1.0)).clamp(0.0, 1.0)
+                _dq = _dq * (_fm + (1.0 - _fm) * _t).unsqueeze(1)
+            self._lf_q1_des = self._lf_q1_des + _dq
             self._lf_substep = 0                        # control-rate용 서브스텝 카운터 리셋
             if getattr(self.cfg, "lf_follower_hold", False):
                 pass                                    # 디버그: 팔로워 IK 끄고 q_start 고정(_lf_q2_des 유지)

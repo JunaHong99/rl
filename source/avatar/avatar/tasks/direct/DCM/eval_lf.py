@@ -27,6 +27,9 @@ parser.add_argument("--stochastic", action="store_true", help="탐험 확인용(
 parser.add_argument("--lf_ik_iters", type=int, default=None, help="팔로워 IK 반복수 override(기본 cfg=12). IK잔차 원인 진단용(예: 50).")
 parser.add_argument("--lf_ik_rate", type=int, default=1, help="팔로워 IK control-rate(학습과 일치시켜야 함). 1=현재, 2~4=서브스텝 재추종.")
 parser.add_argument("--single_action_scale", action="store_true", help="스케일 이중적용 수정(학습과 일치). single_action_scale로 학습한 모델 eval 시 필수.")
+parser.add_argument("--use_near_goal_fine", action="store_true", help="목표 근처 Δq 축소(근접 정밀 테스트). travel은 유지.")
+parser.add_argument("--fine_gate", type=float, default=3.0)
+parser.add_argument("--fine_min_scale", type=float, default=0.3)
 parser.add_argument("--oracle", action="store_true", help="정책 대신 리더를 정답 q*(target_joint_pos)로 P-제어 → 컨트롤러/닫힌사슬 도달 상한 측정(정책 vs 컨트롤러 한계 판별).")
 parser.add_argument("--oracle_cap", type=float, default=1.0, help="오라클 스텝당 액션 clamp(작을수록 완만=팔로워 추종 쉬움). 1.0=최대속도, 0.2≈정책속도.")
 parser.add_argument("--episode_len_s", type=float, default=None, help="에피소드 길이[s] override(기본6=30step). 오라클 컨트롤러 천장 테스트용(예:20=100step).")
@@ -76,6 +79,9 @@ if args.lf_ik_rate > 1:
 cfg.single_action_scale = args.single_action_scale
 if args.single_action_scale:
     print(f"🔧 single_action_scale ON (eval): Δq=joint_dq_scale·tanh")
+if args.use_near_goal_fine:
+    cfg.use_near_goal_fine = True; cfg.fine_gate = args.fine_gate; cfg.fine_min_scale = args.fine_min_scale
+    print(f"🔬 near-goal fine ON (eval): gate={args.fine_gate} min_scale={args.fine_min_scale}")
 if args.episode_len_s is not None:
     cfg.episode_length_s = args.episode_len_s   # 에피소드 길이 override (오라클 컨트롤러 천장 테스트)
     print(f"🔧 episode_length_s override → {cfg.episode_length_s} ({int(args.episode_len_s/0.2)} step)")
@@ -136,10 +142,13 @@ act_h = torch.zeros(B, OSC_K, A, device=dev)
 pe_h = torch.zeros(B, OSC_K, device=dev)
 re_h = torch.zeros(B, OSC_K, device=dev)
 ep_osc = []   # (success, act_flip, act_mag, pe_flip, re_flip)
+# ★ 스케일 버그 검증: 실제 per-step Δq(=_lf_q1_des 변화) 측정 (ON≈0.15, OFF≈0.045 기대)
+q1des_prev = None; dq_sum = 0.0; dq_n = 0
 fint_h = torch.zeros(B, OSC_K, device=dev)   # ★ 근접-구간 내력(f_int) 롤링 (제약위반/내력 가설)
 ep_fint = []   # (success, near_goal_fint)
 jscale = float(cfg.joint_dq_scale)
 fail_idxs = []   # ★ 실패 에피소드의 cache 글로벌 인덱스 (--save_failures로 저장 → 나중에 재생)
+ep_pr = []       # ★ (reached, min_pos, min_rot) — 실패 pos/rot/timing 분해
 for step in range(args.num_steps):
     cur_idx = env.current_sample_idxs.clone()   # 이 스텝에 도는 에피소드의 cache idx (reset 전 스냅샷)
     with torch.no_grad():
@@ -153,6 +162,12 @@ for step in range(args.num_steps):
             action, _, _ = agent.actor.get_action_and_log_prob(batch, deterministic=not args.stochastic)
         act_abs_sum += action.abs().mean().item(); n_act += 1
         _, _, term, trunc, _ = env.step(action)
+    # 실제 Δq 측정 (스케일 검증)
+    if getattr(env, "_lf_q1_des", None) is not None:
+        _q1d = env._lf_q1_des
+        if q1des_prev is not None:
+            dq_sum += (_q1d - q1des_prev).abs().mean().item(); dq_n += 1
+        q1des_prev = _q1d.clone()
     rod_pos = env.rod.data.root_pos_w; goal_pos = env.goal_rod_marker.data.root_pos_w
     pos_err = torch.norm(goal_pos - rod_pos, dim=-1)
     q_diff = math_utils.quat_mul(env.goal_rod_marker.data.root_quat_w,
@@ -193,8 +208,12 @@ for step in range(args.num_steps):
                 ep_osc.append((bool(rr_reached[i].item()), _af, _am, _pf, _rf))
                 ep_fint.append((bool(rr_reached[i].item()), float(fint_h[i].mean())))
                 # ★ 실패 에피소드의 cache idx 저장 (external 주입/-1 제외)
+                ep_pr.append((bool(rr_reached[i].item()), float(rr_min_pos[i]), float(rr_min_rot[i])))
                 if args.save_failures and (not rr_reached[i].item()) and int(cur_idx[i]) >= 0:
-                    fail_idxs.append(int(cur_idx[i]))
+                    # 정밀도(timing) 실패만 저장: pos·rot 각각 임계 도달했으나 동시 아님
+                    _tim = (rr_min_pos[i] < POS_T) and (rr_min_rot[i] < ROT_T)
+                    if _tim:
+                        fail_idxs.append(int(cur_idx[i]))
             rr_min_pos[i] = float("inf"); rr_min_rot[i] = float("inf"); rr_reached[i] = False
             rr_len[i] = 0
             rod_start[i] = env.rod.data.root_pos_w[i]; rod_disp_max[i] = 0.0
@@ -204,6 +223,15 @@ for step in range(args.num_steps):
 
 S = np.array(ep_succ)
 print(f"  genuine ep: {len(S)}   success: {100*S.mean() if len(S) else 0:.1f}%")
+# ── 실패 분해 (timing=정밀도 실패) ──
+if ep_pr:
+    PR = np.array(ep_pr); reached = PR[:,0] > 0.5; fail = ~reached
+    pok = PR[:,1] < POS_T; rok = PR[:,2] < ROT_T
+    timing = fail & pok & rok; posonly = fail & ~pok & rok
+    rotonly = fail & pok & ~rok; both = fail & ~pok & ~rok
+    nF = int(fail.sum())
+    def _r(n): return f"{int(n.sum()):4d} ({100*n.sum()/max(1,nF):4.1f}%)"
+    print(f"  ── 실패분해(총{nF}): 타이밍{_r(timing)} pos만{_r(posonly)} rot만{_r(rotonly)} 둘다{_r(both)}")
 # ── 버킷별 성공률 (worst 먼저) ──
 if bkt_idx is not None and len(ep_bkt):
     eb = np.array(ep_bkt); nb = int(env.cfg.grasp_n_buckets)
@@ -252,6 +280,7 @@ if ep_fint:
     print(f"    → 실패 내력↑ = 내력/제약위반이 동시수렴 방해(가설 지지). 비슷하면 내력은 주범 아님.")
 print(f"  rod 최대이동(에피소드): mean={rod_disp_max.mean()*100:.1f}cm  max={rod_disp_max.max()*100:.1f}cm")
 print(f"  액션 |mean|: {act_abs_sum/max(1,n_act):.3f}  (0에 가까우면 정책 붕괴=freeze)")
+print(f"  실제 |Δq|/step: {dq_sum/max(1,dq_n):.4f} rad  (single_action_scale ON≈0.15, OFF≈0.045; 액션|mean|×{'1' if args.single_action_scale else 'joint_dq_scale'})")
 print(f"  → 진단: rod가 {'거의 안 움직임 → 정책 붕괴/탐험실패' if rod_disp_max.mean()<0.03 else '움직임 → 도달만 못함(탐험/HER)'}")
 # ── ★ 실패 케이스 저장 (external_samples 형식, record_lf --replay_cases로 재생) ──
 if args.save_failures and fail_idxs:

@@ -265,6 +265,11 @@ class DualrobotCfg(DirectRLEnvCfg):
     #   env joint_dq_scale = 제곱 0.09). 기존 모델은 이 이중에 캘리브됨 → 기본 False(하위호환).
     #   True면 env가 안 곱함 → Δq = joint_dq_scale·tanh (정상). 새 학습만 사용, 재학습 필요.
     single_action_scale: bool = False
+    # 목표 근처 fine control: rod가 목표에 가까울수록 리더 Δq 축소(근접 정밀도↑, travel은 유지).
+    #   prox=max(pos_err/0.02, rot_err/0.1745). prox>=fine_gate=full, prox<=1=fine_min_scale.
+    use_near_goal_fine: bool = False
+    fine_gate: float = 3.0
+    fine_min_scale: float = 0.3
     joint_dq_scale: float = 0.30      # action∈[-1,1] → per-step Δq [rad]. 0.15는 먼 목표(rod 60cm)에 30step 빠듯
                                       #   → 0.30 상향(먼 목표 도달 가능하게). ★리더-팔로워는 관절→rod 사상이라 스케일 민감.
     lf_dense_progress: bool = False   # 리더-팔로워 dense progress(Cartesian rod 거리 shaping). sparse가 리더관절

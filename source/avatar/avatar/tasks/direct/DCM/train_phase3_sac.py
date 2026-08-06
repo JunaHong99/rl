@@ -114,6 +114,10 @@ parser.add_argument("--lf_ik_rate", type=int, default=1,
                     help="팔로워 IK 재계산 횟수/RL스텝(control-rate). 1=현재, 2~4=서브스텝 중간에 리더 실제 config 추종 → 내력↓. IK비용 ×rate, 동역학 바뀜.")
 parser.add_argument("--single_action_scale", action="store_true",
                     help="스케일 이중적용 버그 수정: env가 joint_dq_scale 안 곱함 → Δq=joint_dq_scale·tanh(정상, 실효 3배). 재학습 필요, 기존 모델과 비호환.")
+parser.add_argument("--use_near_goal_fine", action="store_true",
+                    help="목표 근처 Δq 축소(근접 정밀↑, travel 유지). 정밀도 가설 재학습 검증용.")
+parser.add_argument("--fine_gate", type=float, default=3.0)
+parser.add_argument("--fine_min_scale", type=float, default=0.3, help="임계 이내 Δq 배율(0.3=30%).")
 parser.add_argument("--lf_dense_progress", action="store_true",
                     help="dense progress 보상(Cartesian rod 접근량). sparse+HER가 리더관절 액션엔 약해 학습 굶는 것 보강.")
 parser.add_argument("--use_kin_graph", action="store_true",
@@ -229,6 +233,10 @@ def main():
         env_cfg.single_action_scale = args.single_action_scale
         if args.single_action_scale:
             print(f"🔧 single_action_scale ON: Δq=joint_dq_scale·tanh (실효 {env_cfg.joint_dq_scale}, 기존 이중 {env_cfg.joint_dq_scale**2:.3f}의 정정)")
+        if args.use_near_goal_fine:
+            env_cfg.use_near_goal_fine = True
+            env_cfg.fine_gate = args.fine_gate; env_cfg.fine_min_scale = args.fine_min_scale
+            print(f"🔬 near-goal fine ON: 근접 Δq {args.fine_min_scale}배 (gate {args.fine_gate}) — 정밀도 재학습")
         env_cfg.lf_ik_rate = args.lf_ik_rate
         if args.lf_ik_rate > 1:
             print(f"⏱️ control-rate {args.lf_ik_rate}: 팔로워 IK를 서브스텝 중간 리더 실제 config로 재추종 (내력↓, IK비용×{args.lf_ik_rate})")
