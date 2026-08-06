@@ -26,6 +26,7 @@ parser.add_argument("--num_rounds", type=int, default=8)
 parser.add_argument("--vary_grasp", action="store_true", help="파지 변이(학습과 일치). 없으면 고정파지.")
 parser.add_argument("--same_side", action="store_true")
 parser.add_argument("--no_gravity", action="store_true", help="중력 OFF(학습과 일치).")
+parser.add_argument("--replay_cases", type=str, default=None, help="eval --save_failures로 저장한 실패 config(.pt) 재생 → 실패 에피소드만 녹화.")
 parser.add_argument("--randomize_base", action="store_true", help="베이스 간격+yaw 랜덤화(학습과 일치).")
 parser.add_argument("--base_spacing_min", type=float, default=0.8)
 parser.add_argument("--base_spacing_max", type=float, default=1.4)
@@ -48,8 +49,17 @@ import isaaclab.utils.math as math_utils
 dev = getattr(args, "device", "cuda") if torch.cuda.is_available() else "cpu"
 N = args.n_clips
 cfg = DualrobotCfg()
+# ★ 실패 재생: 저장된 실패 config를 로드, num_envs=재생 사례 수로 맞춤.
+_replay = None
+if args.replay_cases:
+    _rd = torch.load(args.replay_cases, map_location="cpu")
+    _rs = _rd["samples"]
+    _ncase = min(int(next(iter(_rs.values())).shape[0]), args.n_clips)
+    _replay = {k: v[:_ncase] for k, v in _rs.items()}
+    N = _ncase
+    print(f"🎬 실패 재생: {args.replay_cases}에서 {_ncase}개 (총 {int(next(iter(_rs.values())).shape[0])}개 중)")
 # vary_grasp면 env마다 다른 버킷(=다른 grasp) → 클립마다 다른 env 녹화 위해 num_envs 확보.
-cfg.scene.num_envs = max(8, args.n_clips) if args.vary_grasp else 4
+cfg.scene.num_envs = N if _replay is not None else (max(8, args.n_clips) if args.vary_grasp else 4)
 cfg.scene.env_spacing = args.env_spacing
 cfg.viewer.resolution = (args.res_w, args.res_h)
 cfg.leader_follower = True
@@ -73,6 +83,16 @@ if args.grasp_preset:
     cfg.grasp_preset_path = args.grasp_preset
 cfg.pose_cache_size = args.cache_size
 env = DualrobotEnv(cfg, render_mode="rgb_array")
+# ★ 실패 재생 주입: external_samples(base/q_start/q_goal/obj pose) + grasp 버킷 정합.
+if _replay is not None:
+    bk = _replay.get("bucket", None)
+    env.external_samples = {k: v.to(dev) for k, v in _replay.items() if k != "bucket"}
+    if bk is not None and getattr(env, "_grasp_bucket_d", None) is not None:
+        bk = bk.to(dev).long()
+        env._grasp_bucket_idx = bk
+        env._grasp_d = env._grasp_bucket_d[bk]
+        env._grasp_theta = env._grasp_bucket_theta[bk]
+    print(f"🎬 external_samples 주입 완료 ({env.num_envs} env = 실패 사례)")
 A = env.cfg.action_space
 POS_T, ROT_T = 0.02, math.radians(10)
 origins = env.scene.env_origins
