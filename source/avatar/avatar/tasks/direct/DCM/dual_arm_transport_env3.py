@@ -460,13 +460,15 @@ class DualrobotEnv(DirectRLEnv):
                 self._q_des = torch.cat([
                     self.robot_1.data.joint_pos[:, self.robot_1_joint_ids],
                     self.robot_2.data.joint_pos[:, self.robot_2_joint_ids]], dim=1).clone()
-            self._q_des = self._q_des + self.cfg.joint_dq_scale * self.actions[:, :14]
+            _dqs = 1.0 if getattr(self.cfg, "single_action_scale", False) else self.cfg.joint_dq_scale
+            self._q_des = self._q_des + _dqs * self.actions[:, :14]
             return
         # ── 리더-팔로워: 리더(arm1) 7 Δq 누적, 팔로워(arm2)는 rod 추종 IK ──
         if getattr(self.cfg, "leader_follower", False):
             if getattr(self, "_lf_q1_des", None) is None:
                 self._lf_q1_des = self.robot_1.data.joint_pos[:, self.robot_1_joint_ids].clone()
-            self._lf_q1_des = self._lf_q1_des + self.cfg.joint_dq_scale * self.actions[:, :7]
+            _dqs = 1.0 if getattr(self.cfg, "single_action_scale", False) else self.cfg.joint_dq_scale
+            self._lf_q1_des = self._lf_q1_des + _dqs * self.actions[:, :7]
             self._lf_substep = 0                        # control-rate용 서브스텝 카운터 리셋
             if getattr(self.cfg, "lf_follower_hold", False):
                 pass                                    # 디버그: 팔로워 IK 끄고 q_start 고정(_lf_q2_des 유지)

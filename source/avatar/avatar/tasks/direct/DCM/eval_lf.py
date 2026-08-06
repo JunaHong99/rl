@@ -26,6 +26,7 @@ parser.add_argument("--cache_size", type=int, default=20000, help="reset용 pose
 parser.add_argument("--stochastic", action="store_true", help="탐험 확인용(기본 deterministic).")
 parser.add_argument("--lf_ik_iters", type=int, default=None, help="팔로워 IK 반복수 override(기본 cfg=12). IK잔차 원인 진단용(예: 50).")
 parser.add_argument("--lf_ik_rate", type=int, default=1, help="팔로워 IK control-rate(학습과 일치시켜야 함). 1=현재, 2~4=서브스텝 재추종.")
+parser.add_argument("--single_action_scale", action="store_true", help="스케일 이중적용 수정(학습과 일치). single_action_scale로 학습한 모델 eval 시 필수.")
 parser.add_argument("--oracle", action="store_true", help="정책 대신 리더를 정답 q*(target_joint_pos)로 P-제어 → 컨트롤러/닫힌사슬 도달 상한 측정(정책 vs 컨트롤러 한계 판별).")
 parser.add_argument("--oracle_cap", type=float, default=1.0, help="오라클 스텝당 액션 clamp(작을수록 완만=팔로워 추종 쉬움). 1.0=최대속도, 0.2≈정책속도.")
 parser.add_argument("--episode_len_s", type=float, default=None, help="에피소드 길이[s] override(기본6=30step). 오라클 컨트롤러 천장 테스트용(예:20=100step).")
@@ -72,6 +73,9 @@ if args.lf_ik_iters is not None:
 cfg.lf_ik_rate = args.lf_ik_rate
 if args.lf_ik_rate > 1:
     print(f"⏱️ control-rate {args.lf_ik_rate} (eval): 서브스텝 재추종")
+cfg.single_action_scale = args.single_action_scale
+if args.single_action_scale:
+    print(f"🔧 single_action_scale ON (eval): Δq=joint_dq_scale·tanh")
 if args.episode_len_s is not None:
     cfg.episode_length_s = args.episode_len_s   # 에피소드 길이 override (오라클 컨트롤러 천장 테스트)
     print(f"🔧 episode_length_s override → {cfg.episode_length_s} ({int(args.episode_len_s/0.2)} step)")
