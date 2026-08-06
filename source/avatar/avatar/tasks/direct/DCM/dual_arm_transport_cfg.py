@@ -246,6 +246,8 @@ class DualrobotCfg(DirectRLEnvCfg):
     # 두 파지점이 베이스축(두 base 잇는 선)의 *같은 편*에 오도록 샘플 필터(straddle 배제).
     #   True면 pose 캐시 생성 시 한 파지점 왼편·다른 파지점 오른편인 샘플 제거(별도 _ss 캐시).
     grasp_same_side: bool = False
+    # 실패 재생: env별 grasp 버킷을 명시(라운드로빈 대신) → 저장된 실패의 grasp로 용접앵커 정합.
+    replay_bucket_idx = None          # None=라운드로빈. list/tensor면 env i → replay_bucket_idx[i] 버킷.
     # === 베이스 배치 랜덤화 (morphology 일반화, 2026-08-04) ===
     #   두 로봇 베이스의 간격(x거리)+yaw를 per-episode 랜덤화 → 로봇 배치 일반화.
     #   env는 이미 reset에서 per-env 베이스 write, 팔로워 IK·kin그래프(base-rel 엣지)가 실제 pose 읽음

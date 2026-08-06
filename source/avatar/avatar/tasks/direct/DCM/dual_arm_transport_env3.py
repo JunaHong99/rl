@@ -380,8 +380,12 @@ class DualrobotEnv(DirectRLEnv):
             tu = torch.rand(nb, generator=gen)
             bucket_d = (d_lo + du * (d_hi - d_lo)).to(self.device)               # (nb,)
             bucket_theta = ((tu * 2.0 - 1.0) * th_cap).to(self.device)           # (nb,) ∈ [-cap,+cap]
-        # env → 버킷 라운드로빈 (재현성 고정)
-        bucket_idx = torch.arange(self.num_envs, device=self.device) % nb    # (N,)
+        # env → 버킷: 기본 라운드로빈. replay_bucket_idx 있으면 그걸 사용(실패 재생 grasp 정합).
+        _rb = getattr(cfg, "replay_bucket_idx", None)
+        if _rb is not None:
+            bucket_idx = torch.as_tensor(_rb, device=self.device, dtype=torch.long)[:self.num_envs]
+        else:
+            bucket_idx = torch.arange(self.num_envs, device=self.device) % nb    # (N,)
         self._grasp_bucket_idx = bucket_idx
         self._grasp_bucket_d = bucket_d
         self._grasp_bucket_theta = bucket_theta

@@ -57,6 +57,9 @@ if args.replay_cases:
     _ncase = min(int(next(iter(_rs.values())).shape[0]), args.n_clips)
     _replay = {k: v[:_ncase] for k, v in _rs.items()}
     N = _ncase
+    # ★ 용접앵커는 env 생성 시 고정 → 저장된 grasp 버킷을 *생성 전에* cfg로 주입(라운드로빈 덮어씀).
+    if "bucket" in _replay:
+        cfg.replay_bucket_idx = _replay["bucket"].long().tolist()
     print(f"🎬 실패 재생: {args.replay_cases}에서 {_ncase}개 (총 {int(next(iter(_rs.values())).shape[0])}개 중)")
 # vary_grasp면 env마다 다른 버킷(=다른 grasp) → 클립마다 다른 env 녹화 위해 num_envs 확보.
 cfg.scene.num_envs = N if _replay is not None else (max(8, args.n_clips) if args.vary_grasp else 4)
@@ -85,14 +88,9 @@ cfg.pose_cache_size = args.cache_size
 env = DualrobotEnv(cfg, render_mode="rgb_array")
 # ★ 실패 재생 주입: external_samples(base/q_start/q_goal/obj pose) + grasp 버킷 정합.
 if _replay is not None:
-    bk = _replay.get("bucket", None)
+    # grasp 버킷/용접앵커는 cfg.replay_bucket_idx로 생성 전에 정합됨. 여기선 base/q/obj만 주입.
     env.external_samples = {k: v.to(dev) for k, v in _replay.items() if k != "bucket"}
-    if bk is not None and getattr(env, "_grasp_bucket_d", None) is not None:
-        bk = bk.to(dev).long()
-        env._grasp_bucket_idx = bk
-        env._grasp_d = env._grasp_bucket_d[bk]
-        env._grasp_theta = env._grasp_bucket_theta[bk]
-    print(f"🎬 external_samples 주입 완료 ({env.num_envs} env = 실패 사례)")
+    print(f"🎬 external_samples 주입 완료 ({env.num_envs} env = 실패 사례, grasp 버킷 정합)")
 A = env.cfg.action_space
 POS_T, ROT_T = 0.02, math.radians(10)
 origins = env.scene.env_origins
