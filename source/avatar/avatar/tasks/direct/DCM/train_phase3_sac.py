@@ -110,6 +110,8 @@ parser.add_argument("--lf_rot_weight", type=float, default=0.1,
                     help="progress 거리 회전 가중(current_dist=pos+w·rot). ↑=회전 우선(기본0.1→0.3 권장). env·HER 일관.")
 parser.add_argument("--lf_ik_iters", type=int, default=None,
                     help="팔로워 IK 반복수 override(기본 cfg=12). 수렴 개선(예:30).")
+parser.add_argument("--lf_ik_rate", type=int, default=1,
+                    help="팔로워 IK 재계산 횟수/RL스텝(control-rate). 1=현재, 2~4=서브스텝 중간에 리더 실제 config 추종 → 내력↓. IK비용 ×rate, 동역학 바뀜.")
 parser.add_argument("--lf_dense_progress", action="store_true",
                     help="dense progress 보상(Cartesian rod 접근량). sparse+HER가 리더관절 액션엔 약해 학습 굶는 것 보강.")
 parser.add_argument("--use_kin_graph", action="store_true",
@@ -222,6 +224,9 @@ def main():
             print("🎯 동시성 리워드 ON: progress 거리 = max(pos_err/POS_T, rot_err/ROT_T) (뒤처진 좌표 우선)")
         if args.lf_ik_iters is not None:
             env_cfg.lf_ik_iters = args.lf_ik_iters      # 팔로워 IK 수렴 개선
+        env_cfg.lf_ik_rate = args.lf_ik_rate
+        if args.lf_ik_rate > 1:
+            print(f"⏱️ control-rate {args.lf_ik_rate}: 팔로워 IK를 서브스텝 중간 리더 실제 config로 재추종 (내력↓, IK비용×{args.lf_ik_rate})")
         print(f"🤝 leader_follower ON: 리더 7Δq + 팔로워 IK(iters={env_cfg.lf_ik_iters}), rot_weight={env_cfg.lf_rot_weight}")
     if args.lf_dense_progress:
         env_cfg.lf_dense_progress = True

@@ -277,6 +277,9 @@ class DualrobotCfg(DirectRLEnvCfg):
     #   joint_action과 동일하게 포지션 액추에이터(joint_kp/kd) 사용.
     leader_follower: bool = False
     lf_ik_iters: int = 12             # 팔로워 IK warm-start 반복(작게=빠름, 스텝간 모션 작아 수렴).
+    lf_ik_rate: int = 1               # 팔로워 IK 재계산 횟수/RL스텝. 1=현재(pre_physics서 1회, 리더명령 기준).
+                                      #   2~4=서브스텝 중간에 리더 *실제* config로 재추종 → 5Hz-240Hz 간극 내력↓.
+                                      #   비용: 팔로워 IK를 rate배 계산(FPS↓). 동역학 바뀌므로 재학습 필요.
     lf_rot_weight: float = 0.1        # progress 거리 current_dist = pos_err + w·rot_err. ↑=회전 우선(위치 과달성/회전 marginal 교정). env·HER 일관.
     # 동시성(simultaneity) 리워드 (2026-08-05): progress 거리를 "합"이 아니라 "정규화 max"로.
     #   dist = max(pos_err/POS_T, rot_err/ROT_T)·POS_T = max(pos_err, (POS_T/ROT_T)·rot_err).

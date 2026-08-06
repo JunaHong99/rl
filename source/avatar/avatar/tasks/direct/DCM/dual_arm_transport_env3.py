@@ -467,10 +467,11 @@ class DualrobotEnv(DirectRLEnv):
             if getattr(self, "_lf_q1_des", None) is None:
                 self._lf_q1_des = self.robot_1.data.joint_pos[:, self.robot_1_joint_ids].clone()
             self._lf_q1_des = self._lf_q1_des + self.cfg.joint_dq_scale * self.actions[:, :7]
+            self._lf_substep = 0                        # control-rate용 서브스텝 카운터 리셋
             if getattr(self.cfg, "lf_follower_hold", False):
                 pass                                    # 디버그: 팔로워 IK 끄고 q_start 고정(_lf_q2_des 유지)
             else:
-                self._lf_q2_des = self._follower_ik()  # 팔로워 추종 (control rate 1회)
+                self._lf_q2_des = self._follower_ik()  # 팔로워 추종 (스텝 시작 1회, 리더 명령 기준)
             return
         pos_disp = self.actions[:, 0:3]
         rot_aa = self.actions[:, 3:6]
@@ -619,17 +620,19 @@ class DualrobotEnv(DirectRLEnv):
         self.robot_1.set_joint_position_target(q[:, :7], joint_ids=self.robot_1_joint_ids)
         self.robot_2.set_joint_position_target(q[:, 7:14], joint_ids=self.robot_2_joint_ids)
 
-    def _follower_ik(self):
+    def _follower_ik(self, q1_src=None):
         """팔로워(arm2) 관절 목표 (★feedforward = Hong2025식): 실제 rod가 아니라 **리더 *명령* config의
         FK**로 팔로워 EE 목표를 예측 → 되먹임 고리 제거(feedback은 발산).
+        q1_src: None이면 self._lf_q1_des(리더 명령). control-rate>1의 서브스텝 재계산 시
+                리더 *실제* config를 전달(중간 위치 추종). ※실제config는 경계에선 노이즈 있었음(line 아래).
         ★ rod-매개(파지 변이 대응): 리더 EE → rod pose 역산 → per-env grasp offset으로 팔로워 EE.
           리더 EE = rod·T1(d,θ) → rod = 리더EE·T1⁻¹ ; 팔로워 EE = rod·T2(d,θ).
           T_i = (off_pos_i, off_quat_i): 리더=(-d,0,TCP)/q1, 팔로워=(+d,0,TCP)/q2. 고정파지면 d=0.4,θ=0."""
         sampler = self.pose_sampler._base
         ik = sampler.ik_solver
         B = self.num_envs; dev = self.device
-        # 1. 리더 EE(world) = base·FK(q1_des 명령). (실제 관절 사용은 노이즈로 더 나빴음 → 명령 유지.)
-        fk_p, fk_R = ik.forward_kinematics(self._lf_q1_des)
+        # 1. 리더 EE(world) = base·FK(q1_des 명령 or q1_src). (실제 관절=경계선 노이즈 있었음; 서브스텝 중간은 완만.)
+        fk_p, fk_R = ik.forward_kinematics(self._lf_q1_des if q1_src is None else q1_src)
         b1_p = self.robot_1.data.root_pos_w; b1_q = self.robot_1.data.root_quat_w
         R_b1 = sampler._quat_to_matrix(b1_q)
         lead_p = torch.bmm(R_b1, fk_p.unsqueeze(2)).squeeze(2) + b1_p          # (B,3) world
@@ -690,6 +693,14 @@ class DualrobotEnv(DirectRLEnv):
             self._apply_joint_velocity()
             return
         if getattr(self.cfg, "leader_follower", False):
+            # ── control-rate>1: 서브스텝 중간에 팔로워 IK를 리더 *실제* config로 재추종 → 내력↓ ──
+            _rate = int(getattr(self.cfg, "lf_ik_rate", 1))
+            if _rate > 1 and not getattr(self.cfg, "lf_follower_hold", False):
+                self._lf_substep = getattr(self, "_lf_substep", 0) + 1
+                _interval = max(1, int(self.cfg.decimation) // _rate)
+                if self._lf_substep % _interval == 0 and self._lf_substep < int(self.cfg.decimation):
+                    q1_act = self.robot_1.data.joint_pos[:, self.robot_1_joint_ids]
+                    self._lf_q2_des = self._follower_ik(q1_src=q1_act)   # 리더 실제 위치 추종
             self.robot_1.set_joint_position_target(self._lf_q1_des, joint_ids=self.robot_1_joint_ids)
             if getattr(self, "_lf_q2_des", None) is not None:
                 self.robot_2.set_joint_position_target(self._lf_q2_des, joint_ids=self.robot_2_joint_ids)
