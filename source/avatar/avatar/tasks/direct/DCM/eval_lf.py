@@ -35,6 +35,7 @@ parser.add_argument("--oracle_cap", type=float, default=1.0, help="오라클 스
 parser.add_argument("--episode_len_s", type=float, default=None, help="에피소드 길이[s] override(기본6=30step). 오라클 컨트롤러 천장 테스트용(예:20=100step).")
 parser.add_argument("--save_failures", type=str, default=None, help="실패 에피소드 config를 .pt로 저장(external_samples 형식) → 나중에 record_lf --replay_cases로 재생/시각화.")
 parser.add_argument("--randomize_base", action="store_true", help="베이스 간격+yaw 랜덤화(학습과 일치). 별도 _basevar 캐시.")
+parser.add_argument("--reach_strata", action="store_true", help="에피소드별 goal reach·manip 계산 → 구간별 성공률(특이점/manip 인과 검증).")
 parser.add_argument("--base_spacing_min", type=float, default=0.8)
 parser.add_argument("--base_spacing_max", type=float, default=1.4)
 parser.add_argument("--base_yaw_range", type=float, default=0.2618)
@@ -149,6 +150,24 @@ ep_fint = []   # (success, near_goal_fint)
 jscale = float(cfg.joint_dq_scale)
 fail_idxs = []   # ★ 실패 에피소드의 cache 글로벌 인덱스 (--save_failures로 저장 → 나중에 재생)
 ep_pr = []       # ★ (reached, min_pos, min_rot) — 실패 pos/rot/timing 분해
+# ── ★ reach/manip 인과 검증 (--reach_strata): cache의 q_goal마다 EE reach·Yoshikawa manip 계산 ──
+ep_rm = []       # (success, reach_max, manip_min) — cur_idx로 조회
+if args.reach_strata:
+    from franka_tensor_ik import FrankaTensorIK
+    from franka_jacobian_ik import FrankaJacobianIK
+    _fk = FrankaTensorIK(device=dev); _jik = FrankaJacobianIK(device=dev)
+    _cc = env.pose_sampler.cache
+    def _reach(q):
+        p, _ = _fk.forward_kinematics(q.to(dev)); return p.norm(dim=1)          # base→EE 거리
+    def _manip(q):
+        J, _ = _jik.compute_jacobian(q.to(dev))
+        return torch.sqrt(torch.det(torch.bmm(J, J.transpose(1, 2))).clamp_min(0))  # Yoshikawa
+    with torch.no_grad():
+        _qg1, _qg2 = _cc["q_goal_1"].to(dev), _cc["q_goal_2"].to(dev)
+        cache_reach = torch.maximum(_reach(_qg1), _reach(_qg2))   # (P,) 더 뻗은 팔
+        cache_manip = torch.minimum(_manip(_qg1), _manip(_qg2))   # (P,) 더 나쁜 팔
+    print(f"📐 reach_strata: cache {cache_reach.shape[0]}개 reach·manip 계산완료 "
+          f"(reach med={cache_reach.median():.3f} manip med={cache_manip.median():.4f})")
 for step in range(args.num_steps):
     cur_idx = env.current_sample_idxs.clone()   # 이 스텝에 도는 에피소드의 cache idx (reset 전 스냅샷)
     with torch.no_grad():
@@ -209,6 +228,9 @@ for step in range(args.num_steps):
                 ep_fint.append((bool(rr_reached[i].item()), float(fint_h[i].mean())))
                 # ★ 실패 에피소드의 cache idx 저장 (external 주입/-1 제외)
                 ep_pr.append((bool(rr_reached[i].item()), float(rr_min_pos[i]), float(rr_min_rot[i])))
+                if args.reach_strata and int(cur_idx[i]) >= 0:
+                    _ci = int(cur_idx[i])
+                    ep_rm.append((bool(rr_reached[i].item()), float(cache_reach[_ci]), float(cache_manip[_ci])))
                 if args.save_failures and (not rr_reached[i].item()) and int(cur_idx[i]) >= 0:
                     # 정밀도(timing) 실패만 저장: pos·rot 각각 임계 도달했으나 동시 아님
                     _tim = (rr_min_pos[i] < POS_T) and (rr_min_rot[i] < ROT_T)
@@ -223,6 +245,24 @@ for step in range(args.num_steps):
 
 S = np.array(ep_succ)
 print(f"  genuine ep: {len(S)}   success: {100*S.mean() if len(S) else 0:.1f}%")
+# ── ★ reach/manip 구간별 성공률 (인과 검증) ──
+if ep_rm:
+    RM = np.array(ep_rm); suc = RM[:, 0] > 0.5; rch = RM[:, 1]; mnp = RM[:, 2]
+    def _strata(vals, edges, name, asc=True):
+        print(f"  ── {name} 구간별 성공률 ──")
+        order = range(len(edges) - 1) if asc else reversed(range(len(edges) - 1))
+        for k in order:
+            lo, hi = edges[k], edges[k + 1]
+            m = (vals >= lo) & (vals < hi)
+            n = int(m.sum())
+            sr = 100 * suc[m].mean() if n else float("nan")
+            print(f"     [{lo:.3f}, {hi:.3f})  n={n:4d}  success={sr:5.1f}%")
+    # reach: 낮을수록 쉬움 → 오름차순. manip: 낮을수록(특이점) 어려움 → 낮은 쪽부터.
+    _strata(rch, [0.0, 0.68, 0.74, 0.78, 0.82, 1.0], "EE reach (m)", asc=True)
+    _strata(mnp, [0.0, 0.008, 0.014, 0.020, 0.030, 1.0], "manipulability", asc=True)
+    # 상관 요약: 성공 vs 실패의 reach·manip 중앙값
+    print(f"  ── 요약: 성공 reach_med={np.median(rch[suc]):.3f} manip_med={np.median(mnp[suc]):.4f}  |  "
+          f"실패 reach_med={np.median(rch[~suc]):.3f} manip_med={np.median(mnp[~suc]):.4f}")
 # ── 실패 분해 (timing=정밀도 실패) ──
 if ep_pr:
     PR = np.array(ep_pr); reached = PR[:,0] > 0.5; fail = ~reached
